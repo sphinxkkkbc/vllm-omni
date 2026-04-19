@@ -38,6 +38,8 @@ Key arguments:
 - `--audio-length`: audio duration in seconds.
 - `--num-inference-steps`: diffusion sampling steps.(more steps = higher quality, slower).
 - `--output`: path to save the generated WAV file.
+- `--enable-cpu-offload`: enabling model-wise offloading to save gpu memory
+- `--enable-layerwise-offload`: enabling layerwise offloading to save gpu memory
 
 ## Example materials
 

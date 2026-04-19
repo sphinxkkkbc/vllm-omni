@@ -376,6 +376,7 @@ class StableAudioDiTModel(nn.Module):
     """
 
     _repeated_blocks = ["StableAudioDiTBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks"]
 
     def __init__(
         self,
