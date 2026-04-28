@@ -115,8 +115,8 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         ).to(self.device)
 
         # Load VAE (AutoencoderOobleck for audio)
-        self.vae = DistributedAutoencoderOobleck.from_pretrained(
         # self.vae = AutoencoderOobleck.from_pretrained(
+        self.vae = DistributedAutoencoderOobleck.from_pretrained(
             model,
             subfolder="vae",
             torch_dtype=torch.float32,
@@ -560,7 +560,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
             # Scheduler step
-            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+            latents = self.scheduler.step(noise_pred, t, latents, generator).prev_sample
 
         self._current_timestep = None
 
@@ -570,7 +570,8 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         else:
             # Convert latents to VAE dtype (VAE may use float32)
             latents_for_vae = latents.to(dtype=self.vae.dtype)
-            audio = self.vae.decode(latents_for_vae).sample
+            # audio = self.vae.decode(latents_for_vae, chunked=True).sample
+            audio = self.vae.decode(latents_for_vae, chunked=True)
 
         # Trim to requested length
         audio = audio[:, :, waveform_start:waveform_end]
