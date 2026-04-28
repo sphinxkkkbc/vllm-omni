@@ -32,6 +32,7 @@ from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import Sta
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_oobleck import DistributedAutoencoderOobleck
 
 logger = init_logger(__name__)
 
@@ -114,7 +115,8 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         ).to(self.device)
 
         # Load VAE (AutoencoderOobleck for audio)
-        self.vae = AutoencoderOobleck.from_pretrained(
+        self.vae = DistributedAutoencoderOobleck.from_pretrained(
+        # self.vae = AutoencoderOobleck.from_pretrained(
             model,
             subfolder="vae",
             torch_dtype=torch.float32,
