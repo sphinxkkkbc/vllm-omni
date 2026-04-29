@@ -15,54 +15,23 @@ logger = init_logger(__name__)
 class TiledAutoencoderOobleck(AutoencoderOobleck):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.tile_size = kwargs.pop("tile_size", 128)
-        self.overlap_size = kwargs.pop("overlap_size", 32)
-        self.use_tiling = kwargs.pop("vae_use_tiling", True)
+        # According to official implementation, tile size 128 and overlap 32 works well.
+        # For result correctness, it is recommended to set overlap_size to 32 or greater.
+        self.tile_size = kwargs.get("tile_size", 128)
+        self.overlap_size = kwargs.get("overlap_size", 32)
 
-    def decode(self, z: torch.Tensor, chunked=False) -> torch.Tensor:
-        if chunked:
-            #problem here, it should call DistributedAutoencoderOobleck's tiled_decode
-            return self.tiled_decode(z)
-        else:
-            return super().decode(z).sample
-
-    def tiled_decode(self, latents: torch.Tensor):
-        # more details see stable-audio-tools/stable_audio_tools/models/autoencoders.py
-        chunk_size = self.tile_size
-        overlap = self.overlap_size
-        if latents.shape[2] <= self.tile_size:
-            logger.info("Latent length is smaller than tile size, skipping tiling and decoding in one pass")
-            return super().decode(latents)
-        # chunked decoding
-        hop_size = chunk_size - overlap
-        total_size = latents.shape[2]
-        chunks = []
-        for i in range(0, total_size - chunk_size + 1, hop_size):
-            chunk = latents[:,:,i:i+chunk_size]
-            chunks.append(chunk)
-        if i+chunk_size != total_size:
-            # Final chunk
-            chunk = latents[:,:,-chunk_size:]
-            chunks.append(chunk)
-        chunks = torch.stack(chunks)
-        num_chunks = chunks.shape[0]
-        decoded_chunks = []
-        for i in range(num_chunks):
-            x_chunk = chunks[i,:]
-            # decode the chunk
-            y_chunk = super().decode(x_chunk).sample
-            decoded_chunks.append(y_chunk)
-        return self.blend_chunks(decoded_chunks, overlap_size=overlap, latent_length=total_size)
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        return self.tiled_decode(z)
             
-    def blend_chunks(self, decoded_chunks:list[torch.Tensor], overlap_size:int, latent_length:int):
+    def blend_chunks(self, decoded_chunks:list[torch.Tensor]):
         # simple linear crossfade for blending two chunks
         num_chunks = len(decoded_chunks)
         samples_per_latent = int(self.hop_length)
         batch_size = decoded_chunks[0].shape[0]
         out_channels = decoded_chunks[0].shape[1]
         chunk_size = decoded_chunks[0].shape[2] // samples_per_latent
-        hop_size = chunk_size - overlap_size
-        y_size = latent_length * samples_per_latent
+        hop_size = chunk_size - self.overlap_size
+        y_size = self.latent_length * samples_per_latent
         y_final = torch.zeros((batch_size,out_channels,y_size), dtype = decoded_chunks[0].dtype, device=decoded_chunks[0].device)
         for i in range(num_chunks):
             # figure out where to put the audio along the time domain
@@ -75,7 +44,7 @@ class TiledAutoencoderOobleck(AutoencoderOobleck):
                 t_start = i * hop_size * samples_per_latent
                 t_end = t_start + chunk_size * samples_per_latent
             #  remove the edges of the overlaps
-            ol = (overlap_size//2) * samples_per_latent
+            ol = (self.overlap_size//2) * samples_per_latent
             chunk_start = 0
             chunk_end = y_chunk.shape[2]
             if i > 0:
@@ -111,7 +80,7 @@ class DistributedAutoencoderOobleck(TiledAutoencoderOobleck, DistributedVaeMixin
                     tile_id=len(tiletask_list),
                     grid_coord=(i // self.tile_stride,),
                     tensor=tile,
-                    workload=tile.shape[2],  # workload can be the length of the tile
+                    workload=tile.shape[2], 
                 )
             )
         if i + tile_size != latent_length:
@@ -159,8 +128,8 @@ class DistributedAutoencoderOobleck(TiledAutoencoderOobleck, DistributedVaeMixin
 
     def tiled_decode(self, z: torch.Tensor, return_dict: bool = True):
         if not self.is_distributed_enabled():
-            logger.info("Distributed execution not enabled, falling back to regular decode")
-            return super().tiled_decode(z)
+            logger.debug("Distributed execution not enabled, falling back to regular decode")
+            return super().decode(z).sample
 
         logger.debug("Decode running with distributed executor")
         result = self.distributed_executor.execute(

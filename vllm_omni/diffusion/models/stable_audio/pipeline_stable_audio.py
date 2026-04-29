@@ -571,7 +571,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
             # Convert latents to VAE dtype (VAE may use float32)
             latents_for_vae = latents.to(dtype=self.vae.dtype)
             # audio = self.vae.decode(latents_for_vae, chunked=True).sample
-            audio = self.vae.decode(latents_for_vae, chunked=True)
+            audio = self.vae.decode(latents_for_vae)
 
         # Trim to requested length
         audio = audio[:, :, waveform_start:waveform_end]
