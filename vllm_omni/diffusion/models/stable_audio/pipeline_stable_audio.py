@@ -14,6 +14,7 @@ import os
 from collections.abc import Iterable
 
 import torch
+
 # from diffusers import AutoencoderOobleck
 from diffusers.models.embeddings import get_1d_rotary_pos_embed
 from diffusers.pipelines.stable_audio.modeling_stable_audio import StableAudioProjectionModel
@@ -25,6 +26,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_oobleck import DistributedAutoencoderOobleck
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
@@ -32,7 +34,6 @@ from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import Sta
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
-from vllm_omni.diffusion.distributed.autoencoders.autoencoder_oobleck import DistributedAutoencoderOobleck
 
 logger = init_logger(__name__)
 
