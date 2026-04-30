@@ -15,7 +15,6 @@ from collections.abc import Iterable
 
 import torch
 
-# from diffusers import AutoencoderOobleck
 from diffusers.models.embeddings import get_1d_rotary_pos_embed
 from diffusers.pipelines.stable_audio.modeling_stable_audio import StableAudioProjectionModel
 from diffusers.schedulers import CosineDPMSolverMultistepScheduler
