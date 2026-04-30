@@ -68,7 +68,7 @@ class DistributedAutoencoderOobleck(AutoencoderOobleck, DistributedVaeMixin):
                 tiletask_list.append(
                     TileTask(
                         tile_id=len(tiletask_list),
-                        grid_coord=((latent_length - tile_size) // tile_stride,),
+                        grid_coord=(len(tiletask_list),),
                         tensor=tile,
                         workload=tile.shape[2],
                     )
