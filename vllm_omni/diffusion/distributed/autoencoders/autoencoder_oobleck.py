@@ -85,9 +85,6 @@ class DistributedAutoencoderOobleck(AutoencoderOobleck, DistributedVaeMixin):
 
     def tile_exec(self, task: TileTask) -> torch.Tensor:
         """Decode a single latent tile."""
-        # self.clear_cache()
-        # for k in range(len(task.tensor)):
-            # tile = task.tensor[k]
         tile = task.tensor
         decoded = super().decode(tile).sample
         return decoded
@@ -95,7 +92,6 @@ class DistributedAutoencoderOobleck(AutoencoderOobleck, DistributedVaeMixin):
     def tile_merge(self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec) -> torch.Tensor:
         """Merge decoded tiles into a full audio."""
         grid_len= grid_spec.grid_shape
-        # self.clear_cache()
         result = self.blend_chunks(
             [coord_tensor_map[(i,)] for i in range(grid_len[0])],
         )
