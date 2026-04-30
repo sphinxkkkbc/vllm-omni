@@ -214,6 +214,7 @@ def main():
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Guidance scale: {args.guidance_scale}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    print(f"  Vae patch parallel size: {args.vae_patch_parallel_size if args.vae_patch_parallel_size > 1 else 'None (no VAE patch parallelism)'}")
     if args.use_hsdp:
         print(f"  HSDP: enabled (shard_size={args.hsdp_shard_size}, replicate_size={args.hsdp_replicate_size})")
     else:
@@ -225,6 +226,7 @@ def main():
         use_hsdp=args.use_hsdp,
         hsdp_shard_size=args.hsdp_shard_size,
         hsdp_replicate_size=args.hsdp_replicate_size,
+        vae_patch_parallel_size=args.vae_patch_parallel_size,
     )
 
     # Initialize Omni with Stable Audio model

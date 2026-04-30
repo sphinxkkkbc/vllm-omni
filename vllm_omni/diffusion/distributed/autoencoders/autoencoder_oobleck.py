@@ -21,6 +21,7 @@ class TiledAutoencoderOobleck(AutoencoderOobleck):
         self.overlap_size = kwargs.get("overlap_size", 32)
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
+        self.latent_length = z.shape[-1]
         return self.tiled_decode(z)
             
     def blend_chunks(self, decoded_chunks:list[torch.Tensor]):
@@ -78,7 +79,7 @@ class DistributedAutoencoderOobleck(TiledAutoencoderOobleck, DistributedVaeMixin
             tiletask_list.append(
                  TileTask(
                     tile_id=len(tiletask_list),
-                    grid_coord=(i // self.tile_stride,),
+                    grid_coord=(i // tile_stride,),
                     tensor=tile,
                     workload=tile.shape[2], 
                 )
@@ -89,7 +90,7 @@ class DistributedAutoencoderOobleck(TiledAutoencoderOobleck, DistributedVaeMixin
             tiletask_list.append(
                 TileTask(
                     tile_id=len(tiletask_list),
-                    grid_coord=((latent_length - tile_size) // self.tile_stride,),
+                    grid_coord=((latent_length - tile_size) // tile_stride,),
                     tensor=tile,
                     workload=tile.shape[2],
                 )
@@ -109,20 +110,21 @@ class DistributedAutoencoderOobleck(TiledAutoencoderOobleck, DistributedVaeMixin
     
     def tile_exec(self, task: TileTask) -> torch.Tensor:
         """Decode a single latent tile."""
-        self.clear_cache()
-        for k in range(len(task.tensor)):
-            tile = task.tensor[k]
-            decoded = super().decode(tile)
+        # self.clear_cache()
+        # for k in range(len(task.tensor)):
+            # tile = task.tensor[k]
+        tile = task.tensor
+        decoded = super().decode(tile)
         return decoded
 
     def tile_merge(self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec) -> torch.Tensor:
         """Merge decoded tiles into a full audio."""
         grid_len= grid_spec.grid_shape
-        self.clear_cache()
+        # self.clear_cache()
         result = self.blend_chunks(
             [coord_tensor_map[(i,)] for i in range(grid_len[0])],
             overlap_size=grid_spec.tile_spec["overlap_size"],
-            latent_length=self.audio_length,
+            latent_length=self.latent_length,
         )
         return result
 
