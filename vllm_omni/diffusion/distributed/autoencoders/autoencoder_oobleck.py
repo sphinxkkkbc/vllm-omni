@@ -7,7 +7,7 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     TileTask,
 )
 from vllm.logger import init_logger
-from diffusers.models.autoencoders import AutoencoderOobleck, OobleckDecoderOutput
+from diffusers.models.autoencoders.autoencoder_oobleck import AutoencoderOobleck, OobleckDecoderOutput
 
 logger = init_logger(__name__)
 
@@ -18,6 +18,7 @@ class DistributedAutoencoderOobleck(AutoencoderOobleck, DistributedVaeMixin):
         # For result correctness, it is recommended to set overlap_size to 32 or greater.
         self.tile_size = kwargs.get("tile_size", 128)
         self.overlap_size = kwargs.get("overlap_size", 32)
+        self.use_tiling = kwargs.get("use_tiling", True)
 
     @classmethod
     def from_pretrained(cls, *args: Any, **kwargs: Any):
@@ -81,7 +82,7 @@ class DistributedAutoencoderOobleck(AutoencoderOobleck, DistributedVaeMixin):
                 output_dtype=latents.dtype,
             )
             return tiletask_list, grid_spec
-    
+
     def tile_exec(self, task: TileTask) -> torch.Tensor:
         """Decode a single latent tile."""
         # self.clear_cache()
