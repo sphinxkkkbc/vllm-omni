@@ -6,11 +6,12 @@ from tests.helpers.env import DeviceMemoryMonitor
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
+from tests.e2e.offline_inference.test_diffusion_cpu_offload import check_audio_determinism
 
-# Models to test and expected saved memory in MB, correspondingly
 MODELS_SAVED_MEMORY_MB = {
-    "riverclouds/qwen_image_random": 4500,
-    # "Wan-AI/Wan2.2-T2V-A14B-Diffusers": 45000,
+    "riverclouds/qwen_image_random": {"cuda": 4500, "rocm": None},
+    "stabilityai/stable-audio-open-1.0": {"cuda": 1500, "rocm": None},
+    # "Wan-AI/Wan2.2-T2V-A14B-Diffusers": {"cuda": 45000, "rocm": None},
 }
 
 
@@ -40,7 +41,7 @@ def run_inference(
         width = 640
         num_frames = 5
 
-        runner.omni.generate(
+        output = runner.omni.generate(
             "A cat sitting on a table",
             OmniDiffusionSamplingParams(
                 height=height,
@@ -55,7 +56,7 @@ def run_inference(
     peak = monitor.peak_used_mb
     monitor.stop()
 
-    return peak
+    return peak, output
 
 
 @pytest.mark.parametrize("model_name", MODELS_SAVED_MEMORY_MB.keys())
@@ -69,11 +70,11 @@ def test_layerwise_offload_diffusion_model(model_name: str):
     """
     try:
         # Run without layerwise offloading (baseline)
-        no_offload_peak_memory = run_inference(model_name, layerwise_offload=False)
+        no_offload_peak_memory, output_no_offload = run_inference(model_name, layerwise_offload=False)
         cleanup_dist_env_and_memory()
 
         # Run with layerwise offloading (1 layer on device)
-        layerwise_offload_peak_memory = run_inference(model_name, layerwise_offload=True)
+        layerwise_offload_peak_memory, output_offload = run_inference(model_name, layerwise_offload=True)
         cleanup_dist_env_and_memory()
     except Exception:
         pytest.fail("Inference failed")
@@ -81,9 +82,21 @@ def test_layerwise_offload_diffusion_model(model_name: str):
     print(f"Layerwise offload peak memory (1 GPU layer): {layerwise_offload_peak_memory} MB")
     print(f"No offload peak memory: {no_offload_peak_memory} MB")
 
+    if model_name == "stabilityai/stable-audio-open-1.0":
+        audio_offload = output_offload[0].request_output.multimodal_output.get("audio")
+        audio_no_offload = output_no_offload[0].request_output.multimodal_output.get("audio")
+        check_audio_determinism(audio_offload, audio_no_offload, atol=1e-3)
+
+    is_rocm = torch.version.hip is not None
+    platform = "rocm" if is_rocm else "cuda"
+    expected_saved_memory = MODELS_SAVED_MEMORY_MB[model_name][platform]
+
+    if expected_saved_memory is None:
+        pytest.skip(f"Threshold not defined for {platform} on {model_name}")
+
     # Verify that layerwise offloading significantly reduces memory usage
     # Passes only if the actual savings exceeds the expected savings
-    assert layerwise_offload_peak_memory + MODELS_SAVED_MEMORY_MB[model_name] < no_offload_peak_memory, (
+    assert layerwise_offload_peak_memory + expected_saved_memory < no_offload_peak_memory, (
         f"Layerwise offload peak memory {layerwise_offload_peak_memory} MB "
         f"should be significantly less than no offload peak memory {no_offload_peak_memory} MB"
     )

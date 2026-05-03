@@ -2,6 +2,7 @@ import gc
 
 import pytest
 import torch
+import numpy as np
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
 from tests.helpers.env import DeviceMemoryMonitor
@@ -10,8 +11,10 @@ from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
-models = ["riverclouds/qwen_image_random"]
-
+models_config = {
+    "riverclouds/qwen_image_random": {"cuda": 2500, "rocm": 2100},
+    "stabilityai/stable-audio-open-1.0": {"cuda": 1000, "rocm": None},
+}
 
 def inference(model_name: str, offload: bool = True):
     gc.collect()
@@ -30,7 +33,7 @@ def inference(model_name: str, offload: bool = True):
         height = 256
         width = 256
 
-        runner.omni.generate(
+        output = runner.omni.generate(
             "a photo of a cat sitting on a laptop keyboard",
             OmniDiffusionSamplingParams(
                 height=height,
@@ -46,26 +49,49 @@ def inference(model_name: str, offload: bool = True):
     gc.collect()
     current_omni_platform.empty_cache()
 
-    return peak
+    return peak, output
+
+
+def check_audio_determinism(audio1, audio2, atol=1e-3):
+    if isinstance(audio1, np.ndarray):
+        audio1 = torch.from_numpy(audio1).cuda()
+    if isinstance(audio2, np.ndarray):
+        audio2 = torch.from_numpy(audio2).cuda()
+    if not torch.allclose(audio1, audio2, atol=atol):
+        diff = torch.abs(audio1 - audio2)
+        print(f"Max difference: {diff.max().item()}")
+        print(f"Mean difference: {diff.mean().item()}")
+        raise AssertionError(f"Audio outputs differ beyond tolerance atol={atol}")
+    return True
 
 
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
-@pytest.mark.parametrize("model_name", models)
+@pytest.mark.parametrize("model_name", list(models_config.keys()))
 def test_cpu_offload_diffusion_model(model_name: str):
     try:
-        offload_peak_memory = inference(model_name, offload=True)
+        offload_peak_memory, output_offload = inference(model_name, offload=True)
         cleanup_dist_env_and_memory()
-        no_offload_peak_memory = inference(model_name, offload=False)
+        no_offload_peak_memory, output_no_offload = inference(model_name, offload=False)
     except Exception:
         pytest.fail("Inference failed")
     print(f"Offload peak memory: {offload_peak_memory} MB")
     print(f"No offload peak memory: {no_offload_peak_memory} MB")
+
+    if model_name == "stabilityai/stable-audio-open-1.0":
+        audio_offload = output_offload[0].request_output.multimodal_output.get("audio")
+        audio_no_offload = output_no_offload[0].request_output.multimodal_output.get("audio")
+        check_audio_determinism(audio_offload, audio_no_offload, atol=1e-2)
+        
     # Set platform-specific VRAM saving thresholds to account
     # for varying runtime memory overhead and fragmentation between CUDA and ROCm.
     is_rocm = torch.version.hip is not None
-    threshold = 2500 if not is_rocm else 2100
+    platform = "rocm" if is_rocm else "cuda"
+    threshold = models_config[model_name][platform]
+    if threshold is None:
+        pytest.skip(f"Threshold not defined for {platform} on {model_name}")
+
     assert offload_peak_memory + threshold < no_offload_peak_memory, (
         f"Offload peak memory {offload_peak_memory} MB should be less than "
         f"no offload peak memory {no_offload_peak_memory} MB by {threshold} MB"
