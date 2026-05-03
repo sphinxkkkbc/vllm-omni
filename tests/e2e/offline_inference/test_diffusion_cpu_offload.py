@@ -1,8 +1,8 @@
 import gc
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
 from tests.helpers.env import DeviceMemoryMonitor
@@ -22,18 +22,18 @@ IMAGE_VIDEO_MODELS = {
 MODELS = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}
 
 AUDIO_MODEL_PARAMS = {
-    "runner_params": {}, 
-    "sampler_params": {}, 
+    "runner_params": {},
+    "sampler_params": {},
 }
 
 IMAGE_VIDEO_MODELS_PARAMS = {
-    "runner_params": {
-    },
+    "runner_params": {},
     "sampler_params": {
         "height": 256,
-        "width": 256, 
+        "width": 256,
     },
 }
+
 
 def inference(model_name: str, offload: bool = True):
     gc.collect()
@@ -106,7 +106,7 @@ def test_cpu_offload_diffusion_model(model_name: str):
         audio_offload = output_offload[0].request_output.multimodal_output.get("audio")
         audio_no_offload = output_no_offload[0].request_output.multimodal_output.get("audio")
         check_audio_determinism(audio_offload, audio_no_offload, atol=1e-2)
-        
+
     # Set platform-specific VRAM saving thresholds to account
     # for varying runtime memory overhead and fragmentation between CUDA and ROCm.
     is_rocm = torch.version.hip is not None

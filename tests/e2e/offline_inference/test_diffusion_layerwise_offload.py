@@ -2,11 +2,11 @@ import pytest
 import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
+from tests.e2e.offline_inference.test_diffusion_cpu_offload import check_audio_determinism
 from tests.helpers.env import DeviceMemoryMonitor
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
-from tests.e2e.offline_inference.test_diffusion_cpu_offload import check_audio_determinism
 
 AUDIO_MODEL = {
     "stabilityai/stable-audio-open-1.0": {"cuda": 1500, "rocm": None},
@@ -20,21 +20,15 @@ IMAGE_VIDEO_MODELS = {
 MODELS = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}
 
 AUDIO_MODEL_PARAMS = {
-    "runner_params": {}, 
-    "sampler_params": {}, 
+    "runner_params": {},
+    "sampler_params": {},
 }
 
 IMAGE_VIDEO_MODELS_PARAMS = {
-    "runner_params": {
-        "boundary_ratio": 0.875,
-        "flow_shift": 5.0
-    },
-    "sampler_params": {
-        "height": 480,
-        "width": 640, 
-        "num_frames": 5
-    },
+    "runner_params": {"boundary_ratio": 0.875, "flow_shift": 5.0},
+    "sampler_params": {"height": 480, "width": 640, "num_frames": 5},
 }
+
 
 def run_inference(
     model_name: str,
