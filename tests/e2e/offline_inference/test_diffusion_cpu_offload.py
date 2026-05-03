@@ -11,9 +11,28 @@ from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
-models_config = {
-    "riverclouds/qwen_image_random": {"cuda": 2500, "rocm": 2100},
+AUDIO_MODEL = {
     "stabilityai/stable-audio-open-1.0": {"cuda": 1000, "rocm": None},
+}
+
+IMAGE_VIDEO_MODELS = {
+    "riverclouds/qwen_image_random": {"cuda": 2500, "rocm": 2100},
+}
+
+MODELS = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}
+
+AUDIO_MODEL_PARAMS = {
+    "runner_params": {}, 
+    "sampler_params": {}, 
+}
+
+IMAGE_VIDEO_MODELS_PARAMS = {
+    "runner_params": {
+    },
+    "sampler_params": {
+        "height": 256,
+        "width": 256, 
+    },
 }
 
 def inference(model_name: str, offload: bool = True):
@@ -23,24 +42,28 @@ def inference(model_name: str, offload: bool = True):
     current_omni_platform.reset_peak_memory_stats()
     monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
+
+    if model_name in AUDIO_MODEL:
+        params = AUDIO_MODEL_PARAMS
+    else:
+        params = IMAGE_VIDEO_MODELS_PARAMS
+
     with OmniRunner(
         model_name,
         # TODO: we might want to add overlapped feature e2e tests
         # cache_backend="cache_dit",
         enable_cpu_offload=offload,
+        **params["runner_params"],
     ) as runner:
         current_omni_platform.reset_peak_memory_stats()
-        height = 256
-        width = 256
 
         output = runner.omni.generate(
             "a photo of a cat sitting on a laptop keyboard",
             OmniDiffusionSamplingParams(
-                height=height,
-                width=width,
                 num_inference_steps=9,
                 guidance_scale=0.0,
                 generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(42),
+                **params["sampler_params"],
             ),
         )
     peak = monitor.peak_used_mb
@@ -68,7 +91,7 @@ def check_audio_determinism(audio1, audio2, atol=1e-3):
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
-@pytest.mark.parametrize("model_name", list(models_config.keys()))
+@pytest.mark.parametrize("model_name", list(MODELS.keys()))
 def test_cpu_offload_diffusion_model(model_name: str):
     try:
         offload_peak_memory, output_offload = inference(model_name, offload=True)
@@ -88,7 +111,7 @@ def test_cpu_offload_diffusion_model(model_name: str):
     # for varying runtime memory overhead and fragmentation between CUDA and ROCm.
     is_rocm = torch.version.hip is not None
     platform = "rocm" if is_rocm else "cuda"
-    threshold = models_config[model_name][platform]
+    threshold = MODELS[model_name][platform]
     if threshold is None:
         pytest.skip(f"Threshold not defined for {platform} on {model_name}")
 

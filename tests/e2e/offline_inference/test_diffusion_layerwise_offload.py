@@ -8,12 +8,33 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 from tests.e2e.offline_inference.test_diffusion_cpu_offload import check_audio_determinism
 
-MODELS_SAVED_MEMORY_MB = {
-    "riverclouds/qwen_image_random": {"cuda": 4500, "rocm": None},
+AUDIO_MODEL = {
     "stabilityai/stable-audio-open-1.0": {"cuda": 1500, "rocm": None},
+}
+
+IMAGE_VIDEO_MODELS = {
+    "riverclouds/qwen_image_random": {"cuda": 4500, "rocm": None},
     # "Wan-AI/Wan2.2-T2V-A14B-Diffusers": {"cuda": 45000, "rocm": None},
 }
 
+MODELS = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}
+
+AUDIO_MODEL_PARAMS = {
+    "runner_params": {}, 
+    "sampler_params": {}, 
+}
+
+IMAGE_VIDEO_MODELS_PARAMS = {
+    "runner_params": {
+        "boundary_ratio": 0.875,
+        "flow_shift": 5.0
+    },
+    "sampler_params": {
+        "height": 480,
+        "width": 640, 
+        "num_frames": 5
+    },
+}
 
 def run_inference(
     model_name: str,
@@ -25,31 +46,29 @@ def run_inference(
     monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
 
+    if model_name in AUDIO_MODEL:
+        params = AUDIO_MODEL_PARAMS
+    else:
+        params = IMAGE_VIDEO_MODELS_PARAMS
+
     with OmniRunner(
         model_name,
         enable_layerwise_offload=layerwise_offload,
         # TODO: we might want to add overlapped feature e2e tests
         # cache_backend="cache_dit",
-        boundary_ratio=0.875,
-        flow_shift=5.0,
+        **params["runner_params"],
     ) as runner:
         current_omni_platform.reset_peak_memory_stats()
 
         # Refer to tests/e2e/offline_inference/test_t2v_model.py
         # Use minimal settings for testing
-        height = 480
-        width = 640
-        num_frames = 5
-
         output = runner.omni.generate(
             "A cat sitting on a table",
             OmniDiffusionSamplingParams(
-                height=height,
-                width=width,
                 generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(42),
                 guidance_scale=1.0,
                 num_inference_steps=num_inference_steps,
-                num_frames=num_frames,
+                **params["sampler_params"],
             ),
         )
 
@@ -59,7 +78,7 @@ def run_inference(
     return peak, output
 
 
-@pytest.mark.parametrize("model_name", MODELS_SAVED_MEMORY_MB.keys())
+@pytest.mark.parametrize("model_name", list(MODELS.keys()))
 def test_layerwise_offload_diffusion_model(model_name: str):
     """Test that layerwise offloading reduces GPU memory usage.
 
@@ -89,7 +108,7 @@ def test_layerwise_offload_diffusion_model(model_name: str):
 
     is_rocm = torch.version.hip is not None
     platform = "rocm" if is_rocm else "cuda"
-    expected_saved_memory = MODELS_SAVED_MEMORY_MB[model_name][platform]
+    expected_saved_memory = MODELS[model_name][platform]
 
     if expected_saved_memory is None:
         pytest.skip(f"Threshold not defined for {platform} on {model_name}")
