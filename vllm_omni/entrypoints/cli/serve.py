@@ -477,6 +477,11 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable diffusion pipeline profiler to display stage durations.",
         )
+        omni_config_group.add_argument(
+            "--enable-ar-profiler",
+            action="store_true",
+            help="Enable AR stage profiler to include AR stage timing in stage_durations.",
+        )
         # Stash via type(self) so the docs hook (which execs this function in a
         # sandboxed globals dict via ``DummySelf``) doesn't fail on a NameError.
         type(self)._parser = serve_parser
@@ -713,7 +718,9 @@ def run_headless(args: argparse.Namespace) -> None:
             executor_class=executor_class,
             log_stats=log_stats,
         )
-        engine_manager.join_first()
+        # vllm>=0.19 renamed CoreEngineProcManager.join_first() to
+        # monitor_engine_liveness() (see upstream PR #35862).
+        engine_manager.monitor_engine_liveness()
     finally:
         logger.info("[Headless] Shutting down stage %d.", stage_id)
         if engine_manager is not None:

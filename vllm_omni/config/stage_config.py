@@ -274,9 +274,9 @@ class _LazyPipelineRegistry:
 
     def _get_lazy_map(self) -> dict[str, tuple[str, str]]:
         if self._lazy_map is None:
-            from vllm_omni.config.pipeline_registry import _VLLM_OMNI_PIPELINES
+            from vllm_omni.config.pipeline_registry import _OMNI_PIPELINES
 
-            self._lazy_map = _VLLM_OMNI_PIPELINES
+            self._lazy_map = _OMNI_PIPELINES
         return self._lazy_map
 
     def _load_lazy(self, model_type: str) -> PipelineConfig | None:
@@ -374,7 +374,7 @@ _PIPELINE_REGISTRY = _LazyPipelineRegistry()
 def register_pipeline(pipeline: PipelineConfig) -> None:
     """Register a pipeline config dynamically.
 
-    In-tree pipelines are declared in ``pipeline_registry._VLLM_OMNI_PIPELINES``
+    In-tree pipelines are declared in ``pipeline_registry._OMNI_PIPELINES``
     and loaded lazily; calling ``register_pipeline`` is only needed for
     out-of-tree plugins or tests that build a ``PipelineConfig`` at runtime.
     A dynamic registration overrides the central-registry entry with the same
@@ -439,7 +439,7 @@ class DeployConfig:
 
     # === Pipeline-wide engine settings (applied uniformly to every stage) ===
     trust_remote_code: bool = True
-    distributed_executor_backend: str = "mp"
+    distributed_executor_backend: str | None = None
     dtype: str | None = None
     quantization: str | None = None
     enable_prefix_caching: bool = False
@@ -1009,6 +1009,8 @@ class StageConfigFactory:
             cli_overrides = {}
 
         trust_remote_code = cli_overrides.get("trust_remote_code", True)
+        if trust_remote_code is None:
+            trust_remote_code = False
 
         # --- New path: check pipeline registry by model_type first ---
         model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)
@@ -1352,8 +1354,8 @@ class StageConfigFactory:
 
             hf_config = get_config(model, trust_remote_code=trust_remote_code)
             return hf_config.model_type, hf_config
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"`get_config` failed for {e}; Falling back to raw config.json path")
 
         # Fallback: read config.json directly for custom model types that
         # are not registered with transformers (e.g. qwen3_tts).
@@ -1390,8 +1392,8 @@ class StageConfigFactory:
                             class_name,
                         )
                         return pipeline_cfg.model_type, None
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to detect model type for diffusers-style models: {e}")
 
         # Final fallback: some models (e.g. CosyVoice3) ship an empty
         # config.json and rely on naming conventions. Match the model path

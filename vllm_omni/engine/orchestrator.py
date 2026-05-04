@@ -114,6 +114,9 @@ class OrchestratorRequestState:
 
     streaming: StreamingInputState = field(default_factory=lambda: StreamingInputState())
 
+    # Per-request pipeline timing accumulator (milliseconds)
+    pipeline_timings: dict[str, float] = field(default_factory=dict)
+
 
 @dataclass
 class StreamingInputState:
@@ -625,6 +628,7 @@ class Orchestrator:
                 total_token=self._agg_total_tokens[stage_id],
                 total_gen_time_ms=self._agg_total_gen_time_ms[stage_id],
             ),
+            pipeline_timings=dict(req_state.pipeline_timings),
         )
 
     def _build_kv_sender_info(self, sender_stage_ids: list[int]) -> dict[int, dict[str, Any]] | None:
@@ -682,6 +686,7 @@ class Orchestrator:
                     False,
                 )
                 _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
+                req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d
                 logger.info(
                     "[Orchestrator] ar2diffusion req=%s wall_time=%.3fms stage=%d->%d",
                     req_id,
@@ -868,6 +873,13 @@ class Orchestrator:
 
         if processed.reqs_to_abort:
             await self.stage_clients[stage_id].abort_requests_async(processed.reqs_to_abort)
+            # Same cleanup as _handle_abort — engine-driven aborts (stop
+            # token, max tokens, etc.) also skip the normal process_outputs()
+            # completion path, so accumulated CPU tensors in OmniRequestState
+            # and OutputProcessor would leak.
+            self.output_processors[stage_id].abort_requests(processed.reqs_to_abort, internal=True)
+            for req_id in processed.reqs_to_abort:
+                self.request_states.pop(req_id, None)
 
         if raw_outputs.scheduler_stats is not None:
             processor.update_scheduler_stats(raw_outputs.scheduler_stats)
@@ -911,6 +923,15 @@ class Orchestrator:
         )
         req_state.streaming.enabled = is_streaming
         req_state.stage_submit_ts[stage_id] = _time.time()
+
+        # Per-request pipeline timings from caller thread
+        _enqueue_ts = msg.get("enqueue_ts", 0.0)
+        if _enqueue_ts > 0:
+            req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - _enqueue_ts) * 1000.0
+        _preprocess_ms = msg.get("preprocess_ms", 0.0)
+        if _preprocess_ms > 0:
+            req_state.pipeline_timings["preprocess_ms"] = _preprocess_ms
+
         self.request_states[request_id] = req_state
 
         # Stage-0 prompt is already a fully-formed OmniEngineCoreRequest
@@ -1068,6 +1089,11 @@ class Orchestrator:
         all_ids_to_abort = self._cfg_tracker.abort_parents(request_ids)
         for stage_id in range(self.num_stages):
             await self.stage_clients[stage_id].abort_requests_async(all_ids_to_abort)
+            # Clean up OutputProcessor state (e.g. mm_accumulated tensors) that
+            # would otherwise leak — normal completion cleans up via
+            # process_outputs(), but aborted requests never produce an
+            # EngineCoreOutput, so we must purge them explicitly.
+            self.output_processors[stage_id].abort_requests(all_ids_to_abort, internal=True)
         for req_id in all_ids_to_abort:
             self.request_states.pop(req_id, None)
         logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
