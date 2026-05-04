@@ -81,7 +81,7 @@ def check_audio_determinism(audio1, audio2, atol=1e-3):
         audio1 = torch.from_numpy(audio1).to(device)
     if isinstance(audio2, np.ndarray):
         audio2 = torch.from_numpy(audio2).to(device)
-        
+
     if not torch.allclose(audio1, audio2, atol=atol):
         diff = torch.abs(audio1 - audio2)
         print(f"Max difference: {diff.max().item()}")
