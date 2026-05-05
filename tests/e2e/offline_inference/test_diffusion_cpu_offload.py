@@ -12,7 +12,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
 AUDIO_MODEL = {
-    "stabilityai/stable-audio-open-1.0": {"cuda": 1000, "rocm": None},
+    "stabilityai/stable-audio-open-1.0": {"cuda": 100, "rocm": 100},
 }
 
 IMAGE_VIDEO_MODELS = {
