@@ -21,6 +21,7 @@ from vllm_omni.diffusion.layers.fourier import GaussianFourierProjection
 
 logger = init_logger(__name__)
 
+
 def _preprocess_stable_audio_weight(
     param: torch.Tensor,
     loaded_weight: torch.Tensor,
@@ -28,14 +29,11 @@ def _preprocess_stable_audio_weight(
     if param.shape == loaded_weight.shape:
         return loaded_weight
 
-    if (
-        loaded_weight.ndim + 1 == param.ndim
-        and param.shape[-1] == 1
-        and loaded_weight.shape == param.shape[:-1]
-    ):
+    if loaded_weight.ndim + 1 == param.ndim and param.shape[-1] == 1 and loaded_weight.shape == param.shape[:-1]:
         return loaded_weight.unsqueeze(-1)
 
     return loaded_weight
+
 
 def apply_rotary_emb_stable_audio(
     hidden_states: torch.Tensor,
@@ -368,6 +366,7 @@ class StableAudioDiTBlock(nn.Module):
         hidden_states = residual + hidden_states
 
         return hidden_states
+
 
 class StableAudioDiTModel(nn.Module):
     """
