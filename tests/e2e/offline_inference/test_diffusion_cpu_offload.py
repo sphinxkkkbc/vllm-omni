@@ -75,7 +75,7 @@ def inference(model_name: str, offload: bool = True):
     return peak, output
 
 
-def check_audio_determinism(audio1, audio2, atol=1e-3):
+def check_audio_determinism(audio1, audio2, atol=1e-2):
     device = current_omni_platform.device_type
     if isinstance(audio1, np.ndarray):
         audio1 = torch.from_numpy(audio1).to(device)

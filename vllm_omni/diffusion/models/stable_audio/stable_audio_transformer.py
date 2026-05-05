@@ -68,6 +68,82 @@ def apply_rotary_emb_stable_audio(
     x_rot = (x_rot.float() * cos + x_rotated.float() * sin).to(hidden_states.dtype)
     return torch.cat([x_rot, x_pass], dim=-1)
 
+class StableAudioSchedulerWrapper:
+    def __init__(self, scheduler):
+        self.scheduler = scheduler
+
+    def __getattr__(self, name):
+        return getattr(self.scheduler, name)
+
+    def _get_step_index(self, timestep):
+        step_index = getattr(self.scheduler, "step_index", None)
+        if step_index is not None:
+            return step_index
+
+        timesteps = getattr(self.scheduler, "timesteps", None)
+        if timesteps is None:
+            return None
+
+        timestep = torch.as_tensor(
+            timestep,
+            device=timesteps.device,
+            dtype=timesteps.dtype,
+        )
+        indices = (timesteps == timestep).nonzero()
+        if len(indices) == 0:
+            return None
+
+        return indices[0].item()
+
+    def _is_final_zero_sigma_step(self, timestep):
+        step_index = self._get_step_index(timestep)
+        if step_index is None:
+            return False
+
+        sigmas = self.scheduler.sigmas
+        if step_index + 1 >= len(sigmas):
+            return False
+
+        sigma = sigmas[step_index]
+        next_sigma = sigmas[step_index + 1]
+        sigma_min = torch.as_tensor(
+            self.scheduler.config.sigma_min,
+            device=sigma.device,
+            dtype=sigma.dtype,
+        )
+
+        return torch.isclose(sigma, sigma_min) and torch.isclose(
+            next_sigma,
+            torch.zeros_like(next_sigma),
+        )
+
+    def step(self, model_output, timestep, sample, generator=None, return_dict=True):
+        use_zero_noise = self._is_final_zero_sigma_step(timestep)
+        old_noise_sampler = None
+
+        if use_zero_noise:
+            old_noise_sampler = getattr(self.scheduler, "noise_sampler", None)
+            self.scheduler.noise_sampler = _StableAudioZeroNoiseSampler(sample)
+
+        try:
+            return self.scheduler.step(
+                model_output,
+                timestep,
+                sample,
+                generator=generator,
+                return_dict=return_dict,
+            )
+        finally:
+            if use_zero_noise:
+                self.scheduler.noise_sampler = old_noise_sampler
+
+
+class _StableAudioZeroNoiseSampler:
+    def __init__(self, sample: torch.Tensor):
+        self.sample = sample
+
+    def __call__(self, sigma, next_sigma):
+        return torch.zeros_like(self.sample)
 
 class StableAudioGaussianFourierProjection(GaussianFourierProjection):
     """Gaussian Fourier embeddings for noise levels.
