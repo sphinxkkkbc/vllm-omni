@@ -21,6 +21,21 @@ from vllm_omni.diffusion.layers.fourier import GaussianFourierProjection
 
 logger = init_logger(__name__)
 
+def _preprocess_stable_audio_weight(
+    param: torch.Tensor,
+    loaded_weight: torch.Tensor,
+) -> torch.Tensor:
+    if param.shape == loaded_weight.shape:
+        return loaded_weight
+
+    if (
+        loaded_weight.ndim + 1 == param.ndim
+        and param.shape[-1] == 1
+        and loaded_weight.shape == param.shape[:-1]
+    ):
+        return loaded_weight.unsqueeze(-1)
+
+    return loaded_weight
 
 def apply_rotary_emb_stable_audio(
     hidden_states: torch.Tensor,
@@ -354,7 +369,6 @@ class StableAudioDiTBlock(nn.Module):
 
         return hidden_states
 
-
 class StableAudioDiTModel(nn.Module):
     """
     Optimized Stable Audio DiT model using vLLM layers.
@@ -595,8 +609,12 @@ class StableAudioDiTModel(nn.Module):
 
             if mapped_name in params_dict:
                 param = params_dict[mapped_name]
+                loaded_weight = _preprocess_stable_audio_weight(param, loaded_weight)
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                try:
+                    weight_loader(param, loaded_weight)
+                except AssertionError as err:
+                    raise AssertionError(f"Failed to load Stable Audio weight {name!r} as {mapped_name!r}") from err
                 loaded_params.add(mapped_name)
             else:
                 logger.debug(f"Skipping weight {name} - not found in model")
