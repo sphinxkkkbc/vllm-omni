@@ -41,7 +41,6 @@ def inference(model_name: str, offload: bool = True):
     device_index = current_omni_platform.current_device()
     current_omni_platform.reset_peak_memory_stats()
     monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
-    monitor.start()
 
     if model_name in AUDIO_MODEL:
         params = AUDIO_MODEL_PARAMS
@@ -56,7 +55,7 @@ def inference(model_name: str, offload: bool = True):
         **params["runner_params"],
     ) as runner:
         current_omni_platform.reset_peak_memory_stats()
-
+        monitor.start()
         output = runner.omni.generate(
             "a photo of a cat sitting on a laptop keyboard",
             OmniDiffusionSamplingParams(
