@@ -68,6 +68,7 @@ def apply_rotary_emb_stable_audio(
     x_rot = (x_rot.float() * cos + x_rotated.float() * sin).to(hidden_states.dtype)
     return torch.cat([x_rot, x_pass], dim=-1)
 
+
 class StableAudioSchedulerWrapper:
     def __init__(self, scheduler):
         self.scheduler = scheduler
@@ -144,6 +145,7 @@ class _StableAudioZeroNoiseSampler:
 
     def __call__(self, sigma, next_sigma):
         return torch.zeros_like(self.sample)
+
 
 class StableAudioGaussianFourierProjection(GaussianFourierProjection):
     """Gaussian Fourier embeddings for noise levels.
