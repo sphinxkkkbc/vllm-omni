@@ -97,7 +97,6 @@ def main():
 
     engine = Omni(
         model=args.model,
-        # stage_configs_path=args.stage_configs_path,
         deploy_config=args.deploy_config,
     )
 
