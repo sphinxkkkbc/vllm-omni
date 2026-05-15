@@ -1,105 +1,60 @@
-from io import BytesIO
 import threading
 import time
+import os
 import numpy as np
 import torch
-import soundfile as sf
 import onnxruntime
 import whisper
 import logging
 import os.path
-from .utils import resample_audio, energy_norm_fn, trim_silence
-from tqdm import tqdm
-from .model_loader import ModelSource, UnifiedModelLoader, prepare_data_iterator, AutoModel
+import yaml
+from vllm_omni.diffusion.models.step_audio_editx.utils import prepare_data_iterator
+from vllm_omni.diffusion.models.step_audio_editx.tokenizer.paraformer import ParaformerStreaming
+from vllm_omni.diffusion.models.step_audio_editx.tokenizer.frontend import WavFrontendOnline
+from vllm_omni.diffusion.models.step_audio_editx.utils import resample_audio, energy_norm_fn, trim_silence
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 logger = logging.getLogger(__name__)
 
-class AudioProcessor(AutoModel):
-    def __init__(self, model_path, model_source=ModelSource.HUGGINGFACE, **kwargs):
-        super().__init__(model_path=model_path, model_source=model_source, **kwargs)
+class FunASRModel:
+    def __init__(self, model_path, config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            kwargs = yaml.safe_load(f)
+        assert "model" in kwargs
+        kwargs["init_param"] = os.path.join(model_path, "model.pt")
+        kwargs["frontend_conf"]["cmvn_file"] = os.path.join(model_path, "am.mvn")
+
+        device = kwargs.get("device", "cuda")
+        if not torch.cuda.is_available() or kwargs.get("ngpu", 1) == 0:
+            device = "cpu"
+            kwargs["batch_size"] = 1
+        kwargs["device"] = device
+
+        if kwargs.get("ncpu", None):
+            torch.set_num_threads(kwargs.get("ncpu"))
+        vocab_size = -1
+        # build frontend
+        self.frontend = WavFrontendOnline(**kwargs["frontend_conf"])
+        kwargs["frontend"] = self.frontend
+        kwargs["input_size"] = self.frontend.output_size()
+        self.model = ParaformerStreaming(**kwargs["model_conf"], vocab_size=vocab_size, encoder_conf=kwargs["encoder_conf"], input_size=kwargs["input_size"])
+        self.model.load_weight(kwargs["init_param"])
+        self.model.to(device).eval()
+        init_param = kwargs.get("init_param", None)
+        if init_param is None:
+            raise ValueError("init_param is required but was not provided or is None")
         self.kwargs = kwargs
 
-    def inference(
-        self, input, input_len=None, model=None, kwargs=None, key=None, **cfg
-    ):
-        kwargs = self.kwargs if kwargs is None else kwargs
-        kwargs.update(cfg)
-        model = self.model if model is None else model
-        model = model.cuda()
-        model.eval()
-
-        batch_size = kwargs.get("batch_size", 1)
-
-        key_list, data_list = prepare_data_iterator(
-            input, input_len=input_len, data_type=kwargs.get("data_type", None), key=key
-        )
-
-        speed_stats = {}
-        asr_result_list = []
-        num_samples = len(data_list)
-        disable_pbar = kwargs.get("disable_pbar", False)
-        pbar = (
-            tqdm(colour="blue", total=num_samples, dynamic_ncols=True)
-            if not disable_pbar
-            else None
-        )
-        time_speech_total = 0.0
-        time_escape_total = 0.0
-        for beg_idx in range(0, num_samples, batch_size):
-            end_idx = min(num_samples, beg_idx + batch_size)
-            data_batch = data_list[beg_idx:end_idx]
-            key_batch = key_list[beg_idx:end_idx]
-            batch = {"data_in": data_batch, "key": key_batch}
-            if (end_idx - beg_idx) == 1 and kwargs.get(
-                "data_type", None
-            ) == "fbank":  # fbank
-                batch["data_in"] = data_batch[0]
-                batch["data_lengths"] = input_len
-
-            time1 = time.perf_counter()
-            with torch.no_grad():
-                results, meta_data = model.inference(**batch, **kwargs)
-            time2 = time.perf_counter()
-
-            asr_result_list.extend(results)
-
-            # batch_data_time = time_per_frame_s * data_batch_i["speech_lengths"].sum().item()
-            batch_data_time = meta_data.get("batch_data_time", -1)
-            time_escape = time2 - time1
-            speed_stats["load_data"] = meta_data.get("load_data", 0.0)
-            speed_stats["extract_feat"] = meta_data.get("extract_feat", 0.0)
-            speed_stats["forward"] = f"{time_escape:0.3f}"
-            speed_stats["batch_size"] = f"{len(results)}"
-            speed_stats["time_cost"] = f"{(time_escape)}"
-            speed_stats["rtf"] = f"{(time_escape) / batch_data_time:0.3f}"
-            description = f"{speed_stats}, "
-            if pbar:
-                pbar.update(1)
-                pbar.set_description(description)
-            time_speech_total += batch_data_time
-            time_escape_total += time_escape
-
-        if pbar:
-            # pbar.update(1)
-            pbar.set_description(f"rtf_avg: {time_escape_total/time_speech_total:0.3f}")
-        torch.cuda.empty_cache()
-        return asr_result_list
-
+    @torch.inference_mode()
     def infer_encoder(
-        self, input, input_len=None, model=None, kwargs=None, key=None, **cfg
+        self, input, input_len=None, kwargs=None, key=None, **cfg
     ):
         kwargs = self.kwargs if kwargs is None else kwargs
         kwargs.update(cfg)
-        model = self.model if model is None else model
-        model = model.cuda()
-        model.eval()
-
         batch_size = kwargs.get("batch_size", 1)
-
         key_list, data_list = prepare_data_iterator(
-            input, input_len=input_len, data_type=kwargs.get("data_type", None), key=key
+            input, data_type=kwargs.get("data_type", None), key=key
         )
-
         asr_result_list = []
         num_samples = len(data_list)
         for beg_idx in range(0, num_samples, batch_size):
@@ -113,8 +68,7 @@ class AudioProcessor(AutoModel):
                 batch["data_in"] = data_batch[0]
                 batch["data_lengths"] = input_len
 
-            with torch.no_grad():
-                results, meta_data, cache = model.infer_encoder(**batch, **kwargs)
+            results, meta_data, cache = self.model.infer_encoder(**batch, **kwargs, frontend=self.frontend)
             asr_result_list.extend(results)
 
         torch.cuda.empty_cache()
@@ -123,42 +77,13 @@ class AudioProcessor(AutoModel):
 class StepAudioTokenizer:
     def __init__(
         self,
-        encoder_path,
-        model_source=ModelSource.HUGGINGFACE,
-        funasr_model_id="dengcunqin/speech_paraformer-large_asr_nat-zh-cantonese-en-16k-vocab8501-online"
+        tokenizer_path,
+        funasr_model_id="dengcunqin/speech_paraformer-large_asr_nat-zh-cantonese-en-16k-vocab8501-online",
+        config_path="/root/lanyun-tmp/vllm-omni/vllm_omni/diffusion/models/step_audio_editx/tokenizer/tokenizer.yaml",
     ):
-        """
-        Initialize StepAudioTokenizer
-
-        Args:
-            encoder_path: Encoder path
-            model_source: Model source (auto/local/modelscope/huggingface)
-            funasr_model_id: FunASR model ID or path
-        """
-        model_loader = UnifiedModelLoader()
-        funasr_model_path = os.path.join(encoder_path, funasr_model_id)
-        # Load FunASR model - use unified loader to handle all modes
-        try:
-            self.funasr_model = model_loader.load_funasr_model(
-                encoder_path,
-                funasr_model_path,
-                source=model_source,
-                model_revision="main"
-            )
-        except Exception as e:
-            print(f"Failed to load FunASR model from {model_source}: {e}")
-            # Fallback to default method
-            self.funasr_model = AutoModel(model=funasr_model_path, model_revision="main")
-
-        # Load other resource files (these are usually local files)
-        kms_path = os.path.join(self.funasr_model.repo_path, "linguistic_tokenizer.npy")
-        cosy_tokenizer_path = os.path.join(self.funasr_model.repo_path, "speech_tokenizer_v1.onnx")
-
-        if not os.path.exists(kms_path):
-            raise FileNotFoundError(f"KMS file not found: {kms_path}")
-        if not os.path.exists(cosy_tokenizer_path):
-            raise FileNotFoundError(f"Cosy tokenizer file not found: {cosy_tokenizer_path}")
-
+        self.funasr_model = FunASRModel(model_path=os.path.join(tokenizer_path, funasr_model_id), config_path=config_path)
+        kms_path = os.path.join(tokenizer_path, "linguistic_tokenizer.npy")
+        cosy_tokenizer_path = os.path.join(tokenizer_path, "speech_tokenizer_v1.onnx")
         self.kms = torch.tensor(np.load(kms_path))
 
         providers = ["CUDAExecutionProvider"]
@@ -185,13 +110,18 @@ class StepAudioTokenizer:
 
     def preprocess_wav(self, audio, sample_rate, enable_trim=True, energy_norm=True):
         audio = resample_audio(audio, sample_rate, 16000)
+
+        if audio.dim() == 2:
+            audio = audio.squeeze(0)
+        audio = audio.cpu().to(torch.float32)
+            
         if energy_norm:
             audio = energy_norm_fn(audio)
 
         if enable_trim:
-            audio = audio.cpu().numpy().squeeze(0)
-            audio = trim_silence(audio, 16000)
-            audio = torch.from_numpy(audio)
+            audio_np = audio.numpy()
+            audio_np = trim_silence(audio_np, 16000)
+            audio = torch.from_numpy(audio_np).to(torch.float32)
             audio = audio.unsqueeze(0)
         return audio
 
@@ -214,11 +144,10 @@ class StepAudioTokenizer:
         return speech_tokens, vq02_ori, vq06_ori
 
     def get_vq02_code(self, audio, session_id=None, is_final=True):
-        _tmp_wav = BytesIO()
-        # Use soundfile instead of torchaudio.save (TorchCodec doesn't support BytesIO)
-        audio_np = audio.squeeze(0).cpu().numpy() if audio.dim() > 1 else audio.cpu().numpy()
-        sf.write(_tmp_wav, audio_np, 16000, format='WAV')
-        _tmp_wav.seek(0)
+        if audio.dim() == 2:
+            audio_in = audio.squeeze(0).cpu()
+        else:
+            audio_in = audio.cpu()
 
         with self.vq02_lock:
             cache = {}
@@ -226,7 +155,7 @@ class StepAudioTokenizer:
                 cache = self.vq02_sessions[session_id].get("cache", {})
 
             res, new_cache = self.funasr_model.infer_encoder(
-                input=[_tmp_wav],
+                input=[audio_in],
                 chunk_size=self.chunk_size,
                 encoder_chunk_look_back=self.encoder_chunk_look_back,
                 decoder_chunk_look_back=self.decoder_chunk_look_back,

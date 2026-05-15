@@ -4,105 +4,33 @@ from copy import deepcopy
 from collections import defaultdict
 import numpy as np
 import torch
-import torchaudio
 import torch.nn.functional as F
 from hyperpyyaml import load_hyperpyyaml
-from .step_audio_editx_flow import CausalMaskedDiffWithXvec
-#######这里没有CudaGraph的实现，与Step-Audio-EditX的实现稍微有点不同
+from vllm_omni.diffusion.models.step_audio_editx.decoder.flow import CausalMaskedDiffWithXvec
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
-from .step_audio_editx_bigvgan import BigVGAN
+from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
 import threading
-import torch.utils.data
-from librosa.filters import mel as librosa_mel_fn
-from scipy.io.wavfile import read
 import onnxruntime
-import whisper
-import torchaudio.compliance.kaldi as kaldi
+import torchaudio
 from typing import Dict
+import torchaudio.compliance.kaldi as kaldi
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-
-MAX_WAV_VALUE = 32768.0
-
-def load_wav(full_path):
-    sampling_rate, data = read(full_path)
-    return data, sampling_rate
-
-
-def dynamic_range_compression(x, C=1, clip_val=1e-5):
-    return np.log(np.clip(x, a_min=clip_val, a_max=None) * C)
-
-
-def dynamic_range_decompression(x, C=1):
-    return np.exp(x) / C
-
-
-def dynamic_range_compression_torch(x, C=1, clip_val=1e-5):
-    return torch.log(torch.clamp(x, min=clip_val) * C)
-
-
-def dynamic_range_decompression_torch(x, C=1):
-    return torch.exp(x) / C
-
-
-def spectral_normalize_torch(magnitudes):
-    output = dynamic_range_compression_torch(magnitudes)
-    return output
-
-
-def spectral_de_normalize_torch(magnitudes):
-    output = dynamic_range_decompression_torch(magnitudes)
-    return output
-
-
-mel_basis = {}
-hann_window = {}
-
-
-def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False):
-    # if torch.min(y) < -1.0:
-    #     print("min value is ", torch.min(y))
-    # if torch.max(y) > 1.0:
-    #     print("max value is ", torch.max(y))
-
-    global mel_basis, hann_window  # pylint: disable=global-statement
-    if f"{str(fmax)}_{str(y.device)}" not in mel_basis:
-        mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
-        mel_basis[str(fmax) + "_" + str(y.device)] = torch.from_numpy(mel).float().to(y.device)
-        hann_window[str(y.device)] = torch.hann_window(win_size).to(y.device)
-
-    y = torch.nn.functional.pad(
-        y.unsqueeze(1), (int((n_fft - hop_size) / 2), int((n_fft - hop_size) / 2)), mode="reflect"
-    )
-    y = y.squeeze(1)
-
-    spec = torch.view_as_real(
-        torch.stft(
-            y,
-            n_fft,
-            hop_length=hop_size,
-            win_length=win_size,
-            window=hann_window[str(y.device)],
-            center=center,
-            pad_mode="reflect",
-            normalized=False,
-            onesided=True,
-            return_complex=True,
-        )
-    )
-
-    spec = torch.sqrt(spec.pow(2).sum(-1) + (1e-9))
-
-    spec = torch.matmul(mel_basis[str(fmax) + "_" + str(y.device)], spec)
-    spec = spectral_normalize_torch(spec)
-
-    return spec
+"""perform fade_in_out in tensor style
+"""
+def fade_in_out(fade_in_mel:torch.Tensor, fade_out_mel:torch.Tensor, window:torch.Tensor):
+    mel_overlap_len = int(window.shape[0] / 2)
+    fade_in_mel = fade_in_mel.clone()
+    fade_in_mel[..., :mel_overlap_len] = \
+        fade_in_mel[..., :mel_overlap_len] * window[:mel_overlap_len] + \
+        fade_out_mel[..., -mel_overlap_len:] * window[mel_overlap_len:]
+    return fade_in_mel
 
 
 class CosyVoiceFrontEnd(object):
     def __init__(self, 
                  mel_conf:Dict,
                  campplus_model:str,
-                 speech_tokenizer_model:str,
                  onnx_provider:str='CUDAExecutionProvider',
                  ):
         super().__init__()
@@ -139,28 +67,13 @@ class CosyVoiceFrontEnd(object):
         return embedding
 
 
-"""perform fade_in_out in tensor style
-"""
-def fade_in_out(fade_in_mel:torch.Tensor, fade_out_mel:torch.Tensor, window:torch.Tensor):
-    mel_overlap_len = int(window.shape[0] / 2)
-    fade_in_mel = fade_in_mel.clone()
-    fade_in_mel[..., :mel_overlap_len] = \
-        fade_in_mel[..., :mel_overlap_len] * window[:mel_overlap_len] + \
-        fade_out_mel[..., -mel_overlap_len:] * window[mel_overlap_len:]
-    return fade_in_mel
-
-
-# torch._dynamo.config.cache_size_limit = 128
-# torch._dynamo.config.accumulated_cache_size_limit = 128
-
-
 """
 A wrapper for managing stream caches. 
 """
 class CosyVoice_stream_impl_(torch.nn.Module):
     def __init__(self, 
                  flow: CausalMaskedDiffWithXvec,
-                 hift: Union[HiFTGenerator, BigVGAN],
+                 hift: Union[HiFTGenerator], #  hift: Union[HiFTGenerator, BigVGAN],
                  chunk_size_list: List = [15, 24, 48],  # (0.6s, 0.96s, 1.92s) 
                  mel_cache_len: int = 8,
                  n_timesteps: int = 10, # for both stream/non-stream
@@ -175,13 +88,7 @@ class CosyVoice_stream_impl_(torch.nn.Module):
         # stream conf
         self.mel_cache_len = mel_cache_len
 
-        if isinstance(self.hift, BigVGAN):
-            # bigvgan use left 3 frames and right 3 frames as context
-            self.source_cache_len = int((mel_cache_len - 6)* 480)   # 50hz mel -> 24k wave
-        elif isinstance(self.hift, HiFTGenerator):
-            self.source_cache_len = int(mel_cache_len * 480)   # 50hz mel -> 24k wave
-        else:
-            raise ValueError(f'unsupported vocoder type {type(self.hift)}')
+        self.source_cache_len = int(mel_cache_len * 480)   # 50hz mel -> 24k wave
 
         self.register_buffer('speech_window', torch.from_numpy(np.hamming(2 * self.source_cache_len)), persistent=False)
         # session management
@@ -247,21 +154,10 @@ class CosyVoice_stream_impl_(torch.nn.Module):
             embedding.to(self.dtype),
             self.n_timesteps,
         )
-        # inference vocoder
-        with torch.no_grad():
-            if isinstance(self.hift, BigVGAN):
-                mel = torch.nn.functional.pad(mel, (3,3), mode='reflect')                                                                                                                                                                                                                     
-                speech = self.hift.inference(mel).squeeze(0) # [1,1,T] -> [1,T]
-            elif isinstance(self.hift, HiFTGenerator):
-                speech, _ = self.hift.inference(mel)
-            else:
-                raise ValueError(f'unsupported vocoder type {type(self.hift)}')
+        speech, _ = self.hift.inference(mel)
         speech = speech.cpu().to(torch.float32)
         return speech
     
-    """NOTE Internal method, do not call this method!
-    Handle device & dtype transfer.
-    """
     def _setup_cache(self,
                      token: torch.Tensor,
                      mel: torch.Tensor,
@@ -291,9 +187,6 @@ class CosyVoice_stream_impl_(torch.nn.Module):
             )
             return 
 
-    """NOTE Internal method, do not call this method!
-    Handle device transfer.
-    """
     def _token2wav_stream(self,
                           token: torch.Tensor,
                           session_id: str,
@@ -329,18 +222,7 @@ class CosyVoice_stream_impl_(torch.nn.Module):
         hift_cache_speech = self.hift_cache_dict[session_id]['speech']
         mel = torch.concat([hift_cache_mel, mel], dim=2)
         # inference vocoder
-        with torch.no_grad():
-            if isinstance(self.hift, BigVGAN):
-                if self.b_first_chunk_dict[session_id] and mel.shape[2] > 0:
-                    print(f'[INFO] first chunk mel len: {mel.shape[2]}')
-                    self.b_first_chunk_dict[session_id] = False
-                    mel = F.pad(mel, (3,0), mode='reflect')
-                if last_chunk:
-                    mel = F.pad(mel, (0,3), mode='reflect')
-                speech = self.hift.inference(mel).squeeze(0) # [1,1,T] -> [1,T]
-                source = torch.zeros(1, 1, 0, device=self.device, dtype=self.dtype) # dummy source
-            elif isinstance(self.hift, HiFTGenerator):
-                speech, source = self.hift.inference(mel, hift_cache_source)
+        speech, source = self.hift.inference(mel, hift_cache_source)
         # overlap speech smooth
         if hift_cache_speech.shape[-1] > 0:
             speech = fade_in_out(speech, hift_cache_speech, self.speech_window)
@@ -475,15 +357,17 @@ class CosyVoice:
                  n_timesteps: int = 10,
                  enable_cuda_graph: bool = False,
                  dtype=torch.float32,
+                 yaml_path=None,
                  ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
         # initiate streaming wrapper
         self.model_dir = model_dir
-        with open("{}/cosyvoice.yaml".format(model_dir), "r") as f:
+        config_path = yaml_path or f"{model_dir}/cosyvoice.yaml"
+        with open(config_path, "r") as f:
             configs = load_hyperpyyaml(f)
-            flow, hift = configs['flow'], configs['hift']
-            mel_conf = configs['mel_conf']
+            flow, hift = configs["flow"], configs["hift"]
+            mel_conf = configs["mel_conf"]
         flow.load_state_dict(torch.load(f"{model_dir}/flow.pt", map_location='cpu'))
         flow = flow.eval()
         hift.load_state_dict(torch.load(f"{model_dir}/hift.pt", map_location='cpu'))
@@ -497,7 +381,6 @@ class CosyVoice:
         self.frontend = CosyVoiceFrontEnd(
             mel_conf,
             campplus_model='{}/campplus.onnx'.format(model_dir),
-            speech_tokenizer_model='{}/speech_tokenizer_v1.onnx'.format(model_dir),
         )
     
     # Just proxy
