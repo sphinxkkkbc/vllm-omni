@@ -125,7 +125,6 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         ).to(self.device)
 
         # Load VAE (AutoencoderOobleck for audio)
-        # self.vae = AutoencoderOobleck.from_pretrained(
         self.vae = DistributedAutoencoderOobleck.from_pretrained(
             model,
             subfolder="vae",
@@ -584,7 +583,6 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         else:
             # Convert latents to VAE dtype (VAE may use float32)
             latents_for_vae = latents.to(dtype=self.vae.dtype)
-            # audio = self.vae.decode(latents_for_vae, chunked=True).sample
             audio = self.vae.decode(latents_for_vae)
 
         # Trim to requested length
