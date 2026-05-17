@@ -40,12 +40,17 @@ def run_tts(args) -> None:
     payload = {
         "model": args.model,
         "input": args.text,
-        # "voice": "default",
         "response_format": args.response_format,
+        "extra_params": {
+          "seed": args.seed
+        },
     }
 
     if args.language:
         payload["language"] = args.language
+
+    if args.voice:  
+        payload["voice"] = args.voice
 
     if args.ref_audio:
         ref = args.ref_audio
@@ -54,12 +59,19 @@ def run_tts(args) -> None:
         else:
             payload["ref_audio"] = encode_audio_to_base64(ref)
 
+    if args.ref_text:
+        payload["ref_text"] = args.ref_text
+
+    if args.instructions:
+        payload["instructions"] = args.instructions
+
     print(f"Model: {args.model}")
     print(f"Text: {args.text}")
+    print(f"Seed: {args.seed}")
+    print(f"Voice: {args.voice}")
+
     if args.language:
         print(f"Language: {args.language}")
-    if args.ref_audio:
-        print(f"  ref_audio: {args.ref_audio[:80]}...")
     print("Generating audio...")
 
     api_url = f"{args.api_base}/v1/audio/speech"
@@ -67,7 +79,6 @@ def run_tts(args) -> None:
         "Content-Type": "application/json",
         "Authorization": f"Bearer {args.api_key}",
     }
-
     with httpx.Client(timeout=300.0) as client:
         response = client.post(api_url, json=payload, headers=headers)
 
@@ -104,10 +115,34 @@ def main():
         help="Audio format (default: wav)",
     )
     parser.add_argument(
+        "--voice",
+        type=str,
+        default=None,
+        help="Optional voice name",
+    )
+    parser.add_argument(
         "--ref-audio",
         type=str,
         default=None,
         help="Reference audio for voice cloning (local path, URL, or data: URI)",
+    )
+    parser.add_argument(
+        "--ref-text",
+        type=str,
+        default=None,
+        help="Reference text for voice cloning",
+    )
+    parser.add_argument(
+        "--instructions",
+        type=str,
+        default=None,
+        help="Voice style/emotion instructions",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for generation (default: 42)",
     )
     parser.add_argument("--output", "-o", default=None, help="Output file path")
     args = parser.parse_args()
