@@ -212,7 +212,7 @@ Voice cloning requires `transformers>=5.3.0`. Auto and design modes work with `t
 ```bash
 python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
-    --text "Hello, this is a test." \ 
+    --text "Hello, this is a test." \
     --seed 42
 ```
 
@@ -222,7 +222,7 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
     --text "Hello, this is a test." \
     --ref-audio ref.wav \
-    --ref-text  "This is the reference transcription." \ 
+    --ref-text  "This is the reference transcription." \
     --seed 42
 ```
 
@@ -231,7 +231,7 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
     --text "Hello, this is a test." \
-    --instruct "female, low pitch, british accent" \ 
+    --instruct "female, low pitch, british accent" \
     --seed 42
 ```
 
@@ -240,7 +240,7 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
     --text "你好，这是一个测试。" \
-    --lang zh \ 
+    --lang zh \
     --seed 42
 ```
 

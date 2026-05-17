@@ -10,6 +10,7 @@ Uses request-mode execution (all steps in one forward() call).
 """
 
 from __future__ import annotations
+
 import json
 import os
 from collections.abc import Iterable

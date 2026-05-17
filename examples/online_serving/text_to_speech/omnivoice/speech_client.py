@@ -11,6 +11,7 @@ Examples:
 import argparse
 import base64
 import os
+
 import httpx
 
 DEFAULT_API_BASE = "http://localhost:8091"
@@ -41,15 +42,13 @@ def run_tts(args) -> None:
         "model": args.model,
         "input": args.text,
         "response_format": args.response_format,
-        "extra_params": {
-          "seed": args.seed
-        },
+        "extra_params": {"seed": args.seed},
     }
 
     if args.language:
         payload["language"] = args.language
 
-    if args.voice:  
+    if args.voice:
         payload["voice"] = args.voice
 
     if args.ref_audio:
