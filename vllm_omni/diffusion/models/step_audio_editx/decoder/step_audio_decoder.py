@@ -1,5 +1,5 @@
 from functools import cached_property, reduce
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Iterable
 from copy import deepcopy
 from collections import defaultdict
 import numpy as np
@@ -366,20 +366,20 @@ class CosyVoice:
         config_path = yaml_path or f"{model_dir}/cosyvoice.yaml"
         with open(config_path, "r") as f:
             configs = load_hyperpyyaml(f)
-            flow, hift = configs["flow"], configs["hift"]
-            mel_conf = configs["mel_conf"]
-        flow.load_state_dict(torch.load(f"{model_dir}/flow.pt", map_location='cpu'))
-        flow = flow.eval()
-        hift.load_state_dict(torch.load(f"{model_dir}/hift.pt", map_location='cpu'))
-        hift = hift.eval()
-        cosy_impl = CosyVoice_stream_impl_(flow, hift, chunk_size_list, mel_cache_len, n_timesteps)
+        self.flow = CausalMaskedDiffWithXvec(configs["flow"])
+        self.hift = HiFTGenerator(configs["hift"])
+        # self.flow.load_state_dict(torch.load(f"{model_dir}/flow.pt", map_location='cpu'))
+        # flow = flow.eval()
+        # self.hift.load_state_dict(torch.load(f"{model_dir}/hift.pt", map_location='cpu'))
+        # hift = hift.eval()
+        cosy_impl = CosyVoice_stream_impl_(self.flow, self.hift, chunk_size_list, mel_cache_len, n_timesteps)
         self.cosy_impl = cosy_impl.to(self.device, self.dtype)
         if enable_cuda_graph:
             self.cosy_impl.flow.scatter_cuda_graph(enable_cuda_graph)
             self.cosy_impl.hift._init_cuda_graph()
         # feature frontend
         self.frontend = CosyVoiceFrontEnd(
-            mel_conf,
+            configs["mel_conf"],
             campplus_model='{}/campplus.onnx'.format(model_dir),
         )
     
@@ -417,3 +417,18 @@ class CosyVoice:
 
     def clean_up(self, session_id: str):
         self.cosy_impl.clean_up(session_id)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        params_dict = dict(self.named_parameters())
+        # self.flow.load_state_dict(torch.load(weights, map_location='cpu'))
+        # self.hift.load_state_dict(torch.load(weights, map_location='cpu'))
+        loaded_params = set()
+        for name, loaded_weight in weights:
+            if name not in params_dict:
+                print(f"Miss key in ckpt: {name}")
+                continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params

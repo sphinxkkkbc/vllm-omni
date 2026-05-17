@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from typing import Iterable, Tuple, Optional
 import torchaudio
-from vllm_omni.diffusion.models.step_audio_editx.prompts import AUDIO_EDIT_CLONE_SYSTEM_PROMPT_TPL, AUDIO_EDIT_SYSTEM_PROMPT
+from vllm_omni.diffusion.models.step_audio_editx.utils import AUDIO_EDIT_CLONE_SYSTEM_PROMPT_TPL, AUDIO_EDIT_SYSTEM_PROMPT
 from vllm import SamplingParams
 from vllm_omni.diffusion.models.step_audio_editx.decoder.step_audio_decoder import CosyVoice
 from vllm_omni.diffusion.models.step_audio_editx.tokenizer.step_audio_editx_audio_tokenizer import StepAudioTokenizer
@@ -24,7 +24,6 @@ class StepAudioEditxPipeline(nn.Module):
         self.cosy_model = CosyVoice(**kwargs)
         self.edit_clone_sys_prompt_tpl = AUDIO_EDIT_CLONE_SYSTEM_PROMPT_TPL
         self.edit_sys_prompt = AUDIO_EDIT_SYSTEM_PROMPT
-
 
     def clone(
         self,

@@ -8,11 +8,13 @@ import whisper
 import logging
 import os.path
 import yaml
+from typing import Iterable
 from vllm_omni.diffusion.models.step_audio_editx.utils import prepare_data_iterator
 from vllm_omni.diffusion.models.step_audio_editx.tokenizer.paraformer import ParaformerStreaming
 from vllm_omni.diffusion.models.step_audio_editx.tokenizer.frontend import WavFrontendOnline
 from vllm_omni.diffusion.models.step_audio_editx.utils import resample_audio, energy_norm_fn, trim_silence
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import AutoWeightsLoader
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +40,8 @@ class FunASRModel:
         kwargs["frontend"] = self.frontend
         kwargs["input_size"] = self.frontend.output_size()
         self.model = ParaformerStreaming(**kwargs["model_conf"], vocab_size=vocab_size, encoder_conf=kwargs["encoder_conf"], input_size=kwargs["input_size"])
-        self.model.load_weight(kwargs["init_param"])
-        self.model.to(device).eval()
+        # self.model.load_weight(kwargs["init_param"])
+        # self.model.to(device).eval()
         init_param = kwargs.get("init_param", None)
         if init_param is None:
             raise ValueError("init_param is required but was not provided or is None")
@@ -260,3 +262,7 @@ class StepAudioTokenizer:
             i += 2
             j += 3
         return "".join([f"<audio_{x}>" for x in result])
+    
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
