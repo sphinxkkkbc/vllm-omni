@@ -148,7 +148,7 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         lang = "None"
         instruct = "None"
         extra = req.sampling_params.extra_args or {}
-        seed = extra.get("seed", 42)
+        seed = extra.get("seed", None)
 
         voice_name = None
         if isinstance(prompt, dict):

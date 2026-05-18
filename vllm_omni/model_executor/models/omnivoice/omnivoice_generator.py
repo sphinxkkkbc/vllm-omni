@@ -13,6 +13,7 @@ via FlashAttention/SageAttention/SDPA backends.
 from __future__ import annotations
 
 import math
+import random
 
 import torch
 import torch.nn as nn
@@ -47,7 +48,7 @@ def _get_time_steps(
 
 def _gumbel_sample(logits: torch.Tensor, temperature: float, generator: torch.Generator) -> torch.Tensor:
     """Add Gumbel noise for stochastic position selection."""
-    noise = -torch.log(-torch.log(torch.rand_like(logits, generator=generator).clamp(min=1e-8)))
+    noise = -torch.log(-torch.log(torch.rand(logits.shape, generator=generator).clamp(min=1e-8)))
     return logits / max(temperature, 1e-8) + noise
 
 
@@ -371,13 +372,13 @@ class OmniVoiceGenerator(nn.Module):
         audio_mask: torch.Tensor,
         attention_mask: torch.Tensor,
         target_lens: list[int],
+        seed: int | None = None,
         num_step: int = 32,
         guidance_scale: float = 2.0,
         t_shift: float = 0.1,
         layer_penalty_factor: float = 5.0,
         position_temperature: float = 5.0,
         class_temperature: float = 0.0,
-        seed: int = 42,
     ) -> torch.Tensor:
         """Run the full 32-step iterative unmasking generation.
 
@@ -401,6 +402,8 @@ class OmniVoiceGenerator(nn.Module):
         max_target_len = max(target_lens)
         mask_id = self.config.audio_mask_id
         num_codebooks = self.config.num_audio_codebook
+        if seed is None:
+            seed = random.randint(0, 2**63 - 1)
         generator = torch.Generator(device=device).manual_seed(seed)
 
         # Initialize all target tokens as [MASK]

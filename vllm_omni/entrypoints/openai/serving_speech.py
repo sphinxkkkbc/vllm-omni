@@ -2394,7 +2394,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 request.input[:50] + "..." if len(request.input) > 50 else request.input,
                 "ref_audio" in prompt,
             )
-
+            if request.seed is not None:
+                if request.extra_params is None:
+                    request.extra_params = {}
+                request.extra_params["seed"] = request.seed
             # Apply extra_params from the request to sampling params
             sampling_params_list = self._diffusion_engine.default_sampling_params_list
             if request.extra_params is not None:

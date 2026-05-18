@@ -279,11 +279,11 @@ python speech_client.py \
 --language French \
 --instructions "loud voice"
 
-# Deterministic output
+# Deterministic output with seed parameter
 python speech_client.py --text "Hello, how are you?" --seed 42
 ```
 
-The client supports `-api-base`, `--model`, `--text`, `--response-format`, `--language`, `--voice`, `--ref-audio`, `--ref-text`, `--instructions`, `--seed`, and `--output`.
+The client supports `--api-base`, `--model`, `--text`, `--response-format`, `--language`, `--voice`, `--ref-audio`, `--ref-text`, `--instructions`, `--seed`, and `--output`.
 
 
 ## Qwen3-TTS

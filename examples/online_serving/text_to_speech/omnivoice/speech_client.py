@@ -42,8 +42,9 @@ def run_tts(args) -> None:
         "model": args.model,
         "input": args.text,
         "response_format": args.response_format,
-        "extra_params": {"seed": args.seed},
     }
+    if args.seed is not None:
+        payload["extra_params"]["seed"] = args.seed
 
     if args.language:
         payload["language"] = args.language
@@ -67,7 +68,9 @@ def run_tts(args) -> None:
     print(f"Model: {args.model}")
     print(f"Text: {args.text}")
     print(f"Seed: {args.seed}")
-    print(f"Voice: {args.voice}")
+
+    if args.voice:
+        print(f"Voice: {args.voice}")
 
     if args.language:
         print(f"Language: {args.language}")
@@ -140,7 +143,7 @@ def main():
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=None,
         help="Random seed for generation (default: 42)",
     )
     parser.add_argument("--output", "-o", default=None, help="Output file path")
