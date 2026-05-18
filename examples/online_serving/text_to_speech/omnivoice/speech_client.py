@@ -144,7 +144,7 @@ def main():
         "--seed",
         type=int,
         default=None,
-        help="Random seed for generation (default: 42)",
+        help="Random seed for generation, default: None for stochastic output)",
     )
     parser.add_argument("--output", "-o", default=None, help="Output file path")
     args = parser.parse_args()
