@@ -4,11 +4,9 @@ import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 import logging
 import numpy as np
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List, Iterable
 from vllm_omni.diffusion.models.step_audio_editx.utils import to_device
 from torch.amp import autocast
-from typing import Iterable
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 #这里的Encoder可能用非流式的SinusoidalPositionEncoder
 from vllm_omni.diffusion.models.step_audio_editx.tokenizer.transformer_utils import (
     MultiHeadedAttentionSANMwithMask,
@@ -17,6 +15,8 @@ from vllm_omni.diffusion.models.step_audio_editx.tokenizer.transformer_utils imp
     PositionwiseFeedForward,
     repeat,
 )
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
 
 logger = logging.getLogger(__name__)
 
@@ -558,33 +558,22 @@ class ParaformerStreaming(Paraformer):
             self.init_cache(cache, **kwargs)
 
         return result, meta_data, cache
-    
-    def load_weight(self, model_path, map_location="cuda"):
-        dst_state = self.state_dict()
-        src_state = torch.load(model_path, map_location=map_location)
-        if "state_dict" in src_state:
-            src_state = src_state["state_dict"]
-
-        for k in dst_state.keys():
-            if not k.startswith("module.") and "module." + k in src_state.keys():
-                k_ddp = "module." + k
-            else:
-                k_ddp = k
-            if k_ddp in src_state:
-                dst_state[k] = src_state[k_ddp]
-            else:
-                print(f"Miss key in ckpt: model: {k}, ckpt: {k_ddp}")
-
-        self.load_state_dict(dst_state, strict=True)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params_dict = dict(self.named_parameters())
-        loaded_params = set()
-        for name, loaded_weight in weights:
-            if name not in params_dict:
-                continue
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+      params = dict(self.named_parameters())
+      loaded = set()
+
+      for name, w in weights:
+          if name.startswith("module."):
+              name = name[len("module."):]
+
+          if name not in params:
+              continue
+
+          p = params[name]
+          wl = getattr(p, "weight_loader", default_weight_loader)
+          wl(p, w)
+          loaded.add(name)
+
+      return loaded
+

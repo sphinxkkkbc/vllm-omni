@@ -15,6 +15,8 @@ import torchaudio
 from typing import Dict
 import torchaudio.compliance.kaldi as kaldi
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import AutoWeightsLoader
+
 
 """perform fade_in_out in tensor style
 """
@@ -346,6 +348,22 @@ class CosyVoice_stream_impl_(torch.nn.Module):
         self.speech_token_dict.pop(session_id, None)
         torch.cuda.empty_cache()
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        params_dict = dict(self.named_parameters())
+        # self.flow.load_state_dict(torch.load(weights, map_location='cpu'))
+        # self.hift.load_state_dict(torch.load(weights, map_location='cpu'))
+        loaded_params = set()
+        for name, loaded_weight in weights:
+            if name not in params_dict:
+                print(f"Miss key in ckpt: {name}")
+                continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
+
+
 
 """Keep compatible with cosyvoice1
 """
@@ -419,16 +437,4 @@ class CosyVoice:
         self.cosy_impl.clean_up(session_id)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params_dict = dict(self.named_parameters())
-        # self.flow.load_state_dict(torch.load(weights, map_location='cpu'))
-        # self.hift.load_state_dict(torch.load(weights, map_location='cpu'))
-        loaded_params = set()
-        for name, loaded_weight in weights:
-            if name not in params_dict:
-                print(f"Miss key in ckpt: {name}")
-                continue
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+        return AutoWeightsLoader(self.cosy_impl).load_weights(weights)

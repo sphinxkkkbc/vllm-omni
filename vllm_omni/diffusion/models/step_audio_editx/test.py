@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 def test_tokenizer():
     tokenizer = StepAudioTokenizer(
-            tokenizer_path="/root/lanyun-tmp/Model/hub/models--stepfun-ai--Step-Audio-Tokenizer/snapshots/af7e5a3ec06175a7facae9d4100073d6e4dbb36c",
+            tokenizer_path="/root/workspace/Model/hub/models--stepfun-ai--Step-Audio-Tokenizer/snapshots/af7e5a3ec06175a7facae9d4100073d6e4dbb36c",
             funasr_model_id="dengcunqin/speech_paraformer-large_asr_nat-zh-cantonese-en-16k-vocab8501-online"
         )
     wav_path = '/root/lanyun-tmp/vllm-omni/Rajat_sharma_hin_25s.wav'
@@ -80,6 +80,22 @@ def test_ar_vllm():
         # x = torch.ones(1,1,3072).cuda()
         output = ar_model(x)
         print(output)
+
+def test_tokenizer_weight_load():
+    tokenizer = StepAudioTokenizer(
+            tokenizer_path="/root/workspace/Model/hub/models--stepfun-ai--Step-Audio-Tokenizer/snapshots/af7e5a3ec06175a7facae9d4100073d6e4dbb36c",
+            funasr_model_id="dengcunqin/speech_paraformer-large_asr_nat-zh-cantonese-en-16k-vocab8501-online",
+            config_path="/root/workspace/vllm-omni/vllm_omni/diffusion/models/step_audio_editx/tokenizer/tokenizer.yaml",
+        )
+    wav_path = '/root/workspace/out_seed42_1.wav'
+    speech_np, sample_rate = sf.read(wav_path)
+    if speech_np.ndim == 1:
+        wav = torch.from_numpy(speech_np).float().unsqueeze(0)  # (samples,) -> (1, samples)
+    else:
+        wav = torch.from_numpy(speech_np).float().T 
+    print(f"Loaded wav file: {wav_path}, sample_rate: {sample_rate}, wav shape: {wav.shape}")
+    vq0206_codes, vq02_codes_ori, vq06_codes_ori = tokenizer.wav2token(audio=wav, sample_rate=24000)
+
 
 
 if __name__ == "__main__":
