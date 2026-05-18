@@ -83,7 +83,7 @@ def run_e2e():
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=None,
         help="Random seed for generation",
     )
     nullify_stage_engine_defaults(parser)
