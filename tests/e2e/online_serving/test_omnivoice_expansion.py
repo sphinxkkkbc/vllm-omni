@@ -73,6 +73,7 @@ class TestOmniVoiceTTS:
         }
         openai_client.send_audio_speech_request(request_config)
 
+
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 class TestOmniVoiceSeed:
     """E2E tests for OmniVoice Seed Params."""
