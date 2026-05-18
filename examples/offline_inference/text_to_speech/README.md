@@ -223,7 +223,7 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
     --text "Hello, this is a test." \
     --ref-audio ref.wav \
-    --ref-text  "This is the reference transcription." 
+    --ref-text  "This is the reference transcription."
 ```
 
 ### Voice design
@@ -231,7 +231,7 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
     --text "Hello, this is a test." \
-    --instruct "female, low pitch, british accent" 
+    --instruct "female, low pitch, british accent"
 ```
 
 ### Language hint
