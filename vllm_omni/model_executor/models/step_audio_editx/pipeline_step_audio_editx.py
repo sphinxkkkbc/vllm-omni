@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 from typing import Iterable, Tuple, Optional
 import torchaudio
-from vllm_omni.model_executor.models.step_audio_editx.utils import AUDIO_EDIT_CLONE_SYSTEM_PROMPT_TPL, AUDIO_EDIT_SYSTEM_PROMPT
 from vllm_omni.model_executor.models.step_audio_editx.decoder.step_audio_decoder import CosyVoice
 from vllm_omni.model_executor.models.step_audio_editx.tokenizer.step_audio_editx_audio_tokenizer import StepAudioTokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader

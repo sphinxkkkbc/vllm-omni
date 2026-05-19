@@ -73,8 +73,6 @@ class RelPositionMultiHeadedAttention(nn.Module):
                  n_feat: int,
                  dropout_rate: float,
                  key_bias: bool = True):
-        """Construct an RelPositionMultiHeadedAttention object."""
-        
         super().__init__()
         assert n_feat % n_head == 0
         # We assume d_v always equals d_k
@@ -580,97 +578,9 @@ class UpsampleConformerEncoderV2(torch.nn.Module):
             ) for _ in range(num_up_blocks)
         ])
 
-        self.enable_cuda_graph = False
-        self.use_cuda_graph = False
-        self.graph_encoder = {}
-        self.graph_up_encoder = {}
         self.inference_buffers_encoder = {}
         self.inference_buffers_up_encoder = {}
         self.max_static_time = 1500
-    
-    # FIXME(sfy) revert hard-coded bfloat16 
-    # this method is skipped in CausalMaskedDiffWithXvec.scatter_cuda_graph
-    def scatter_cuda_graph(self, enable_cuda_graph: bool):
-        self.enable_cuda_graph = enable_cuda_graph
-        if self.enable_cuda_graph:
-            self._init_cuda_graph()
-    
-    def _init_cuda_graph(self):
-
-        for l in range(100, 1500, 10):
-            static_x = torch.zeros((1, l, 512), 
-                                dtype=torch.float32, device=torch.device('cuda'))
-            static_mask = torch.ones((1, 1, l), 
-                                    dtype=torch.bool, device=torch.device('cuda'))
-            static_pos_emb = torch.zeros((1, 2*l-1, 512), 
-                                        dtype=torch.float32, device=torch.device('cuda'))
-            
-            static_inputs = [
-                static_x,
-                static_mask,
-                static_pos_emb,
-            ]
-            
-            self._forward_impl_encoder(
-                static_inputs[0],
-                static_inputs[1],
-                static_inputs[2],
-            )
-            graph = torch.cuda.CUDAGraph()
-            with torch.no_grad():
-                with torch.cuda.graph(graph):
-                    static_out_x = self._forward_impl_encoder(
-                        static_inputs[0],
-                        static_inputs[1],
-                        static_inputs[2]
-                    )
-            self.graph_encoder[l] = graph
-            static_outputs = [
-                static_out_x,
-            ]
-            self.inference_buffers_encoder[l] = {
-                'static_inputs': static_inputs,
-                'static_outputs': static_outputs
-            }
-
-        for l in range(100, 1500, 10):
-            static_x = torch.zeros((1, l, 512), 
-                                dtype=torch.float32, device=torch.device('cuda'))
-            static_mask = torch.ones((1, 1, l), 
-                                    dtype=torch.bool, device=torch.device('cuda'))
-            static_pos_emb = torch.zeros((1, 2*l-1, 512), 
-                                        dtype=torch.float32, device=torch.device('cuda'))
-            
-            static_inputs = [
-                static_x,
-                static_mask,
-                static_pos_emb,
-            ]
-            
-            self._forward_impl_up_encoder(
-                static_inputs[0],
-                static_inputs[1],
-                static_inputs[2],
-            )
-            graph = torch.cuda.CUDAGraph()
-            with torch.no_grad():
-                with torch.cuda.graph(graph):
-                    static_out_x = self._forward_impl_up_encoder(
-                        static_inputs[0],
-                        static_inputs[1],
-                        static_inputs[2]
-                    )
-            self.graph_up_encoder[l] = graph
-            static_outputs = [
-                static_out_x,
-            ]
-            self.inference_buffers_up_encoder[l] = {
-                'static_inputs': static_inputs,
-                'static_outputs': static_outputs
-            }
-
-        self.use_cuda_graph = True
-        print("CUDA Graph initialized successfully for encoder and up_encoder")
 
     # @torch.compile(dynamic=True,backend="eager")
     def _forward_impl_encoder(self,
@@ -707,14 +617,8 @@ class UpsampleConformerEncoderV2(torch.nn.Module):
         # lookahead
         xs = self.pre_lookahead_layer(xs)
         # conformer block
-        if self.enable_cuda_graph and xs.shape[1] in self.graph_encoder:
-            self.inference_buffers_encoder[xs.shape[1]]['static_inputs'][0].copy_(xs)
-            self.inference_buffers_encoder[xs.shape[1]]['static_inputs'][1].copy_(masks)
-            self.inference_buffers_encoder[xs.shape[1]]['static_inputs'][2].copy_(pos_emb)
-            self.graph_encoder[xs.shape[1]].replay()    
-            xs = self.inference_buffers_encoder[xs.shape[1]]['static_outputs'][0]
-        else:
-            xs = self._forward_impl_encoder(xs, masks, pos_emb)
+        
+        xs = self._forward_impl_encoder(xs, masks, pos_emb)
         # upsample
         xs = xs.transpose(1, 2).contiguous()
         xs, xs_lens = self.up_layer(xs, xs_lens)
@@ -724,14 +628,8 @@ class UpsampleConformerEncoderV2(torch.nn.Module):
         T = xs.size(1)
         masks = ~make_pad_mask(xs_lens, T).unsqueeze(1)  # (B, 1, T)
         xs, pos_emb = self.up_embed(xs)
-        if self.enable_cuda_graph and xs.shape[1] in self.graph_up_encoder:
-            self.inference_buffers_up_encoder[xs.shape[1]]['static_inputs'][0].copy_(xs)
-            self.inference_buffers_up_encoder[xs.shape[1]]['static_inputs'][1].copy_(masks)
-            self.inference_buffers_up_encoder[xs.shape[1]]['static_inputs'][2].copy_(pos_emb)
-            self.graph_up_encoder[xs.shape[1]].replay()
-            xs = self.inference_buffers_up_encoder[xs.shape[1]]['static_outputs'][0]
-        else:
-            xs = self._forward_impl_up_encoder(xs, masks, pos_emb)
+        
+        xs = self._forward_impl_up_encoder(xs, masks, pos_emb)
         # post norm
         if self.normalize_before:
             xs = self.after_norm(xs)
@@ -934,7 +832,6 @@ class Attention(torch.nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x, new_att_cache
-
 
 def modulate(x, shift, scale):
     return x * (1 + scale) + shift
@@ -1158,64 +1055,11 @@ class DiT(nn.Module):
         ])
         self.final_layer = FinalLayer(hidden_size, self.out_channels)
 
-        self.enable_cuda_graph = False
-        self.use_cuda_graph = False
-
-        self.graph_chunk = {}
         self.inference_buffers_chunk = {}
         self.max_size_chunk = {}
 
         self.register_buffer('att_cache_buffer', torch.zeros((16, 2, 8, 1000, 128)), persistent=False)
         self.register_buffer('cnn_cache_buffer', torch.zeros((16, 2, 1024, 2)), persistent=False)
-
-    def _init_cuda_graph_chunk(self):
-        # get dtype, device from registered buffer
-        dtype, device = self.cnn_cache_buffer.dtype, self.cnn_cache_buffer.device
-        # init cuda graph for streaming forward
-        with torch.no_grad():
-            for chunk_size in [30, 48, 96]:
-                if chunk_size == 30 or chunk_size == 48:
-                    max_size = 500
-                    self.max_size_chunk[chunk_size] = max_size
-                else:
-                    max_size = 1000
-                    self.max_size_chunk[chunk_size] = max_size
-                static_x1 = torch.zeros((2, 320, chunk_size), dtype=dtype, device=device)
-                static_t1 = torch.zeros((2, 1, 512), dtype=dtype, device=device)
-                static_mask1 = torch.ones((2, chunk_size, max_size+chunk_size), dtype=torch.bool, device=device)
-                static_att_cache = torch.zeros((16, 2, 8, max_size, 128), dtype=dtype, device=device)
-                static_cnn_cache = torch.zeros((16, 2, 1024, 2), dtype=dtype, device=device)
-                static_inputs1 = [
-                    static_x1, 
-                    static_t1, 
-                    static_mask1, 
-                    static_cnn_cache, 
-                    static_att_cache, 
-                ]
-                static_new_cnn_cache = torch.zeros((16, 2, 1024, 2), dtype=dtype, device=device)
-                static_new_att_cache = torch.zeros((16, 2, 8, max_size+chunk_size, 128), dtype=dtype, device=device)
-                self.blocks_forward_chunk(
-                    static_inputs1[0], 
-                    static_inputs1[1], 
-                    static_inputs1[2], 
-                    static_inputs1[3], 
-                    static_inputs1[4], 
-                    static_new_cnn_cache, 
-                    static_new_att_cache)
-                graph_chunk = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph_chunk):
-                    static_out1 = self.blocks_forward_chunk(static_x1, static_t1, static_mask1, static_cnn_cache, static_att_cache, static_new_cnn_cache, static_new_att_cache)
-                static_outputs1 = [static_out1, static_new_cnn_cache, static_new_att_cache]
-                self.inference_buffers_chunk[chunk_size] = {
-                    'static_inputs': static_inputs1,
-                    'static_outputs': static_outputs1
-                }
-                self.graph_chunk[chunk_size] = graph_chunk
-
-    def _init_cuda_graph_all(self):
-        self._init_cuda_graph_chunk()
-        self.use_cuda_graph = True
-        print(f"CUDA Graph initialized successfully for chunk decoder")
 
     def forward(self, x, mask, mu, t, spks=None, cond=None):
         """Args:
@@ -1225,9 +1069,6 @@ class DiT(nn.Module):
             spks: shape (b, c)
             cond: shape (b, c, t)
         """
-        # (sfy) chunk training strategy should not be open-sourced
-
-        # time
         t = self.t_embedder(t).unsqueeze(1)  # (b, 1, c)
         x = pack([x, mu], "b * t")[0]
         if spks is not None:
@@ -1286,25 +1127,10 @@ class DiT(nn.Module):
             last_att_len = 0
         chunk_size = x.shape[2]
         mask = torch.ones(x.shape[0], chunk_size, last_att_len+chunk_size, dtype=torch.bool, device=x.device)
-        if self.use_cuda_graph and att_cache[0] is not None and chunk_size in self.graph_chunk and last_att_len <= self.max_size_chunk[chunk_size]:
-            padded_mask = torch.zeros((2, chunk_size, self.max_size_chunk[chunk_size]+chunk_size), dtype=mask.dtype, device=mask.device)
-            padded_mask[:, :, :mask.shape[-1]] = mask
-            padded_att_cache = torch.zeros((16, 2, 8, self.max_size_chunk[chunk_size], 128), dtype=att_cache.dtype, device=att_cache.device)
-            padded_att_cache[:, :, :, :last_att_len, :] = att_cache
-            self.inference_buffers_chunk[chunk_size]['static_inputs'][0].copy_(x)
-            self.inference_buffers_chunk[chunk_size]['static_inputs'][1].copy_(t)
-            self.inference_buffers_chunk[chunk_size]['static_inputs'][2].copy_(padded_mask)
-            self.inference_buffers_chunk[chunk_size]['static_inputs'][3].copy_(cnn_cache)
-            self.inference_buffers_chunk[chunk_size]['static_inputs'][4].copy_(padded_att_cache)
-            self.graph_chunk[chunk_size].replay()
-            x = self.inference_buffers_chunk[chunk_size]['static_outputs'][0][:, :, :chunk_size]
-            new_cnn_cache = self.inference_buffers_chunk[chunk_size]['static_outputs'][1]
-            new_att_cache = self.inference_buffers_chunk[chunk_size]['static_outputs'][2][:, :, :, :chunk_size+last_att_len, :]          
-        else:
-            mask = None
-            x = self.blocks_forward_chunk(x, t, mask, cnn_cache, att_cache, self.cnn_cache_buffer, self.att_cache_buffer)
-            new_cnn_cache = self.cnn_cache_buffer
-            new_att_cache = self.att_cache_buffer[:, :, :, :last_att_len+chunk_size, :]
+        mask = None
+        x = self.blocks_forward_chunk(x, t, mask, cnn_cache, att_cache, self.cnn_cache_buffer, self.att_cache_buffer)
+        new_cnn_cache = self.cnn_cache_buffer
+        new_att_cache = self.att_cache_buffer[:, :, :, :last_att_len+chunk_size, :]
 
         return x, new_cnn_cache, new_att_cache
     
@@ -1348,19 +1174,6 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         self.encoder_proj = torch.nn.Linear(self.encoder.output_size(), output_size)
         self.decoder = decoder
 
-        # xvec projection with CUDA Graph optimization
-        # 初始化 CUDA Graph 相关变量
-        self.enable_cuda_graph = False
-        self.static_embedding = None
-        self.static_output = None
-        self.graph = None
-        self.embedding_shape = None
-
-    def scatter_cuda_graph(self, enable_cuda_graph: bool):
-        self.enable_cuda_graph = enable_cuda_graph
-        if self.enable_cuda_graph:
-            # self.encoder.scatter_cuda_graph(enable_cuda_graph)
-            self.decoder.scatter_cuda_graph(enable_cuda_graph)
 
     @torch.inference_mode()
     def inference(self,
