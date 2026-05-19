@@ -2,11 +2,13 @@ import math
 from dataclasses import dataclass
 import logging
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Optional
 import torch
 import torch.nn as nn
 from transformers import LlamaConfig
+from vllm import SamplingParams
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -15,6 +17,8 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from transformers import AutoTokenizer
+from vllm_omni.model_executor.models.step_audio_editx.utils import AUDIO_EDIT_CLONE_SYSTEM_PROMPT_TPL, AUDIO_EDIT_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -266,7 +270,7 @@ class Step1ForCausalLM(nn.Module):
             ("mlp.gate_up_proj", "mlp.gate_proj", 0),
             ("mlp.gate_up_proj", "mlp.up_proj", 1),
         ]
-        for name, loaded_weight in weights.items():
+        for name, loaded_weight in weights:
             if name.startswith("model.layers."):
                 name = name[len("model."):]
             mapped_name = name_mapping.get(name, name)
@@ -306,13 +310,134 @@ class Step1ForCausalLM(nn.Module):
             print(name)
 
         return loaded_params
+    
+class StepAudioAR:
+    def __init__(self, config, vllm_config, **kwargs) -> None:
+        self.text_tokenizer = AutoTokenizer.from_pretrained(**kwargs)
+        self.llm = Step1ForCausalLM(Step1CausalLMConfig())
+        self.edit_clone_sys_prompt_tpl = AUDIO_EDIT_CLONE_SYSTEM_PROMPT_TPL
+        self.edit_sys_prompt = AUDIO_EDIT_SYSTEM_PROMPT
 
-    def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **kwargs):
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "past_key_values": kwargs.get("past_key_values"),
-        }
 
-    def _reorder_cache(self, past_key_values, beam_idx):
-        return past_key_values
+    def forward(self, prompt, audio_tokens, task_type):
+        if task_type == "edit":  
+            prompt_text, edit_type, edit_info, target_text = prompt
+            instruct_prefix = self._build_audio_edit_instruction(prompt_text, edit_type, edit_info, target_text)
+
+            token_ids = self._encode_edit_prompt(
+                self.edit_sys_prompt,
+                instruct_prefix, 
+                audio_tokens
+            )
+
+        if task_type == "clone":
+            prompt_text, target_text = prompt
+            prompt_speaker = "debug"
+            token_ids = self._encode_clone_prompt(
+                target_text,
+                prompt_text,
+                prompt_speaker,
+                audio_tokens,
+            )
+        output = self._generate(token_ids, max_tokens=8192 - len(token_ids))
+        # return output
+        return OmniOutput(
+            text_hidden_states=output,
+        )
+    
+    def _generate(self, token_ids: list[int], max_tokens: int = 4096, temperature: float = 0.7) -> torch.Tensor:
+        audio_in = sum(1 for t in token_ids if 65536 <= t < 67584)
+        text_in = sum(1 for t in token_ids if t < 65536)
+        other_in = sum(1 for t in token_ids if t >= 67584)
+        logger.info(f"INPUT tokens: total={len(token_ids)}, audio(65536-67583)={audio_in}, text(<65536)={text_in}, other(>=67584)={other_in}")
+        if token_ids:
+            logger.info(f"INPUT range: min={min(token_ids)}, max={max(token_ids)}")
+        
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            max_tokens=max_tokens,
+            skip_special_tokens=False,
+        )
+        
+        # Use prompt_token_ids directly instead of decoding to text
+        # This preserves audio tokens (65536+) which would be corrupted by decode
+        prompt = {"prompt_token_ids": token_ids}
+        outputs = self.llm.generate([prompt], sampling_params, use_tqdm=False)
+
+        # Extract output token IDs (vLLM only returns generated tokens, not input)
+        output_token_ids = list(outputs[0].outputs[0].token_ids)
+        
+        # Debug: analyze token distribution
+        if output_token_ids:
+            min_tok = min(output_token_ids)
+            max_tok = max(output_token_ids)
+            audio_count = sum(1 for t in output_token_ids if 65536 <= t < 67584)
+            text_count = sum(1 for t in output_token_ids if t < 65536)
+            other_count = sum(1 for t in output_token_ids if t >= 67584)
+            logger.info(f"Generated {len(output_token_ids)} tokens: min={min_tok}, max={max_tok}, "
+                       f"audio(65536-67583)={audio_count}, text(<65536)={text_count}, other(>=67584)={other_count}")
+        
+        # Remove eos token if present
+        if len(output_token_ids) > 0 and output_token_ids[-1] == 3: # <|EOT|>
+            output_token_ids = output_token_ids[:-1]
+        
+        output_ids = torch.tensor(output_token_ids, dtype=torch.long)
+
+        return output_ids
+
+    def _encode_edit_prompt(
+        self, sys_prompt: str, instruct_prefix: str, audio_token_str: str
+    ) -> list[int]:
+        """Encode audio edit prompt to token sequence"""
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": f"{instruct_prefix}\n{audio_token_str}\n"}
+        ]
+
+        return self.text_tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+
+
+    def _encode_clone_prompt(
+        self, text: str, prompt_text: str, prompt_speaker: str, prompt_wav_tokens: str
+    ):
+        
+        sys_prompt = self.edit_clone_sys_prompt_tpl.format(
+            speaker=prompt_speaker,
+            prompt_text=prompt_text,
+            prompt_wav_tokens=prompt_wav_tokens
+        )
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": f"{text}"}
+        ]
+
+        return self.text_tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+
+    def _build_audio_edit_instruction(
+        self,
+        audio_text: str,
+        edit_type: str,
+        edit_info: Optional[str] = None,
+        text: Optional[str] = None
+    ) -> str:
+        """Build audio editing instruction based on request"""
+        audio_text = audio_text.strip() if audio_text else ""
+        if edit_type in {"emotion", "speed"}:
+            if edit_info == "remove":
+                instruct_prefix = f"Remove any emotion in the following audio and the reference text is: {audio_text}\n"
+            else:
+                instruct_prefix = f"Make the following audio more {edit_info}. The text corresponding to the audio is: {audio_text}\n"
+        elif edit_type == "style":
+            if edit_info == "remove":
+                instruct_prefix = f"Remove any speaking styles in the following audio and the reference text is: {audio_text}\n"
+            else:
+                instruct_prefix = f"Make the following audio more {edit_info} style. The text corresponding to the audio is: {audio_text}\n"
+        elif edit_type == "denoise":
+            instruct_prefix = f"Remove any noise from the given audio while preserving the voice content clearly. Ensure that the speech quality remains intact with minimal distortion, and eliminate all noise from the audio.\n"
+        elif edit_type == "vad":
+            instruct_prefix = f"Remove any silent portions from the given audio while preserving the voice content clearly. Ensure that the speech quality remains intact with minimal distortion, and eliminate all silence from the audio.\n"
+        elif edit_type == "paralinguistic":
+            instruct_prefix = f"Add some non-verbal sounds to make the audio more natural, the new text is : {text}\n  The text corresponding to the audio is: {audio_text}\n"
+        else:
+            logger.error(f"Unsupported audio editing type: {edit_type}")
+        return instruct_prefix

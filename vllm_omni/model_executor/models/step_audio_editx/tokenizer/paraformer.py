@@ -5,10 +5,10 @@ from torch.nn.utils.rnn import pad_sequence
 import logging
 import numpy as np
 from typing import Dict, Tuple, Optional, List, Iterable
-from vllm_omni.diffusion.models.step_audio_editx.utils import to_device
+from vllm_omni.model_executor.models.step_audio_editx.utils import to_device
 from torch.amp import autocast
 #这里的Encoder可能用非流式的SinusoidalPositionEncoder
-from vllm_omni.diffusion.models.step_audio_editx.tokenizer.transformer_utils import (
+from vllm_omni.model_executor.models.step_audio_editx.tokenizer.transformer_utils import (
     MultiHeadedAttentionSANMwithMask,
     StreamSinusoidalPositionEncoder,
     LayerNorm,

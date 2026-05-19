@@ -6,7 +6,7 @@ from einops import pack, repeat
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalConditionalCFM
 from vllm_omni.model_executor.models.cosyvoice3.utils import make_pad_mask
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
-from vllm_omni.diffusion.models.step_audio_editx.tokenizer.transformer_utils import PositionwiseFeedForward
+from vllm_omni.model_executor.models.step_audio_editx.tokenizer.transformer_utils import PositionwiseFeedForward
 from typing import Tuple, Optional, Union
 
 class DualCodebookEmbedding(torch.nn.Module):

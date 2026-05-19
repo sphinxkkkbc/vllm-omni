@@ -1,7 +1,7 @@
-from vllm_omni.diffusion.models.step_audio_editx.tokenizer.step_audio_editx_audio_tokenizer import StepAudioTokenizer
+from vllm_omni.model_executor.models.step_audio_editx.tokenizer.step_audio_editx_audio_tokenizer import StepAudioTokenizer
 import logging
 import torch
-from vllm_omni.diffusion.models.step_audio_editx.decoder.step_audio_decoder import CosyVoice as cosyvoice_vllm
+from vllm_omni.model_executor.models.step_audio_editx.decoder.step_audio_decoder import CosyVoice as cosyvoice_vllm
 import tempfile
 from safetensors.torch import load_file
 import soundfile as sf
@@ -46,7 +46,7 @@ def test_decoder():
     print(wav.shape)
 
 def test_ar_vllm():
-    from vllm_omni.diffusion.models.step_audio_editx.ar.step_audio_vllm import Step1ForCausalLM, Step1CausalLMConfig
+    from vllm_omni.model_executor.models.step_audio_editx.step_audio_ar import Step1ForCausalLM, Step1CausalLMConfig
     from vllm.distributed.parallel_state import initialize_model_parallel, init_distributed_environment, model_parallel_is_initialized
     from vllm.config import VllmConfig, set_current_vllm_config
 

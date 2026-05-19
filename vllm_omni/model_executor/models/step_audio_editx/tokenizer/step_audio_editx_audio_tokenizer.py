@@ -8,11 +8,12 @@ import whisper
 import logging
 import os.path
 import yaml
-from vllm_omni.diffusion.models.step_audio_editx.utils import prepare_data_iterator
-from vllm_omni.diffusion.models.step_audio_editx.tokenizer.paraformer import ParaformerStreaming
-from vllm_omni.diffusion.models.step_audio_editx.tokenizer.frontend import WavFrontendOnline
-from vllm_omni.diffusion.models.step_audio_editx.utils import resample_audio, energy_norm_fn, trim_silence
+from vllm_omni.model_executor.models.step_audio_editx.utils import prepare_data_iterator
+from vllm_omni.model_executor.models.step_audio_editx.tokenizer.paraformer import ParaformerStreaming
+from vllm_omni.model_executor.models.step_audio_editx.tokenizer.frontend import WavFrontendOnline
+from vllm_omni.model_executor.models.step_audio_editx.utils import resample_audio, energy_norm_fn, trim_silence
 from typing import Iterable
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = logging.getLogger(__name__)
 
@@ -106,10 +107,18 @@ class StepAudioTokenizer:
         self.vq02_lock = threading.Lock()
         self.vq06_lock = threading.Lock()
 
-    def __call__(self, audio, sr):
-        _, vq02, vq06 = self.wav2token(audio, sr, False)
-        text = self.merge_vq0206_to_token_str(vq02, vq06)
-        return text
+    def forward(self, audio, sr):
+        vq0206_codes, vq02_codes_ori, vq06_codes_ori = self.wav2token(audio, sr)
+        vq0206_codes = torch.tensor(vq0206_codes, dtype=torch.long) - 65536
+        audio_tokens = self.merge_vq0206_to_token_str(vq02_codes_ori, vq06_codes_ori)
+        return OmniOutput(
+            multimodal_outputs={
+                "audio_tokens":audio_tokens,
+            },
+            intermediate_tensors = {
+                "vq0206_codes": vq0206_codes,
+            }
+        )
 
     def preprocess_wav(self, audio, sample_rate, enable_trim=True, energy_norm=True):
         audio = resample_audio(audio, sample_rate, 16000)
