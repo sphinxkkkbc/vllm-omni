@@ -13,8 +13,6 @@ def sequence_mask(lengths, maxlen=None, dtype=torch.float32, device=None):
     return mask.type(dtype).to(device) if device is not None else mask.type(dtype)
 
 class MultiSequential(torch.nn.Sequential):
-    """Multi-input multi-output torch.nn.Sequential."""
-
     def __init__(self, *args, layer_drop_rate=0.0):
         """Initialize MultiSequential with layer_drop.
 
@@ -49,17 +47,16 @@ def repeat(N, fn, layer_drop_rate=0.0):
     return MultiSequential(*[fn(n) for n in range(N)], layer_drop_rate=layer_drop_rate)
 
 class PositionwiseFeedForward(torch.nn.Module):
-    def __init__(self, idim, hidden_units, dropout_rate, activation=torch.nn.ReLU()):
+    def __init__(self, idim, hidden_units, activation=torch.nn.ReLU()):
         """Construct an PositionwiseFeedForward object."""
         super().__init__()
         self.w_1 = torch.nn.Linear(idim, hidden_units)
         self.w_2 = torch.nn.Linear(hidden_units, idim)
-        self.dropout = torch.nn.Dropout(dropout_rate)
         self.activation = activation
 
     def forward(self, x):
         """Forward function."""
-        return self.w_2(self.dropout(self.activation(self.w_1(x))))
+        return self.w_2(self.activation(self.w_1(x)))
 
 class LayerNorm(torch.nn.LayerNorm):
     def __init__(self, nout, dim=-1):
@@ -146,7 +143,6 @@ class MultiHeadedAttentionSANM(nn.Module):
         n_head,
         in_feat,
         n_feat,
-        dropout_rate,
         kernel_size,
         sanm_shfit=0,
     ):
@@ -157,7 +153,6 @@ class MultiHeadedAttentionSANM(nn.Module):
         self.linear_out = nn.Linear(n_feat, n_feat)
         self.linear_q_k_v = nn.Linear(in_feat, n_feat * 3)
         self.attn = None
-        self.dropout = nn.Dropout(p=dropout_rate)
 
         self.fsmn_block = nn.Conv1d(
             n_feat, n_feat, kernel_size, stride=1, padding=0, groups=n_feat, bias=False
@@ -182,7 +177,6 @@ class MultiHeadedAttentionSANM(nn.Module):
         x = self.fsmn_block(x)
         x = x.transpose(1, 2)
         x += inputs
-        x = self.dropout(x)
         if mask is not None:
             x = x * mask
         return x
@@ -227,8 +221,7 @@ class MultiHeadedAttentionSANM(nn.Module):
         else:
             self.attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
 
-        p_attn = self.dropout(self.attn)
-        x = torch.matmul(p_attn, value)  # (batch, head, time1, d_k)
+        x = torch.matmul(self.attn, value)  # (batch, head, time1, d_k)
         x = (
             x.transpose(1, 2).contiguous().view(n_batch, -1, self.h * self.d_k)
         )  # (batch, time1, d_model)

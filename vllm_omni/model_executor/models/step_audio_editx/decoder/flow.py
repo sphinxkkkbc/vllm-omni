@@ -31,13 +31,11 @@ class BaseSubsampling(torch.nn.Module):
         return self.pos_enc.position_encoding(offset, size)
 
 class LinearNoSubsampling(BaseSubsampling):
-    def __init__(self, idim: int, odim: int, dropout_rate: float,
-                 pos_enc_class: torch.nn.Module):
+    def __init__(self, idim: int, odim: int, pos_enc_class: torch.nn.Module):
         super().__init__()
         self.out = torch.nn.Sequential(
             torch.nn.Linear(idim, odim),
             torch.nn.LayerNorm(odim, eps=1e-5),
-            torch.nn.Dropout(dropout_rate),
         )
         self.pos_enc = pos_enc_class
 
@@ -65,13 +63,11 @@ class RelPositionMultiHeadedAttention(nn.Module):
     Args:
         n_head (int): The number of heads.
         n_feat (int): The number of features.
-        dropout_rate (float): Dropout rate.
     """
 
     def __init__(self,
                  n_head: int,
                  n_feat: int,
-                 dropout_rate: float,
                  key_bias: bool = True):
         super().__init__()
         assert n_feat % n_head == 0
@@ -82,7 +78,6 @@ class RelPositionMultiHeadedAttention(nn.Module):
         self.linear_k = nn.Linear(n_feat, n_feat, bias=key_bias)
         self.linear_v = nn.Linear(n_feat, n_feat)
         self.linear_out = nn.Linear(n_feat, n_feat)
-        self.dropout = nn.Dropout(p=dropout_rate)
 
         # linear transformation for positional encoding
         self.linear_pos = nn.Linear(n_feat, n_feat, bias=False)
@@ -190,8 +185,7 @@ class RelPositionMultiHeadedAttention(nn.Module):
         else:
             attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
 
-        p_attn = self.dropout(attn)
-        x = torch.matmul(p_attn, v)  # (batch, head, time1, d_k)
+        x = torch.matmul(attn, v)  # (batch, head, time1, d_k)
         x = (x.transpose(1, 2).contiguous().view(n_batch, -1,
                                                  self.h * self.d_k)
              )  # (batch, time1, d_model)
@@ -208,16 +202,14 @@ class EspnetRelPositionalEncoding(torch.nn.Module):
 
     Args:
         d_model (int): Embedding dimension.
-        dropout_rate (float): Dropout rate.
         max_len (int): Maximum input length.
     """
 
-    def __init__(self, d_model: int, dropout_rate: float, max_len: int = 5000):
+    def __init__(self, d_model: int, max_len: int = 5000):
         """Construct an PositionalEncoding object."""
         super().__init__()
         self.d_model = d_model
         self.xscale = math.sqrt(self.d_model)
-        self.dropout = torch.nn.Dropout(p=dropout_rate)
         self.pe = None
         self.extend_pe(torch.tensor(0.0).expand(1, max_len))
 
@@ -267,7 +259,7 @@ class EspnetRelPositionalEncoding(torch.nn.Module):
         self.extend_pe(x)
         x = x * self.xscale
         pos_emb = self.position_encoding(size=x.size(1), offset=offset)
-        return self.dropout(x), self.dropout(pos_emb)
+        return x, pos_emb
 
     def position_encoding(self,
                           offset: Union[int, torch.Tensor],
@@ -301,7 +293,6 @@ class ConformerEncoderLayer(nn.Module):
             `PositionwiseFeedForward` instance can be used as the argument.
         conv_module (torch.nn.Module): Convolution module instance.
             `ConvlutionModule` instance can be used as the argument.
-        dropout_rate (float): Dropout rate.
         normalize_before (bool):
             True: use layer_norm before each sub-block.
             False: use layer_norm after each sub-block.
@@ -315,7 +306,6 @@ class ConformerEncoderLayer(nn.Module):
         feed_forward: Optional[nn.Module] = None,
         feed_forward_macaron: Optional[nn.Module] = None,
         conv_module: Optional[nn.Module] = None,
-        dropout_rate: float = 0.1,
         normalize_before: bool = True,
     ):
         """Construct an EncoderLayer object."""
@@ -335,7 +325,6 @@ class ConformerEncoderLayer(nn.Module):
             self.norm_conv = nn.LayerNorm(size, eps=1e-12)  # for the CNN module
             self.norm_final = nn.LayerNorm(
                 size, eps=1e-12)  # for the final output of the block
-        self.dropout = nn.Dropout(dropout_rate)
         self.size = size
         self.normalize_before = normalize_before
 
@@ -385,8 +374,7 @@ class ConformerEncoderLayer(nn.Module):
             residual = x
             if self.normalize_before:
                 x = self.norm_ff_macaron(x)
-            x = residual + self.ff_scale * self.dropout(
-                self.feed_forward_macaron(x))
+            x = residual + self.ff_scale * self.feed_forward_macaron(x)
             if not self.normalize_before:
                 x = self.norm_ff_macaron(x)
 
@@ -397,7 +385,7 @@ class ConformerEncoderLayer(nn.Module):
         # att_cache: (b, head, cache_t, d_k*2)
         x_att, new_att_cache = self.self_attn(x, x, x, mask, pos_emb,
                                               att_cache)
-        x = residual + self.dropout(x_att)
+        x = residual + x_att
         if not self.normalize_before:
             x = self.norm_mha(x)
 
@@ -409,7 +397,7 @@ class ConformerEncoderLayer(nn.Module):
             if self.normalize_before:
                 x = self.norm_conv(x)
             x, new_cnn_cache = self.conv_module(x, mask_pad, cnn_cache)
-            x = residual + self.dropout(x)
+            x = residual + x
 
             if not self.normalize_before:
                 x = self.norm_conv(x)
@@ -419,7 +407,7 @@ class ConformerEncoderLayer(nn.Module):
         if self.normalize_before:
             x = self.norm_ff(x)
 
-        x = residual + self.ff_scale * self.dropout(self.feed_forward(x))
+        x = residual + self.ff_scale * self.feed_forward(x)
         if not self.normalize_before:
             x = self.norm_ff(x)
 
@@ -494,10 +482,6 @@ class UpsampleConformerEncoderV2(torch.nn.Module):
         key_bias: bool = True,
         # mlp
         linear_units: int = 2048,
-        # dropouts
-        dropout_rate: float = 0.1,
-        positional_dropout_rate: float = 0.1,
-        attention_dropout_rate: float = 0.0,
         # other
         normalize_before: bool = True,
         **kwargs,
@@ -507,10 +491,8 @@ class UpsampleConformerEncoderV2(torch.nn.Module):
         self.embed = LinearNoSubsampling(
             input_size,
             output_size,
-            dropout_rate,
             EspnetRelPositionalEncoding(
                 output_size,
-                positional_dropout_rate
             ),
         )
 
@@ -521,14 +503,12 @@ class UpsampleConformerEncoderV2(torch.nn.Module):
         encoder_selfattn_layer_args = (
             attention_heads,
             output_size,
-            attention_dropout_rate,
             key_bias,
         )
         # feed-forward module definition
         positionwise_layer_args = (
             output_size,
             linear_units,
-            dropout_rate,
             activation,
         )
         self.pre_lookahead_layer = PreLookaheadLayer(
@@ -545,7 +525,6 @@ class UpsampleConformerEncoderV2(torch.nn.Module):
                 PositionwiseFeedForward(*positionwise_layer_args),
                 None,
                 None,
-                dropout_rate,
                 normalize_before,
             ) for _ in range(num_blocks)
         ]) 
@@ -558,10 +537,8 @@ class UpsampleConformerEncoderV2(torch.nn.Module):
         self.up_embed = LinearNoSubsampling(
             input_size,
             output_size,
-            dropout_rate,
             EspnetRelPositionalEncoding(
                 output_size,
-                positional_dropout_rate
             ),
         )
         self.up_encoders = torch.nn.ModuleList([
@@ -573,7 +550,6 @@ class UpsampleConformerEncoderV2(torch.nn.Module):
                 PositionwiseFeedForward(*positionwise_layer_args),
                 None,
                 None,
-                dropout_rate,
                 normalize_before,
             ) for _ in range(num_up_blocks)
         ])
@@ -724,25 +700,20 @@ class MLP(torch.nn.Module):
             act_layer=nn.GELU,
             norm_layer=None,
             bias=True,
-            drop=0.,
     ):
         super().__init__()
         hidden_features = hidden_features or in_features
         out_features = out_features or in_features
         self.fc1 = nn.Linear(in_features, hidden_features, bias=bias)
         self.act = act_layer()
-        self.drop1 = nn.Dropout(drop)
         self.norm = norm_layer(hidden_features) if norm_layer is not None else nn.Identity()
         self.fc2 = nn.Linear(hidden_features, out_features, bias=bias)
-        self.drop2 = nn.Dropout(drop)
 
     def forward(self, x):
         x = self.fc1(x)
         x = self.act(x)
-        x = self.drop1(x)
         x = self.norm(x)
         x = self.fc2(x)
-        x = self.drop2(x)
         return x
 
 
@@ -754,8 +725,6 @@ class Attention(torch.nn.Module):
             head_dim: int = 64,
             qkv_bias: bool = False,
             qk_norm: bool = False,
-            attn_drop: float = 0.,
-            proj_drop: float = 0.,
             norm_layer: nn.Module = nn.LayerNorm,
     ) -> None:
         super().__init__()
@@ -770,9 +739,6 @@ class Attention(torch.nn.Module):
 
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj_drop = nn.Dropout(proj_drop)
 
         self.proj = nn.Linear(self.inner_dim, dim)
 
@@ -794,7 +760,6 @@ class Attention(torch.nn.Module):
         x = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
-            dropout_p=self.attn_drop.p if self.training else 0.,
         )   # (b, nh, t, c)
         x = x.transpose(1, 2).reshape(b, t, -1)
         x = self.proj(x)
