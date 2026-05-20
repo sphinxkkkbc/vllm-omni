@@ -4,6 +4,11 @@ import torch
 import torch.nn as nn
 from einops import pack, repeat
 from torch.nn import functional as F
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.linear import (
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from vllm_omni.model_executor.models.step_audio_editx.tokenizer.transformer_utils import PositionwiseFeedForward
 
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalConditionalCFM
@@ -46,14 +51,6 @@ class LinearNoSubsampling(BaseSubsampling):
     def forward(
         self, x: torch.Tensor, offset: int | torch.Tensor = 0
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x (torch.Tensor): Input tensor (#batch, time, idim).
-            x_mask (torch.Tensor): Input mask (#batch, 1, time).
-        Returns:
-            torch.Tensor: linear input tensor (#batch, time, odim),
-            torch.Tensor: linear input mask (#batch, 1, time),
-        """
         x = self.out(x)
         x, pos_emb = self.pos_enc(x, offset)
         return x, pos_emb
@@ -666,7 +663,7 @@ DiT-v5
 """
 
 
-class MLP(torch.nn.Module):
+class FlowMLP(torch.nn.Module):
     def __init__(
         self,
         in_features: int,
@@ -692,7 +689,7 @@ class MLP(torch.nn.Module):
         return x
 
 
-class Attention(torch.nn.Module):
+class FlowAttention(torch.nn.Module):
     def __init__(
         self,
         dim: int,
@@ -708,39 +705,60 @@ class Attention(torch.nn.Module):
         self.inner_dim = num_heads * head_dim
         self.scale = head_dim**-0.5
 
-        self.to_q = nn.Linear(dim, self.inner_dim, bias=qkv_bias)
-        self.to_k = nn.Linear(dim, self.inner_dim, bias=qkv_bias)
-        self.to_v = nn.Linear(dim, self.inner_dim, bias=qkv_bias)
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=self.hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=self.num_heads,
+            params_dtype=dtype,
+            disable_tp=True,
+            prefix=f"{prefix}.qkv_proj",
+            bias=qkv_bias,
+        )
 
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
 
-        self.proj = nn.Linear(self.inner_dim, dim)
+        self.proj = RowParallelLinear(
+            input_size=self.inner_dim,
+            output_size=dim,
+            params_dtype=dtype,
+            prefix=f"{prefix}.o_proj",
+            bias=False,
+        )
+        self.attn = Attention(
+            num_heads=self.num_heads,
+            head_size=self.head_dim,
+            scale=self.head_dim**-0.5,
+            prefix=f"{prefix}.attn",
+        )
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
         b, t, c = x.shape
-
-        q = self.to_q(x)
-        k = self.to_k(x)
-        v = self.to_v(x)
+        qkv, _ = self.qkv_proj(x)
+        qkv = qkv.view(b, t, -1, self.head_dim)
+        q, k, v = qkv.chunk(3, dim=2)
 
         q = q.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)  # (b, nh, t, c)
-        k = q.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)
-        v = q.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)
+        k = k.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)
+        v = v.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        attn_mask = attn_mask.unsqueeze(1)
-        x = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-        )  # (b, nh, t, c)
+        x = self.attn(
+            query=q,
+            key=k,
+            value=v,
+        )
+        # attn_mask = attn_mask.unsqueeze(1)
+        # x = F.scaled_dot_product_attention(
+        #     q,
+        #     k,
+        #     v,
+        #     attn_mask=attn_mask,
+        # )  # (b, nh, t, c)
         x = x.transpose(1, 2).reshape(b, t, -1)
-        x = self.proj(x)
-        x = self.proj_drop(x)
+        x, _ = self.proj(x)
         return x
 
     def forward_chunk(self, x: torch.Tensor, att_cache: torch.Tensor = None, attn_mask: torch.Tensor = None):
@@ -869,15 +887,11 @@ class CausalConvBlock(nn.Module):
         self.kernel_size = kernel_size
 
         self.block = torch.nn.Sequential(
-            # norm
-            # conv1
             Transpose(1, 2),
             CausalConv1d(in_channels, out_channels, kernel_size),
             Transpose(1, 2),
-            # norm & act
             nn.LayerNorm(out_channels),
             nn.Mish(),
-            # conv2
             Transpose(1, 2),
             CausalConv1d(out_channels, out_channels, kernel_size),
             Transpose(1, 2),
@@ -919,13 +933,13 @@ class DiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, head_dim, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(
+        self.attn = FlowAttention(
             hidden_size, num_heads=num_heads, head_dim=head_dim, qkv_bias=True, qk_norm=True, **block_kwargs
         )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = MLP(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.mlp = FlowMLP(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
         self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.conv = CausalConvBlock(in_channels=hidden_size, out_channels=hidden_size, kernel_size=3)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 9 * hidden_size, bias=True))

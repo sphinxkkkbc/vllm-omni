@@ -1,28 +1,29 @@
+import logging
 import time
+from collections.abc import Iterable
+
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn.utils.rnn import pad_sequence
-import logging
-import numpy as np
-from typing import Dict, Tuple, Optional, List, Iterable
-from vllm_omni.model_executor.models.step_audio_editx.utils import to_device
 from torch.amp import autocast
-#这里的Encoder可能用非流式的SinusoidalPositionEncoder
-from vllm_omni.model_executor.models.step_audio_editx.tokenizer.transformer_utils import (
-    MultiHeadedAttentionSANMwithMask,
-    StreamSinusoidalPositionEncoder,
-    LayerNorm,
-    PositionwiseFeedForward,
-    repeat,
-)
+from torch.nn.utils.rnn import pad_sequence
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+# 这里的Encoder可能用非流式的SinusoidalPositionEncoder
+from vllm_omni.model_executor.models.step_audio_editx.tokenizer.transformer_utils import (
+    LayerNorm,
+    MultiHeadedAttentionSANMwithMask,
+    PositionwiseFeedForward,
+    StreamSinusoidalPositionEncoder,
+    repeat,
+)
+
+from vllm_omni.model_executor.models.step_audio_editx.utils import to_device
 
 logger = logging.getLogger(__name__)
 
-def extract_fbank(
-    data, data_len=None, data_type: str = "sound", frontend=None, **kwargs
-):
+
+def extract_fbank(data, data_len=None, data_type: str = "sound", frontend=None, **kwargs):
     if isinstance(data, np.ndarray):
         data = torch.from_numpy(data)
         if len(data.shape) < 2:
@@ -45,6 +46,7 @@ def extract_fbank(
     if isinstance(data_len, (list, tuple)):
         data_len = torch.tensor([data_len])
     return data.to(torch.float32), data_len.to(torch.int32)
+
 
 class EncoderLayerSANM(nn.Module):
     def __init__(
@@ -74,9 +76,7 @@ class EncoderLayerSANM(nn.Module):
         self.stochastic_depth_rate = stochastic_depth_rate
         self.dropout_rate = dropout_rate
 
-    def forward(
-        self, x, mask, cache=None, mask_shfit_chunk=None, mask_att_chunk_encoder=None
-    ):
+    def forward(self, x, mask, cache=None, mask_shift_chunk=None, mask_att_chunk_encoder=None):
         """Compute encoded features.
 
         Args:
@@ -113,7 +113,7 @@ class EncoderLayerSANM(nn.Module):
                     self.self_attn(
                         x,
                         mask,
-                        mask_shfit_chunk=mask_shfit_chunk,
+                        mask_shift_chunk=mask_shift_chunk,
                         mask_att_chunk_encoder=mask_att_chunk_encoder,
                     ),
                 ),
@@ -129,7 +129,7 @@ class EncoderLayerSANM(nn.Module):
                     self.self_attn(
                         x,
                         mask,
-                        mask_shfit_chunk=mask_shfit_chunk,
+                        mask_shift_chunk=mask_shift_chunk,
                         mask_att_chunk_encoder=mask_att_chunk_encoder,
                     )
                 )
@@ -138,7 +138,7 @@ class EncoderLayerSANM(nn.Module):
                     self.self_attn(
                         x,
                         mask,
-                        mask_shfit_chunk=mask_shfit_chunk,
+                        mask_shift_chunk=mask_shift_chunk,
                         mask_att_chunk_encoder=mask_att_chunk_encoder,
                     )
                 )
@@ -152,7 +152,7 @@ class EncoderLayerSANM(nn.Module):
         if not self.normalize_before:
             x = self.norm2(x)
 
-        return x, mask, cache, mask_shfit_chunk, mask_att_chunk_encoder
+        return x, mask, cache, mask_shift_chunk, mask_att_chunk_encoder
 
     def forward_chunk(self, x, cache=None, chunk_size=None, look_back=0):
         """Compute encoded features.
@@ -209,10 +209,10 @@ class SANMEncoderChunkOpt(nn.Module):
         attention_dropout_rate: float = 0.0,
         normalize_before: bool = True,
         concat_after: bool = False,
-        interctc_layer_idx: List[int] = [],
+        interctc_layer_idx: list[int] = [],
         interctc_use_conditioning: bool = False,
         kernel_size: int = 11,
-        sanm_shfit: int = 0,
+        sanm_shift: int = 0,
     ):
         super().__init__()
         self._output_size = output_size
@@ -233,7 +233,7 @@ class SANMEncoderChunkOpt(nn.Module):
             output_size,
             attention_dropout_rate,
             kernel_size,
-            sanm_shfit,
+            sanm_shift,
         )
 
         encoder_selfattn_layer_args = (
@@ -242,7 +242,7 @@ class SANMEncoderChunkOpt(nn.Module):
             output_size,
             attention_dropout_rate,
             kernel_size,
-            sanm_shfit,
+            sanm_shift,
         )
         self.encoders0 = repeat(
             1,
@@ -277,20 +277,17 @@ class SANMEncoderChunkOpt(nn.Module):
             assert 0 < min(interctc_layer_idx) and max(interctc_layer_idx) < num_blocks
         self.interctc_use_conditioning = interctc_use_conditioning
         self.conditioning_layer = None
-        # shfit_fsmn = (kernel_size - 1) // 2
+        # shift_fsmn = (kernel_size - 1) // 2
 
     def output_size(self) -> int:
         return self._output_size
-
 
     def _add_overlap_chunk(self, feats: np.ndarray, cache: dict = {}):
         if len(cache) == 0:
             return feats
         cache["feats"] = to_device(cache["feats"], device=feats.device)
         overlap_feats = torch.cat((cache["feats"], feats), dim=1)
-        cache["feats"] = overlap_feats[
-            :, -(cache["chunk_size"][0] + cache["chunk_size"][2]) :, :
-        ]
+        cache["feats"] = overlap_feats[:, -(cache["chunk_size"][0] + cache["chunk_size"][2]) :, :]
         return overlap_feats
 
     def forward_chunk(
@@ -336,10 +333,7 @@ class SANMEncoderChunkOpt(nn.Module):
 
         if self.normalize_before:
             xs_pad = self.after_norm(xs_pad)
-        if (
-            cache["encoder_chunk_look_back"] > 0
-            or cache["encoder_chunk_look_back"] == -1
-        ):
+        if cache["encoder_chunk_look_back"] > 0 or cache["encoder_chunk_look_back"] == -1:
             cache["opt"] = new_cache
 
         return xs_pad, ilens, None
@@ -356,7 +350,7 @@ class Paraformer(torch.nn.Module):
         self,
         normalize: str = None,
         encoder: str = None,
-        encoder_conf: Optional[Dict] = None,
+        encoder_conf: dict | None = None,
         input_size: int = 80,
         vocab_size: int = -1,
         ignore_id: int = -1,
@@ -391,12 +385,11 @@ class ParaformerStreaming(Paraformer):
 
     def __init__(
         self,
-        encoder_conf: Dict = None,
+        encoder_conf: dict = None,
         *args,
         **kwargs,
     ):
         super().__init__(*args, **kwargs, encoder_conf=encoder_conf)
-        
 
     def encode_chunk(
         self,
@@ -404,7 +397,7 @@ class ParaformerStreaming(Paraformer):
         speech_lengths: torch.Tensor,
         cache: dict = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Frontend + Encoder. Note that this method is used by asr_inference.py
         Args:
                 speech: (Batch, Length, ...)
@@ -417,14 +410,11 @@ class ParaformerStreaming(Paraformer):
                 speech, speech_lengths = self.normalize(speech, speech_lengths)
 
         # Forward encoder
-        encoder_out, encoder_out_lens, _ = self.encoder.forward_chunk(
-            speech, speech_lengths, cache=cache["encoder"]
-        )
+        encoder_out, encoder_out_lens, _ = self.encoder.forward_chunk(speech, speech_lengths, cache=cache["encoder"])
         if isinstance(encoder_out, tuple):
             encoder_out = encoder_out[0]
 
         return encoder_out, torch.tensor([encoder_out.size(1)])
-
 
     def init_cache(self, cache: dict = {}, **kwargs):
         chunk_size = kwargs.get("chunk_size", [0, 10, 5])
@@ -433,9 +423,7 @@ class ParaformerStreaming(Paraformer):
         batch_size = 1
 
         enc_output_size = kwargs["encoder_conf"]["output_size"]
-        feats_dims = (
-            kwargs["frontend_conf"]["n_mels"] * kwargs["frontend_conf"]["lfr_m"]
-        )
+        feats_dims = kwargs["frontend_conf"]["n_mels"] * kwargs["frontend_conf"]["lfr_m"]
         cache_encoder = {
             "start_idx": 0,
             "cif_hidden": torch.zeros((batch_size, 1, enc_output_size)),
@@ -444,9 +432,7 @@ class ParaformerStreaming(Paraformer):
             "encoder_chunk_look_back": encoder_chunk_look_back,
             "last_chunk": False,
             "opt": None,
-            "feats": torch.zeros(
-                (batch_size, chunk_size[0] + chunk_size[2], feats_dims)
-            ),
+            "feats": torch.zeros((batch_size, chunk_size[0] + chunk_size[2], feats_dims)),
             "tail_chunk": False,
         }
         cache["encoder"] = cache_encoder
@@ -499,9 +485,7 @@ class ParaformerStreaming(Paraformer):
         meta_data["extract_feat"] = 0.0
         for i in range(n):
             kwargs["is_final"] = _is_final and i == n - 1
-            audio_sample_i = audio_sample[
-                i * chunk_stride_samples : (i + 1) * chunk_stride_samples
-            ]
+            audio_sample_i = audio_sample[i * chunk_stride_samples : (i + 1) * chunk_stride_samples]
             time2 = time.perf_counter()
             # extract fbank feats
             if kwargs["is_final"] and len(audio_sample_i) == 0:
@@ -526,10 +510,7 @@ class ParaformerStreaming(Paraformer):
             meta_data["extract_feat"] = meta_data["extract_feat"] + time3 - time2
             meta_data["batch_data_time"] = (
                 meta_data["batch_data_time"]
-                + speech_lengths.sum().item()
-                * frontend.frame_shift
-                * frontend.lfr_n
-                / 1000
+                + speech_lengths.sum().item() * frontend.frame_shift * frontend.lfr_n / 1000
             )
             speech = speech.to(device=kwargs["device"])
             speech_lengths = speech_lengths.to(device=kwargs["device"])
@@ -560,20 +541,19 @@ class ParaformerStreaming(Paraformer):
         return result, meta_data, cache
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-      params = dict(self.named_parameters())
-      loaded = set()
+        params = dict(self.named_parameters())
+        loaded = set()
 
-      for name, w in weights:
-          if name.startswith("module."):
-              name = name[len("module."):]
+        for name, w in weights:
+            if name.startswith("module."):
+                name = name[len("module.") :]
 
-          if name not in params:
-              continue
+            if name not in params:
+                continue
 
-          p = params[name]
-          wl = getattr(p, "weight_loader", default_weight_loader)
-          wl(p, w)
-          loaded.add(name)
+            p = params[name]
+            wl = getattr(p, "weight_loader", default_weight_loader)
+            wl(p, w)
+            loaded.add(name)
 
-      return loaded
-
+        return loaded

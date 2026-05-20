@@ -1,6 +1,7 @@
+import numpy
 import torch
 import torch.nn as nn
-import numpy
+
 
 def sequence_mask(lengths, maxlen=None, dtype=torch.float32, device=None):
     if maxlen is None:
@@ -11,6 +12,7 @@ def sequence_mask(lengths, maxlen=None, dtype=torch.float32, device=None):
     mask = mask.detach()
 
     return mask.type(dtype).to(device) if device is not None else mask.type(dtype)
+
 
 class MultiSequential(torch.nn.Sequential):
     def __init__(self, *args, layer_drop_rate=0.0):
@@ -46,6 +48,7 @@ def repeat(N, fn, layer_drop_rate=0.0):
     """
     return MultiSequential(*[fn(n) for n in range(N)], layer_drop_rate=layer_drop_rate)
 
+
 class PositionwiseFeedForward(torch.nn.Module):
     def __init__(self, idim, hidden_units, activation=torch.nn.ReLU()):
         """Construct an PositionwiseFeedForward object."""
@@ -58,6 +61,7 @@ class PositionwiseFeedForward(torch.nn.Module):
         """Forward function."""
         return self.w_2(self.activation(self.w_1(x)))
 
+
 class LayerNorm(torch.nn.LayerNorm):
     def __init__(self, nout, dim=-1):
         """Construct an LayerNorm object."""
@@ -67,11 +71,8 @@ class LayerNorm(torch.nn.LayerNorm):
     def forward(self, x):
         if self.dim == -1:
             return super().forward(x)
-        return (
-            super()
-            .forward(x.transpose(self.dim, -1))
-            .transpose(self.dim, -1)
-        )
+        return super().forward(x.transpose(self.dim, -1)).transpose(self.dim, -1)
+
 
 class SinusoidalPositionEncoder(torch.nn.Module):
     def encode(
@@ -83,17 +84,10 @@ class SinusoidalPositionEncoder(torch.nn.Module):
         batch_size = positions.size(0)
         positions = positions.type(dtype)
         device = positions.device
-        log_timescale_increment = torch.log(
-            torch.tensor([10000], dtype=dtype, device=device)
-        ) / (depth / 2 - 1)
-        inv_timescales = torch.exp(
-            torch.arange(depth / 2, device=device).type(dtype)
-            * (-log_timescale_increment)
-        )
+        log_timescale_increment = torch.log(torch.tensor([10000], dtype=dtype, device=device)) / (depth / 2 - 1)
+        inv_timescales = torch.exp(torch.arange(depth / 2, device=device).type(dtype) * (-log_timescale_increment))
         inv_timescales = torch.reshape(inv_timescales, [batch_size, -1])
-        scaled_time = torch.reshape(positions, [1, -1, 1]) * torch.reshape(
-            inv_timescales, [1, 1, -1]
-        )
+        scaled_time = torch.reshape(positions, [1, -1, 1]) * torch.reshape(inv_timescales, [1, 1, -1])
         encoding = torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=2)
         return encoding.type(dtype)
 
@@ -114,16 +108,10 @@ class StreamSinusoidalPositionEncoder(torch.nn.Module):
     ):
         batch_size = positions.size(0)
         positions = positions.type(dtype)
-        log_timescale_increment = torch.log(torch.tensor([10000], dtype=dtype)) / (
-            depth / 2 - 1
-        )
-        inv_timescales = torch.exp(
-            torch.arange(depth / 2).type(dtype) * (-log_timescale_increment)
-        )
+        log_timescale_increment = torch.log(torch.tensor([10000], dtype=dtype)) / (depth / 2 - 1)
+        inv_timescales = torch.exp(torch.arange(depth / 2).type(dtype) * (-log_timescale_increment))
         inv_timescales = torch.reshape(inv_timescales, [batch_size, -1])
-        scaled_time = torch.reshape(positions, [1, -1, 1]) * torch.reshape(
-            inv_timescales, [1, 1, -1]
-        )
+        scaled_time = torch.reshape(positions, [1, -1, 1]) * torch.reshape(inv_timescales, [1, 1, -1])
         encoding = torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=2)
         return encoding.type(dtype)
 
@@ -137,6 +125,7 @@ class StreamSinusoidalPositionEncoder(torch.nn.Module):
         position_encoding = self.encode(positions, input_dim, x.dtype).to(x.device)
         return x + position_encoding[:, start_idx : start_idx + timesteps]
 
+
 class MultiHeadedAttentionSANM(nn.Module):
     def __init__(
         self,
@@ -144,7 +133,7 @@ class MultiHeadedAttentionSANM(nn.Module):
         in_feat,
         n_feat,
         kernel_size,
-        sanm_shfit=0,
+        sanm_shift=0,
     ):
         super().__init__()
         assert n_feat % n_head == 0
@@ -154,22 +143,20 @@ class MultiHeadedAttentionSANM(nn.Module):
         self.linear_q_k_v = nn.Linear(in_feat, n_feat * 3)
         self.attn = None
 
-        self.fsmn_block = nn.Conv1d(
-            n_feat, n_feat, kernel_size, stride=1, padding=0, groups=n_feat, bias=False
-        )
+        self.fsmn_block = nn.Conv1d(n_feat, n_feat, kernel_size, stride=1, padding=0, groups=n_feat, bias=False)
         # padding
         left_padding = (kernel_size - 1) // 2
-        if sanm_shfit > 0:
-            left_padding = left_padding + sanm_shfit
+        if sanm_shift > 0:
+            left_padding = left_padding + sanm_shift
         right_padding = kernel_size - 1 - left_padding
         self.pad_fn = nn.ConstantPad1d((left_padding, right_padding), 0.0)
 
-    def forward_fsmn(self, inputs, mask, mask_shfit_chunk=None):
+    def forward_fsmn(self, inputs, mask, mask_shift_chunk=None):
         b, t, d = inputs.size()
         if mask is not None:
             mask = torch.reshape(mask, (b, -1, 1))
-            if mask_shfit_chunk is not None:
-                mask = mask * mask_shfit_chunk
+            if mask_shift_chunk is not None:
+                mask = mask * mask_shift_chunk
             inputs = inputs * mask
 
         x = inputs.transpose(1, 2)
@@ -211,24 +198,18 @@ class MultiHeadedAttentionSANM(nn.Module):
 
             mask = mask.unsqueeze(1).eq(0)  # (batch, 1, *, time2)
 
-            min_value = float(
-                numpy.finfo(torch.tensor(0, dtype=scores.dtype).numpy().dtype).min
-            )
+            min_value = float(numpy.finfo(torch.tensor(0, dtype=scores.dtype).numpy().dtype).min)
             scores = scores.masked_fill(mask, min_value)
-            self.attn = torch.softmax(scores, dim=-1).masked_fill(
-                mask, 0.0
-            )  # (batch, head, time1, time2)
+            self.attn = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)  # (batch, head, time1, time2)
         else:
             self.attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
 
         x = torch.matmul(self.attn, value)  # (batch, head, time1, d_k)
-        x = (
-            x.transpose(1, 2).contiguous().view(n_batch, -1, self.h * self.d_k)
-        )  # (batch, time1, d_model)
+        x = x.transpose(1, 2).contiguous().view(n_batch, -1, self.h * self.d_k)  # (batch, time1, d_model)
 
         return self.linear_out(x)  # (batch, time1, d_model)
 
-    def forward(self, x, mask, mask_shfit_chunk=None, mask_att_chunk_encoder=None):
+    def forward(self, x, mask, mask_shift_chunk=None, mask_att_chunk_encoder=None):
         """Compute scaled dot product attention.
 
         Args:
@@ -243,7 +224,7 @@ class MultiHeadedAttentionSANM(nn.Module):
 
         """
         q_h, k_h, v_h, v = self.forward_qkv(x)
-        fsmn_memory = self.forward_fsmn(v, mask, mask_shfit_chunk)
+        fsmn_memory = self.forward_fsmn(v, mask, mask_shift_chunk)
         q_h = q_h * self.d_k ** (-0.5)
         scores = torch.matmul(q_h, k_h.transpose(-2, -1))
         att_outs = self.forward_attention(v_h, scores, mask, mask_att_chunk_encoder)
@@ -287,17 +268,16 @@ class MultiHeadedAttentionSANM(nn.Module):
         scores = torch.matmul(q_h, k_h.transpose(-2, -1))
         att_outs = self.forward_attention(v_h, scores, None)
         return att_outs + fsmn_memory, cache
-    
+
+
 class MultiHeadedAttentionSANMwithMask(MultiHeadedAttentionSANM):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def forward(self, x, mask, mask_shfit_chunk=None, mask_att_chunk_encoder=None):
+    def forward(self, x, mask, mask_shift_chunk=None, mask_att_chunk_encoder=None):
         q_h, k_h, v_h, v = self.forward_qkv(x)
-        fsmn_memory = self.forward_fsmn(v, mask[0], mask_shfit_chunk)
+        fsmn_memory = self.forward_fsmn(v, mask[0], mask_shift_chunk)
         q_h = q_h * self.d_k ** (-0.5)
         scores = torch.matmul(q_h, k_h.transpose(-2, -1))
         att_outs = self.forward_attention(v_h, scores, mask[1], mask_att_chunk_encoder)
         return att_outs + fsmn_memory
-
-    

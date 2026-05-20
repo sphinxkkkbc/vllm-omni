@@ -1,24 +1,27 @@
+import logging
+import os
+import os.path
 import threading
 import time
-import os
+from collections.abc import Iterable
+
 import numpy as np
-import torch
 import onnxruntime
+import torch
 import whisper
-import logging
-import os.path
 import yaml
-from .utils import prepare_data_iterator, resample_audio, energy_norm_fn, trim_silence
-from .audio_tokenizer.paraformer import ParaformerStreaming
-from .audio_tokenizer.frontend import WavFrontendOnline
-from typing import Iterable
 from transformers import AutoTokenizer
+
+from .audio_tokenizer.frontend import WavFrontendOnline
+from .audio_tokenizer.paraformer import ParaformerStreaming
+from .utils import energy_norm_fn, prepare_data_iterator, resample_audio, trim_silence
 
 logger = logging.getLogger(__name__)
 
+
 class FunASRModel:
     def __init__(self, model_path, config_path):
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             kwargs = yaml.safe_load(f)
         assert "model" in kwargs
         kwargs["init_param"] = os.path.join(model_path, "model.pt")
@@ -36,7 +39,12 @@ class FunASRModel:
         self.frontend = WavFrontendOnline(**kwargs["frontend_conf"])
         kwargs["frontend"] = self.frontend
         kwargs["input_size"] = self.frontend.output_size()
-        self.model = ParaformerStreaming(**kwargs["model_conf"], vocab_size=vocab_size, encoder_conf=kwargs["encoder_conf"], input_size=kwargs["input_size"])
+        self.model = ParaformerStreaming(
+            **kwargs["model_conf"],
+            vocab_size=vocab_size,
+            encoder_conf=kwargs["encoder_conf"],
+            input_size=kwargs["input_size"],
+        )
         # self.model.load_weight(kwargs["init_param"])
         self.model.to(device).eval()
         init_param = kwargs.get("init_param", None)
@@ -45,15 +53,11 @@ class FunASRModel:
         self.kwargs = kwargs
 
     @torch.inference_mode()
-    def infer_encoder(
-        self, input, input_len=None, kwargs=None, key=None, **cfg
-    ):
+    def infer_encoder(self, input, input_len=None, kwargs=None, key=None, **cfg):
         kwargs = self.kwargs if kwargs is None else kwargs
         kwargs.update(cfg)
         batch_size = kwargs.get("batch_size", 1)
-        key_list, data_list = prepare_data_iterator(
-            input, data_type=kwargs.get("data_type", None), key=key
-        )
+        key_list, data_list = prepare_data_iterator(input, data_type=kwargs.get("data_type", None), key=key)
         asr_result_list = []
         num_samples = len(data_list)
         for beg_idx in range(0, num_samples, batch_size):
@@ -61,9 +65,7 @@ class FunASRModel:
             data_batch = data_list[beg_idx:end_idx]
             key_batch = key_list[beg_idx:end_idx]
             batch = {"data_in": data_batch, "key": key_batch}
-            if (end_idx - beg_idx) == 1 and kwargs.get(
-                "data_type", None
-            ) == "fbank":  # fbank
+            if (end_idx - beg_idx) == 1 and kwargs.get("data_type", None) == "fbank":  # fbank
                 batch["data_in"] = data_batch[0]
                 batch["data_lengths"] = input_len
 
@@ -72,9 +74,10 @@ class FunASRModel:
 
         torch.cuda.empty_cache()
         return asr_result_list, cache
-    
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return self.model.load_weights(weights)
+
 
 class StepAudioTokenizer:
     def __init__(
@@ -84,16 +87,16 @@ class StepAudioTokenizer:
         funasr_model_id="dengcunqin/speech_paraformer-large_asr_nat-zh-cantonese-en-16k-vocab8501-online",
     ):
         self.text_tokenizer = AutoTokenizer.from_pretrained(config_path)
-        self.funasr_model = FunASRModel(model_path=os.path.join(tokenizer_path, funasr_model_id), config_path=config_path)
+        self.funasr_model = FunASRModel(
+            model_path=os.path.join(tokenizer_path, funasr_model_id), config_path=config_path
+        )
         kms_path = os.path.join(tokenizer_path, "linguistic_tokenizer.npy")
         cosy_tokenizer_path = os.path.join(tokenizer_path, "speech_tokenizer_v1.onnx")
         self.kms = torch.tensor(np.load(kms_path))
 
         providers = ["CUDAExecutionProvider"]
         session_option = onnxruntime.SessionOptions()
-        session_option.graph_optimization_level = (
-            onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-        )
+        session_option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         session_option.intra_op_num_threads = 1
         self.ort_session = onnxruntime.InferenceSession(
             cosy_tokenizer_path, sess_options=session_option, providers=providers
@@ -116,17 +119,13 @@ class StepAudioTokenizer:
         vq0206_codes = torch.tensor(vq0206_codes, dtype=torch.long) - 65536
         audio_tokens = self.merge_vq0206_to_token_str(vq02_codes_ori, vq06_codes_ori)
         return audio_tokens, vq0206_codes
-    
+
     def _text_tokenize(self, task_type, audio_tokens, prompt):
-        if task_type == "edit":  
+        if task_type == "edit":
             prompt_text, edit_type, edit_info, target_text = prompt
             instruct_prefix = self._build_audio_edit_instruction(prompt_text, edit_type, edit_info, target_text)
 
-            token_ids = self._encode_edit_prompt(
-                self.edit_sys_prompt,
-                instruct_prefix, 
-                audio_tokens
-            )
+            token_ids = self._encode_edit_prompt(self.edit_sys_prompt, instruct_prefix, audio_tokens)
 
         if task_type == "clone":
             prompt_text, target_text = prompt
@@ -138,15 +137,15 @@ class StepAudioTokenizer:
                 audio_tokens,
             )
 
-        return token_ids   
-    
+        return token_ids
+
     def preprocess_wav(self, audio, sample_rate, enable_trim=True, energy_norm=True):
         audio = resample_audio(audio, sample_rate, 16000)
 
         if audio.dim() == 2:
             audio = audio.squeeze(0)
         audio = audio.cpu().to(torch.float32)
-            
+
         if energy_norm:
             audio = energy_norm_fn(audio)
 
@@ -158,9 +157,7 @@ class StepAudioTokenizer:
         return audio
 
     def wav2token(self, audio, sample_rate, enable_trim=True, energy_norm=True):
-        audio = self.preprocess_wav(
-            audio, sample_rate, enable_trim=enable_trim, energy_norm=energy_norm
-        )
+        audio = self.preprocess_wav(audio, sample_rate, enable_trim=enable_trim, energy_norm=energy_norm)
 
         vq02_ori = self.get_vq02_code(audio)
         vq02 = [int(x) + 65536 for x in vq02_ori]
@@ -240,10 +237,7 @@ class StepAudioTokenizer:
                     self.ort_session.run(
                         None,
                         {
-                            self.ort_session.get_inputs()[0]
-                            .name: feat.detach()
-                            .cpu()
-                            .numpy(),
+                            self.ort_session.get_inputs()[0].name: feat.detach().cpu().numpy(),
                             self.ort_session.get_inputs()[1].name: feat_len,
                         },
                     )[0]
@@ -295,40 +289,25 @@ class StepAudioTokenizer:
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return self.funasr_model.load_weights(weights)
 
-    def _encode_edit_prompt(
-        self, sys_prompt: str, instruct_prefix: str, audio_token_str: str
-    ) -> list[int]:
+    def _encode_edit_prompt(self, sys_prompt: str, instruct_prefix: str, audio_token_str: str) -> list[int]:
         """Encode audio edit prompt to token sequence"""
         messages = [
             {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": f"{instruct_prefix}\n{audio_token_str}\n"}
+            {"role": "user", "content": f"{instruct_prefix}\n{audio_token_str}\n"},
         ]
 
         return self.text_tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
 
-
-    def _encode_clone_prompt(
-        self, text: str, prompt_text: str, prompt_speaker: str, prompt_wav_tokens: str
-    ):
-        
+    def _encode_clone_prompt(self, text: str, prompt_text: str, prompt_speaker: str, prompt_wav_tokens: str):
         sys_prompt = self.edit_clone_sys_prompt_tpl.format(
-            speaker=prompt_speaker,
-            prompt_text=prompt_text,
-            prompt_wav_tokens=prompt_wav_tokens
+            speaker=prompt_speaker, prompt_text=prompt_text, prompt_wav_tokens=prompt_wav_tokens
         )
-        messages = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": f"{text}"}
-        ]
+        messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": f"{text}"}]
 
         return self.text_tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
 
     def _build_audio_edit_instruction(
-        self,
-        audio_text: str,
-        edit_type: str,
-        edit_info: Optional[str] = None,
-        text: Optional[str] = None
+        self, audio_text: str, edit_type: str, edit_info: Optional[str] = None, text: Optional[str] = None
     ) -> str:
         """Build audio editing instruction based on request"""
         audio_text = audio_text.strip() if audio_text else ""
@@ -336,16 +315,20 @@ class StepAudioTokenizer:
             if edit_info == "remove":
                 instruct_prefix = f"Remove any emotion in the following audio and the reference text is: {audio_text}\n"
             else:
-                instruct_prefix = f"Make the following audio more {edit_info}. The text corresponding to the audio is: {audio_text}\n"
+                instruct_prefix = (
+                    f"Make the following audio more {edit_info}. The text corresponding to the audio is: {audio_text}\n"
+                )
         elif edit_type == "style":
             if edit_info == "remove":
-                instruct_prefix = f"Remove any speaking styles in the following audio and the reference text is: {audio_text}\n"
+                instruct_prefix = (
+                    f"Remove any speaking styles in the following audio and the reference text is: {audio_text}\n"
+                )
             else:
                 instruct_prefix = f"Make the following audio more {edit_info} style. The text corresponding to the audio is: {audio_text}\n"
         elif edit_type == "denoise":
-            instruct_prefix = f"Remove any noise from the given audio while preserving the voice content clearly. Ensure that the speech quality remains intact with minimal distortion, and eliminate all noise from the audio.\n"
+            instruct_prefix = "Remove any noise from the given audio while preserving the voice content clearly. Ensure that the speech quality remains intact with minimal distortion, and eliminate all noise from the audio.\n"
         elif edit_type == "vad":
-            instruct_prefix = f"Remove any silent portions from the given audio while preserving the voice content clearly. Ensure that the speech quality remains intact with minimal distortion, and eliminate all silence from the audio.\n"
+            instruct_prefix = "Remove any silent portions from the given audio while preserving the voice content clearly. Ensure that the speech quality remains intact with minimal distortion, and eliminate all silence from the audio.\n"
         elif edit_type == "paralinguistic":
             instruct_prefix = f"Add some non-verbal sounds to make the audio more natural, the new text is : {text}\n  The text corresponding to the audio is: {audio_text}\n"
         else:

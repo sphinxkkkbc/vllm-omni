@@ -1,19 +1,20 @@
 import logging
+
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional
 import torchaudio
-from .step_audio_decoder import CosyVoice
-from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.config import VllmConfig
-from vllm.model_executor.models.utils import init_vllm_registered_model
 from vllm.model_executor.model_loader.weight_utils import maybe_prefix
+from vllm.model_executor.models.utils import init_vllm_registered_model
+
+from .step_audio_decoder import CosyVoice
 
 logger = logging.getLogger(__name__)
 
+
 class StepAudioEditxPipeline(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__()   
+        super().__init__()
         self.model_stage = vllm_config.model_config.model_stage
 
         if self.model_stage == "ar_codec":
@@ -33,17 +34,10 @@ class StepAudioEditxPipeline(nn.Module):
             self.decoder = CosyVoice(vllm_config=vllm_config, prefix=prefix)
             self.model = self.decoder
 
-    def clone(
-        self,
-        prompt_wav_path: str,
-        prompt_text: str,
-        target_text: str
-    ) -> Tuple[torch.Tensor, int]:
+    def clone(self, prompt_wav_path: str, prompt_text: str, target_text: str) -> tuple[torch.Tensor, int]:
         try:
             logger.debug(f"Starting voice cloning: {prompt_wav_path}")
-            vq0206_codes, audio_tokens, speech_feat, _, speech_embedding = (
-                self.preprocess_prompt_wav(prompt_wav_path)
-            )
+            vq0206_codes, audio_tokens, speech_feat, _, speech_embedding = self.preprocess_prompt_wav(prompt_wav_path)
             # prompt_speaker = self.generate_clone_voice_id(prompt_text, prompt_wav)
             prompt_speaker = "debug"
             token_ids = self._encode_audio_edit_clone_prompt(
@@ -74,21 +68,15 @@ class StepAudioEditxPipeline(nn.Module):
         prompt_wav_path: str,
         prompt_text: str,
         edit_type: str,
-        edit_info: Optional[str] = None,
-        target_text: Optional[str] = None
-    ) -> Tuple[torch.Tensor, int]:
+        edit_info: str | None = None,
+        target_text: str | None = None,
+    ) -> tuple[torch.Tensor, int]:
         try:
             logger.debug(f"Starting audio editing: {edit_type} - {edit_info}")
-            vq0206_codes, audio_tokens, speech_feat, _, speech_embedding = (
-                self.preprocess_prompt_wav(prompt_wav_path)
-            )
+            vq0206_codes, audio_tokens, speech_feat, _, speech_embedding = self.preprocess_prompt_wav(prompt_wav_path)
             instruct_prefix = self._build_audio_edit_instruction(prompt_text, edit_type, edit_info, target_text)
 
-            prompt_tokens = self._encode_audio_edit_prompt(
-                self.edit_sys_prompt,
-                instruct_prefix, 
-                audio_tokens
-            )
+            prompt_tokens = self._encode_audio_edit_prompt(self.edit_sys_prompt, instruct_prefix, audio_tokens)
 
             logger.debug(f"Edit instruction: {instruct_prefix}")
             logger.debug(f"Encoded prompt length: {len(prompt_tokens)}")
@@ -119,13 +107,9 @@ class StepAudioEditxPipeline(nn.Module):
         if norm > 0.6:
             prompt_wav = prompt_wav / norm * 0.6
 
-        speech_feat = self.cosy_model.frontend.extract_speech_feat(
-            prompt_wav, prompt_wav_sr
-        )
+        speech_feat = self.cosy_model.frontend.extract_speech_feat(prompt_wav, prompt_wav_sr)
         speech_feat_len = torch.tensor([speech_feat.shape[1]], dtype=torch.long)
-        speech_embedding = self.cosy_model.frontend.extract_spk_embedding(
-            prompt_wav, prompt_wav_sr
-        )
+        speech_embedding = self.cosy_model.frontend.extract_spk_embedding(prompt_wav, prompt_wav_sr)
         vq0206_codes, vq02_codes_ori, vq06_codes_ori = self.audio_tokenizer.wav2token(prompt_wav, prompt_wav_sr)
         audio_tokens = self.audio_tokenizer.merge_vq0206_to_token_str(vq02_codes_ori, vq06_codes_ori)
         return (
