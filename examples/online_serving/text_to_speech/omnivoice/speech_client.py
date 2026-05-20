@@ -68,7 +68,8 @@ def run_tts(args) -> None:
 
     print(f"Model: {args.model}")
     print(f"Text: {args.text}")
-    print(f"Seed: {args.seed}")
+    if args.seed:
+        print(f"Seed: {args.seed}")
 
     if args.voice:
         print(f"Voice: {args.voice}")

@@ -48,7 +48,11 @@ def _get_time_steps(
 
 def _gumbel_sample(logits: torch.Tensor, temperature: float, generator: torch.Generator) -> torch.Tensor:
     """Add Gumbel noise for stochastic position selection."""
-    noise = -torch.log(-torch.log(torch.rand(logits.shape, generator=generator, device=logits.device).clamp(min=1e-8)))
+    noise = -torch.log(
+        -torch.log(
+            torch.rand(logits.shape, generator=generator, device=logits.device, dtype=logits.dtype).clamp(min=1e-8)
+        )
+    )
     return logits / max(temperature, 1e-8) + noise
 
 
