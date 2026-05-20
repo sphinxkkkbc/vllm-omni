@@ -1,11 +1,13 @@
-from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import CausalConvRNNF0Predictor, CausalConv1d
 import torch.nn as nn
+
+from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import CausalConv1d, CausalConvRNNF0Predictor
+
 try:
     from torch.nn.utils.parametrizations import weight_norm
 except ImportError:
     from torch.nn.utils import weight_norm
 
-    
+
 class StepAudioCausalConvRNNF0Predictor(CausalConvRNNF0Predictor):
     def __init__(
         self,
@@ -36,4 +38,3 @@ class StepAudioCausalConvRNNF0Predictor(CausalConvRNNF0Predictor):
             nn.ELU(),
         )
         self.classifier = nn.Linear(in_features=cond_channels, out_features=self.num_class)
-

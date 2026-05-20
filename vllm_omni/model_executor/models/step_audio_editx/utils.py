@@ -1,17 +1,18 @@
 import dataclasses
+import json
+import logging
 import math
+import os
+import random
+import string
 import tempfile
 from urllib.parse import urlparse
+
+import librosa
 import numpy as np
+import requests
 import torch
 import torchaudio
-import librosa
-import random
-import os
-import requests
-import logging
-import string
-import json
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +24,9 @@ AUDIO_EDIT_CLONE_SYSTEM_PROMPT_TPL = """Generate audio with the following timbre
 
 [speaker_start]
 speaker name: {speaker}
-speaker prompt text: 
+speaker prompt text:
 {prompt_text}
-speaker audio tokens: 
+speaker audio tokens:
 {prompt_wav_tokens}
 [speaker_end]
 """
@@ -41,14 +42,10 @@ Note: You will receive instructions in natural language and are expected to accu
 
 def resample_audio(wav, original_sample_rate, target_sample_rate):
     if original_sample_rate != target_sample_rate:
-        assert (
-            original_sample_rate > target_sample_rate
-        ), "wav sample rate {} must be greater than {}".format(
-            original_sample_rate, target_sample_rate
+        assert original_sample_rate > target_sample_rate, (
+            f"wav sample rate {original_sample_rate} must be greater than {target_sample_rate}"
         )
-        wav = torchaudio.transforms.Resample(
-            orig_freq=original_sample_rate, new_freq=target_sample_rate
-        )(wav)
+        wav = torchaudio.transforms.Resample(orig_freq=original_sample_rate, new_freq=target_sample_rate)(wav)
     return wav
 
 
@@ -60,6 +57,7 @@ def energy_norm_fn(wav):
         max_data = torch.max(torch.abs(wav))
         wav = wav / max(max_data, 0.01) * 0.999
     return wav
+
 
 def trim_silence(audio, sr, keep_left_time=0.05, keep_right_time=0.22, hop_size=240):
     _, index = librosa.effects.trim(audio, top_db=20, frame_length=512, hop_length=128)
@@ -75,19 +73,16 @@ def trim_silence(audio, sr, keep_left_time=0.05, keep_right_time=0.22, hop_size=
     if start_idx > 0:
         trim_wav = trim_wav[start_idx:]
     else:
-        trim_wav = np.pad(
-            trim_wav, (abs(start_idx), 0), mode="constant", constant_values=0.0
-        )
+        trim_wav = np.pad(trim_wav, (abs(start_idx), 0), mode="constant", constant_values=0.0)
     wav_len = len(trim_wav)
     out_len = int(num_frames * hop_size + (keep_left_time + keep_right_time) * sr)
 
     if out_len < wav_len:
         trim_wav = trim_wav[:out_len]
     else:
-        trim_wav = np.pad(
-            trim_wav, (0, (out_len - wav_len)), mode="constant", constant_values=0.0
-        )
+        trim_wav = np.pad(trim_wav, (0, (out_len - wav_len)), mode="constant", constant_values=0.0)
     return trim_wav
+
 
 def load_bytes(input):
     middle_data = np.frombuffer(input, dtype=np.int16)
@@ -101,10 +96,9 @@ def load_bytes(input):
     i = np.iinfo(middle_data.dtype)
     abs_max = 2 ** (i.bits - 1)
     offset = i.min + abs_max
-    array = np.frombuffer(
-        (middle_data.astype(dtype) - offset) / abs_max, dtype=np.float32
-    )
+    array = np.frombuffer((middle_data.astype(dtype) - offset) / abs_max, dtype=np.float32)
     return array
+
 
 def prepare_data_iterator(data_in, data_type=None, key=None):
     """
@@ -122,18 +116,14 @@ def prepare_data_iterator(data_in, data_type=None, key=None):
     chars = string.ascii_letters + string.digits
     if isinstance(data_in, str) and data_in.startswith("http"):  # url
         data_in = download_from_url(data_in)
-    if isinstance(data_in, str) and os.path.exists(
-        data_in
-    ):  # wav_path; filelist: wav.scp, file.jsonl;text.txt;
+    if isinstance(data_in, str) and os.path.exists(data_in):  # wav_path; filelist: wav.scp, file.jsonl;text.txt;
         _, file_extension = os.path.splitext(data_in)
         file_extension = file_extension.lower()
         if file_extension in filelist:  # filelist: wav.scp, file.jsonl;text.txt;
             with open(data_in, encoding="utf-8") as fin:
                 for line in fin:
                     key = "rand_key_" + "".join(random.choice(chars) for _ in range(13))
-                    if data_in.endswith(
-                        ".jsonl"
-                    ):  # file.jsonl: json.dumps({"source": data})
+                    if data_in.endswith(".jsonl"):  # file.jsonl: json.dumps({"source": data})
                         lines = json.loads(line.strip())
                         data = lines["source"]
                         key = data["key"] if "key" in data else key
@@ -149,14 +139,10 @@ def prepare_data_iterator(data_in, data_type=None, key=None):
             data_list = [data_in]
             key_list = [key]
     elif isinstance(data_in, (list, tuple)):
-        if data_type is not None and isinstance(
-            data_type, (list, tuple)
-        ):  # mutiple inputs
+        if data_type is not None and isinstance(data_type, (list, tuple)):  # multiple inputs
             data_list_tmp = []
             for data_in_i, data_type_i in zip(data_in, data_type):
-                key_list, data_list_i = prepare_data_iterator(
-                    data_in=data_in_i, data_type=data_type_i
-                )
+                key_list, data_list_i = prepare_data_iterator(data_in=data_in_i, data_type=data_type_i)
                 data_list_tmp.append(data_list_i)
             data_list = []
             for item in zip(*data_list_tmp):
@@ -164,10 +150,7 @@ def prepare_data_iterator(data_in, data_type=None, key=None):
         else:
             # [audio sample point, fbank, text]
             data_list = data_in
-            key_list = [
-                "rand_key_" + "".join(random.choice(chars) for _ in range(13))
-                for _ in range(len(data_in))
-            ]
+            key_list = ["rand_key_" + "".join(random.choice(chars) for _ in range(13)) for _ in range(len(data_in))]
     else:  # raw text; audio sample point, fbank; bytes
         if isinstance(data_in, bytes):  # audio bytes
             data_in = load_bytes(data_in)
@@ -185,6 +168,7 @@ class HTTPStorage:
         r.raise_for_status()
         return r.content
 
+
 def download_from_url(url):
     result = urlparse(url)
     file_path = None
@@ -201,23 +185,15 @@ def download_from_url(url):
     assert file_path is not None, f"failed to download: {url}"
     return file_path
 
+
 def to_device(data, device=None, dtype=None, non_blocking=False, copy=False):
     """Change the device of object recursively"""
     if isinstance(data, dict):
-        return {
-            k: to_device(v, device, dtype, non_blocking, copy) for k, v in data.items()
-        }
+        return {k: to_device(v, device, dtype, non_blocking, copy) for k, v in data.items()}
     elif dataclasses.is_dataclass(data) and not isinstance(data, type):
-        return type(data)(
-            *[
-                to_device(v, device, dtype, non_blocking, copy)
-                for v in dataclasses.astuple(data)
-            ]
-        )
+        return type(data)(*[to_device(v, device, dtype, non_blocking, copy) for v in dataclasses.astuple(data)])
     elif isinstance(data, tuple) and type(data) is not tuple:
-        return type(data)(
-            *[to_device(o, device, dtype, non_blocking, copy) for o in data]
-        )
+        return type(data)(*[to_device(o, device, dtype, non_blocking, copy) for o in data])
     elif isinstance(data, (list, tuple)):
         return type(data)(to_device(v, device, dtype, non_blocking, copy) for v in data)
     elif isinstance(data, np.ndarray):

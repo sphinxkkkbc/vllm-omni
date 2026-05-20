@@ -6,7 +6,7 @@ mel_conf:
     sampling_rate: 24000
     fmin: 0
     fmax: 8000
-    
+
 flow: !new:vllm_omni.diffusion.models.step_audio_editx.decoder.flow.CausalMaskedDiffWithXvec
     input_size: 512
     output_size: 80

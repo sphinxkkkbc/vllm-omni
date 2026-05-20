@@ -6,31 +6,42 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import (
-    CodesStruct,
-    MetaStruct,
-    OmniPayload,
     OmniPayloadStruct,
-    to_dict,
-)
-from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
-    compute_dynamic_initial_chunk_size,
-    max_ic_for_chunk_size,
-)
-from vllm_omni.model_executor.stage_input_processors.tts_utils import (
-    extract_language_from_prompt,
-    extract_language_from_request,
-    extract_speaker_from_prompt,
-    extract_speaker_from_request,
 )
 
 logger = init_logger(__name__)
 
 
-def tokenizer2ar():
-    pass
+def ar2decoder(source_outputs: list[Any], _prompt: Any = None, _requires_multimodal_data: bool = False):
+    from vllm_omni.inputs.data import OmniTokensPrompt
 
-def tokenizer2decoder():
-    pass
+    code2wav_inputs: list[OmniTokensPrompt] = []
 
-def ar2decoder():
+    for out in source_outputs:
+        if not out.finished:
+            continue
+
+        o = out.outputs[0]
+        mm = o.multimodal_output or {}
+
+        codec_codes = mm["codec_codes"]
+        codec_codes = codec_codes - 65536
+        vq0206_codes = (out.intermediate_tensors or {}).get("vq0206_codes")
+        vq0206_codes_vocoder = torch.tensor([vq0206_codes], dtype=torch.long) - 65536
+
+        additional_information = None
+        if vq0206_codes_vocoder is not None:
+            additional_information = {"vq0206_codes": vq0206_codes_vocoder}
+
+        code2wav_inputs.append(
+            OmniTokensPrompt(
+                prompt_token_ids=codec_codes,
+                multi_modal_data=None,
+                mm_processor_kwargs=None,
+                additional_information=additional_information,
+            )
+        )
+
+
+def talker2code2wav_async_chunk(payload: OmniPayloadStruct):
     pass

@@ -17,8 +17,6 @@ import torchaudio.compliance.kaldi as kaldi
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 
-"""perform fade_in_out in tensor style
-"""
 def fade_in_out(fade_in_mel:torch.Tensor, fade_out_mel:torch.Tensor, window:torch.Tensor):
     mel_overlap_len = int(window.shape[0] / 2)
     fade_in_mel = fade_in_mel.clone()
@@ -66,8 +64,6 @@ class CosyVoiceFrontEnd(object):
         embedding = torch.tensor([embedding])
         return embedding
 
-"""Keep compatible with cosyvoice1
-"""
 class CosyVoice:
     def __init__(self, 
                  model_dir:str, 
@@ -109,8 +105,8 @@ class CosyVoice:
     
     def forward(self, token, prompt_token, input_wav):
         """
-        token: generated from ar stage  
-        prompt_token : vq02 + vq06 (str) from audio_tokenizer
+        token: generated from autoregressive decoding 
+        prompt_token : vq0206 codec tensor from audio_tokenizer
         """
         speech_feat, speech_embedding = self._feature_extract(input_wav, self.frontend.sample_rate)
         def _make_len(ts:torch.Tensor):
