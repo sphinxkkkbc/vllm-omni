@@ -7,6 +7,10 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalC
 from vllm_omni.model_executor.models.cosyvoice3.utils import make_pad_mask
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
 from vllm_omni.model_executor.models.step_audio_editx.tokenizer.transformer_utils import PositionwiseFeedForward
+from vllm.model_executor.layers.linear import (
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from typing import Tuple, Optional, Union
 
 class DualCodebookEmbedding(torch.nn.Module):
@@ -467,22 +471,16 @@ class Upsample1D(nn.Module):
 class UpsampleConformerEncoderV2(torch.nn.Module):
     def __init__(
         self,
-        # input & output
         input_size: int,
         output_size: int = 256,
         pre_lookahead_len: int = 3,
-        # size
         num_blocks: int = 6,
         num_up_blocks: int = 4,
-        # upsampling
         up_stride: int = 2,
         up_scale_factor: float = 2,
-        # attention
         attention_heads: int = 4,
         key_bias: bool = True,
-        # mlp
         linear_units: int = 2048,
-        # other
         normalize_before: bool = True,
         **kwargs,
     ):
