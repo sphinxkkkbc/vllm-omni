@@ -332,7 +332,10 @@ class StepAudioAR:
         text_in = sum(1 for t in token_ids if t < 65536)
         other_in = sum(1 for t in token_ids if t >= 67584)
         logger.info(
-            f"INPUT tokens: total={len(token_ids)}, audio(65536-67583)={audio_in}, text(<65536)={text_in}, other(>=67584)={other_in}"
+            f"INPUT tokens: total={len(token_ids)}, "
+            f"audio(65536-67583)={audio_in}, "
+            f"text(<65536)={text_in}, "
+            f"other(>=67584)={other_in}"
         )
         if token_ids:
             logger.info(f"INPUT range: min={min(token_ids)}, max={max(token_ids)}")

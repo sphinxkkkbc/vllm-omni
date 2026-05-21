@@ -12,7 +12,7 @@ from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
-from transformers import AutoTokenizer
+
 # Upstream zero-shot reference clip
 ZERO_SHOT_PROMPT_URL = "https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav"
 
@@ -61,18 +61,8 @@ def run_e2e():
         help="Path to reference audio for voice cloning. "
         "If unset, downloads the upstream CosyVoice3 zero-shot prompt audio clip",
     )
-    parser.add_argument(
-        "--edit-type",
-        type=str,
-        default=None,
-        help="Type of edit to perform. "
-    )
-    parser.add_argument(
-        "--edit-info",
-        type=str,
-        default=None,
-        help="Additional information for the edit. "
-    )
+    parser.add_argument("--edit-type", type=str, default=None, help="Type of edit to perform. ")
+    parser.add_argument("--edit-info", type=str, default=None, help="Additional information for the edit. ")
     nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
     # Ensure tokenizer directory exists

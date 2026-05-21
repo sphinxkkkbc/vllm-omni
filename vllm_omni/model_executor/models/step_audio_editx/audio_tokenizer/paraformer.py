@@ -9,16 +9,16 @@ from torch.amp import autocast
 from torch.nn.utils.rnn import pad_sequence
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.model_executor.models.step_audio_editx.utils import to_device
+
 # 这里的Encoder可能用非流式的SinusoidalPositionEncoder
-from vllm_omni.model_executor.models.step_audio_editx.tokenizer.transformer_utils import (
+from .transformer_utils import (
     LayerNorm,
     MultiHeadedAttentionSANMwithMask,
     PositionwiseFeedForward,
     StreamSinusoidalPositionEncoder,
     repeat,
 )
-
-from vllm_omni.model_executor.models.step_audio_editx.utils import to_device
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,6 @@ class EncoderLayerSANM(nn.Module):
         size,
         self_attn,
         feed_forward,
-        dropout_rate,
         normalize_before=True,
         concat_after=False,
         stochastic_depth_rate=0.0,
@@ -66,7 +65,6 @@ class EncoderLayerSANM(nn.Module):
         self.feed_forward = feed_forward
         self.norm1 = LayerNorm(in_size)
         self.norm2 = LayerNorm(size)
-        self.dropout = nn.Dropout(dropout_rate)
         self.in_size = in_size
         self.size = size
         self.normalize_before = normalize_before
@@ -74,7 +72,6 @@ class EncoderLayerSANM(nn.Module):
         if self.concat_after:
             self.concat_linear = nn.Linear(size + size, size)
         self.stochastic_depth_rate = stochastic_depth_rate
-        self.dropout_rate = dropout_rate
 
     def forward(self, x, mask, cache=None, mask_shift_chunk=None, mask_att_chunk_encoder=None):
         """Compute encoded features.
@@ -125,22 +122,18 @@ class EncoderLayerSANM(nn.Module):
                 x = stoch_layer_coeff * self.concat_linear(x_concat)
         else:
             if self.in_size == self.size:
-                x = residual + stoch_layer_coeff * self.dropout(
-                    self.self_attn(
-                        x,
-                        mask,
-                        mask_shift_chunk=mask_shift_chunk,
-                        mask_att_chunk_encoder=mask_att_chunk_encoder,
-                    )
+                x = residual + stoch_layer_coeff * self.self_attn(
+                    x,
+                    mask,
+                    mask_shift_chunk=mask_shift_chunk,
+                    mask_att_chunk_encoder=mask_att_chunk_encoder,
                 )
             else:
-                x = stoch_layer_coeff * self.dropout(
-                    self.self_attn(
-                        x,
-                        mask,
-                        mask_shift_chunk=mask_shift_chunk,
-                        mask_att_chunk_encoder=mask_att_chunk_encoder,
-                    )
+                x = stoch_layer_coeff * self.self_attn(
+                    x,
+                    mask,
+                    mask_shift_chunk=mask_shift_chunk,
+                    mask_att_chunk_encoder=mask_att_chunk_encoder,
                 )
         if not self.normalize_before:
             x = self.norm1(x)
@@ -148,7 +141,7 @@ class EncoderLayerSANM(nn.Module):
         residual = x
         if self.normalize_before:
             x = self.norm2(x)
-        x = residual + stoch_layer_coeff * self.dropout(self.feed_forward(x))
+        x = residual + stoch_layer_coeff * self.feed_forward(x)
         if not self.normalize_before:
             x = self.norm2(x)
 
@@ -205,8 +198,6 @@ class SANMEncoderChunkOpt(nn.Module):
         attention_heads: int = 4,
         linear_units: int = 2048,
         num_blocks: int = 6,
-        dropout_rate: float = 0.1,
-        attention_dropout_rate: float = 0.0,
         normalize_before: bool = True,
         concat_after: bool = False,
         interctc_layer_idx: list[int] = [],
@@ -223,7 +214,6 @@ class SANMEncoderChunkOpt(nn.Module):
         positionwise_layer_args = (
             output_size,
             linear_units,
-            dropout_rate,
         )
 
         encoder_selfattn_layer = MultiHeadedAttentionSANMwithMask
@@ -231,7 +221,6 @@ class SANMEncoderChunkOpt(nn.Module):
             attention_heads,
             input_size,
             output_size,
-            attention_dropout_rate,
             kernel_size,
             sanm_shift,
         )
@@ -240,7 +229,6 @@ class SANMEncoderChunkOpt(nn.Module):
             attention_heads,
             output_size,
             output_size,
-            attention_dropout_rate,
             kernel_size,
             sanm_shift,
         )
@@ -251,7 +239,6 @@ class SANMEncoderChunkOpt(nn.Module):
                 output_size,
                 encoder_selfattn_layer(*encoder_selfattn_layer_args0),
                 positionwise_layer(*positionwise_layer_args),
-                dropout_rate,
                 normalize_before,
                 concat_after,
             ),
@@ -264,7 +251,6 @@ class SANMEncoderChunkOpt(nn.Module):
                 output_size,
                 encoder_selfattn_layer(*encoder_selfattn_layer_args),
                 positionwise_layer(*positionwise_layer_args),
-                dropout_rate,
                 normalize_before,
                 concat_after,
             ),
@@ -295,9 +281,7 @@ class SANMEncoderChunkOpt(nn.Module):
         xs_pad: torch.Tensor,
         ilens: torch.Tensor,
         cache: dict = None,
-        **kwargs,
     ):
-        is_final = kwargs.get("is_final", False)
         xs_pad *= self.output_size() ** 0.5
         xs_pad = self.embed(xs_pad, cache)
         if cache["tail_chunk"]:
@@ -498,12 +482,12 @@ class ParaformerStreaming(Paraformer):
                     cache=cache["frontend"],
                     is_final=kwargs["is_final"],
                 )
-            except:
+            except Exception as e:
                 if i == n - 1 and audio_sample_i.shape[0] < 480:
                     print(f"Warning!!!, skip {audio_sample_i.shape[0]} samples")
                     break
                 else:
-                    raise RuntimeError("infer failed")
+                    raise RuntimeError("infer failed") from e
             time3 = time.perf_counter()
             if len(speech) == 0 and kwargs["is_final"]:
                 break

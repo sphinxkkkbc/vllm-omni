@@ -349,7 +349,7 @@ _OMNI_MODELS = {
         "StepAudioEditxPipeline",
     ),
     "StepAudioAR": ("step_audio_editx", "step_audio_ar", "StepAudioAR"),
-    "StepAudioDecoder": ("step_audio_editx", "step_audio_decoder", "StepAudioCode2wav"),
+    "StepAudioCode2wav": ("step_audio_editx", "step_audio_decoder", "StepAudioCode2wav"),
 }
 
 

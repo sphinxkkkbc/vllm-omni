@@ -160,8 +160,8 @@ class StepAudioCode2wav:
         session_id: str,
         last_chunk: bool,
     ) -> torch.Tensor | None:
-        def _mixed_len(l: int):
-            return (l // 3) * 5
+        def _mixed_len(len: int):
+            return (len // 3) * 5
 
         # init chunk size tracking
         if session_id not in self.chunk_size_dict:

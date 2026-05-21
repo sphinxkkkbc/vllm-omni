@@ -31,13 +31,17 @@ speaker audio tokens:
 [speaker_end]
 """
 
-AUDIO_EDIT_SYSTEM_PROMPT = """As a highly skilled audio editing and tuning specialist, you excel in interpreting user instructions and applying precise adjustments to meet their needs. Your expertise spans a wide range of enhancement capabilities, including but not limited to:
-# Emotional Enhancement
-# Speaking Style Transfer
-# Non-linguistic Adjustments
-# Audio Tuning & Editing
-Note: You will receive instructions in natural language and are expected to accurately interpret and execute the most suitable audio edits and enhancements.
-"""
+AUDIO_EDIT_SYSTEM_PROMPT = (
+    "As a highly skilled audio editing and tuning specialist, you excel in "
+    "interpreting user instructions and applying precise adjustments to meet their needs. "
+    "Your expertise spans a wide range of enhancement capabilities, including but not limited to:\n"
+    "# Emotional Enhancement\n"
+    "# Speaking Style Transfer\n"
+    "# Non-linguistic Adjustments\n"
+    "# Audio Tuning & Editing\n"
+    "Note: You will receive instructions in natural language and are expected to accurately "
+    "interpret and execute the most suitable audio edits and enhancements."
+)
 
 
 def resample_audio(wav, original_sample_rate, target_sample_rate):
@@ -64,7 +68,6 @@ def trim_silence(audio, sr, keep_left_time=0.05, keep_right_time=0.22, hop_size=
     num_frames = int(math.ceil((index[1] - index[0]) / hop_size))  # 300
 
     left_sil_samples = int(keep_left_time * sr)
-    right_sil_samples = int(keep_right_time * sr)
 
     wav_len = len(audio)
     start_idx = index[0] - left_sil_samples

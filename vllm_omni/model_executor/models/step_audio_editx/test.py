@@ -1,11 +1,12 @@
 import logging
+import os
 import tempfile
 
 import soundfile as sf
 import torch
 from safetensors.torch import load_file
 
-from .step_audio_decoder import CosyVoice as cosyvoice_vllm
+from .step_audio_decoder import StepAudioCode2wav
 from .step_audio_tokenizer import StepAudioTokenizer
 
 logger = logging.getLogger(__name__)
@@ -29,8 +30,10 @@ def test_tokenizer():
 
 
 def test_decoder():
-    model_path = "/root/lanyun-tmp/Model/hub/models--stepfun-ai--Step-Audio-EditX/snapshots/5fe2f8a05c2353301ad47d3c1747b262115da138/CosyVoice-300M-25Hz"
-    cosyvoice1 = cosyvoice_vllm(
+    directory = "Model/hub/models--stepfun-ai--Step-Audio-EditX/snapshots/5fe2f8a05c2353301ad47d3c1747b262115da138/"
+    path = "/CosyVoice-300M-25Hz"
+    model_path = os.path.join(directory, path)
+    cosyvoice1 = StepAudioCode2wav(
         model_dir=model_path,
         yaml_path="/root/lanyun-tmp/vllm-omni/vllm_omni/diffusion/models/step_audio_editx/decoder/cosyvoice.yaml",
     )

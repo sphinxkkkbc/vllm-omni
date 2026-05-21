@@ -184,7 +184,6 @@ class WavFrontendOnline(nn.Module):
         input_lengths: torch.Tensor,
         is_final: bool = False,
         cache: dict = {},
-        **kwargs,
     ):
         batch_size = input.size(0)
         feats = []
@@ -193,8 +192,6 @@ class WavFrontendOnline(nn.Module):
         for i in range(batch_size):
             mat = input[i, : input_lengths[i], :]
             if self.lfr_m != 1 or self.lfr_n != 1:
-                # update self.lfr_splice_cache in self.apply_lfr
-                # mat, self.lfr_splice_cache[i], lfr_splice_frame_idx = self.apply_lfr(mat, self.lfr_m, self.lfr_n, self.lfr_splice_cache[i],
                 mat, cache["lfr_splice_cache"][i], lfr_splice_frame_idx = self.apply_lfr(
                     mat, self.lfr_m, self.lfr_n, is_final
                 )

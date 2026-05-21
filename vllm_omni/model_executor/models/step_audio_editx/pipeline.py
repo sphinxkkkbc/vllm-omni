@@ -21,11 +21,11 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.step_audio_editx"
 
 STEP_AUDIO_EDITX_PIPELINE = PipelineConfig(
     model_type="StepAudioEditx",
-    model_arch="StepAudioEditxPipeline",
     stages=(
         StagePipelineConfig(
             stage_id=0,
             model_stage="ar_codec",
+            model_arch="StepAudioAR",
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
             owns_tokenizer=True,
@@ -39,6 +39,7 @@ STEP_AUDIO_EDITX_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=1,
             model_stage="code2wav",
+            model_arch="StepAudioCode2wav",
             execution_type=StageExecutionType.LLM_GENERATION,
             input_sources=(0,),
             final_output=True,

@@ -14,9 +14,9 @@ encoder_conf:
     attention_heads: 4
     linear_units: 2048
     num_blocks: 50
-    dropout_rate: 0.1
+    # dropout_rate: 0.1
     # positional_dropout_rate: 0.1
-    attention_dropout_rate: 0.1
+    # attention_dropout_rate: 0.1
     # input_layer: pe_online
     # pos_enc_class: SinusoidalPositionEncoder
     normalize_before: true

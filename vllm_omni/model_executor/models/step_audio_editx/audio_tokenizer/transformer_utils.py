@@ -15,38 +15,28 @@ def sequence_mask(lengths, maxlen=None, dtype=torch.float32, device=None):
 
 
 class MultiSequential(torch.nn.Sequential):
-    def __init__(self, *args, layer_drop_rate=0.0):
-        """Initialize MultiSequential with layer_drop.
-
-        Args:
-            layer_drop_rate (float): Probability of dropping out each fn (layer).
-
-        """
+    def __init__(self, *args):
         super().__init__(*args)
-        self.layer_drop_rate = layer_drop_rate
 
     def forward(self, *args):
         """Repeat."""
-        _probs = torch.empty(len(self)).uniform_()
         for idx, m in enumerate(self):
-            if not self.training or (_probs[idx] >= self.layer_drop_rate):
-                args = m(*args)
+            args = m(*args)
         return args
 
 
-def repeat(N, fn, layer_drop_rate=0.0):
-    """Repeat module N times.
+def repeat(n, fn):
+    """Repeat module   times.
 
     Args:
-        N (int): Number of repeat time.
+        n (int): Number of repeat time.
         fn (Callable): Function to generate module.
-        layer_drop_rate (float): Probability of dropping out each fn (layer).
 
     Returns:
         MultiSequential: Repeated model instance.
 
     """
-    return MultiSequential(*[fn(n) for n in range(N)], layer_drop_rate=layer_drop_rate)
+    return MultiSequential(*[fn(i) for i in range(n)])
 
 
 class PositionwiseFeedForward(torch.nn.Module):

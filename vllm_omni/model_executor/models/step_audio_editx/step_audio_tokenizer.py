@@ -8,6 +8,7 @@ from collections.abc import Iterable
 import numpy as np
 import onnxruntime
 import torch
+import torchaudio
 import whisper
 import yaml
 from transformers import AutoTokenizer
@@ -72,7 +73,7 @@ class FunASRModel:
             results, meta_data, cache = self.model.infer_encoder(**batch, **kwargs, frontend=self.frontend)
             asr_result_list.extend(results)
 
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
         return asr_result_list, cache
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -122,8 +123,13 @@ class StepAudioTokenizer:
 
     def _text_tokenize(self, task_type: str, audio_tokens: str, prompt: dict | tuple):
         """
-        edit mode: prompt = (prompt_text: str, edit_type: str, edit_info: str | None = None, target_text: str | None = None)
-        clone mode: prompt = (prompt_text, target_text)
+        edit mode: prompt = {
+                            prompt_text: str,
+                            edit_type: str,
+                            edit_info: str | None = None,
+                            target_text: str | None = None
+                        }
+        clone mode: prompt = {prompt_text, target_text}
         """
         if task_type == "edit":
             prompt_text, edit_type, edit_info, target_text = prompt
@@ -143,7 +149,20 @@ class StepAudioTokenizer:
 
         return token_ids
 
+    def _load_audio(self, prompt_wav: str | torch.Tensor):
+        if isinstance(prompt_wav, str):
+            prompt_wav, prompt_wav_sr = torchaudio.load(prompt_wav)
+        return prompt_wav, prompt_wav_sr
+
     def preprocess_wav(self, audio, sample_rate, enable_trim=True, energy_norm=True):
+        if audio.shape[0] > 1:
+            audio = audio.mean(dim=0, keepdim=True)
+
+        # volume-normalize avoid clipping
+        norm = torch.max(torch.abs(audio), dim=1, keepdim=True)[0]
+        if norm.item() > 0.6:
+            audio = audio / norm * 0.6
+
         audio = resample_audio(audio, sample_rate, 16000)
 
         if audio.dim() == 2:
@@ -326,15 +345,32 @@ class StepAudioTokenizer:
                     f"Remove any speaking styles in the following audio and the reference text is: {audio_text}\n"
                 )
             else:
-                instruct_prefix = f"Make the following audio more {edit_info} style. The text corresponding to the audio is: {audio_text}\n"
+                instruct_prefix = (
+                    f"Make the following audio more {edit_info} style. "
+                    "The text corresponding to the audio is: "
+                    f"{audio_text}\n"
+                )
         elif edit_type == "denoise":
-            instruct_prefix = "Remove any noise from the given audio while preserving the voice content clearly. Ensure that the speech quality remains intact with minimal distortion, and eliminate all noise from the audio.\n"
+            instruct_prefix = (
+                "Remove any noise from the given audio while preserving the voice content clearly. "
+                "Ensure that the speech quality remains intact with minimal distortion, and "
+                "eliminate all noise from the audio.\n"
+            )
         elif edit_type == "vad":
-            instruct_prefix = "Remove any silent portions from the given audio while preserving the voice content clearly. Ensure that the speech quality remains intact with minimal distortion, and eliminate all silence from the audio.\n"
+            instruct_prefix = (
+                "Remove any silent portions from the given audio while preserving the voice content clearly. "
+                "Ensure that the speech quality remains intact with minimal distortion, and "
+                "eliminate all silence from the audio.\n"
+            )
         elif edit_type == "paralinguistic":
-            instruct_prefix = f"Add some non-verbal sounds to make the audio more natural, the new text is : {text}\n  The text corresponding to the audio is: {audio_text}\n"
+            instruct_prefix = (
+                "Add some non-verbal sounds to make the audio more natural, "
+                f"the new text is : {text}\n"
+                "  The text corresponding to the audio is: "
+                f"{audio_text}\n"
+            )
         else:
-            logger.error(f"Unsupported audio editing type: {edit_type}")
+            logger.error("Unsupported audio editing type: %s", edit_type)
         return instruct_prefix
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
