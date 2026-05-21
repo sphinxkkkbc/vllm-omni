@@ -11,7 +11,6 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalConditionalCFM
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
 from vllm_omni.model_executor.models.cosyvoice3.utils import make_pad_mask
 
@@ -656,7 +655,7 @@ class UpsampleConformerEncoderV2(torch.nn.Module):
         return xs, new_cnn_cache, new_att_cache
 
 
-class FlowMLP(torch.nn.Module):
+class MLP(torch.nn.Module):
     def __init__(
         self,
         in_features: int,
@@ -684,7 +683,7 @@ class FlowMLP(torch.nn.Module):
         return x
 
 
-class FlowAttention(torch.nn.Module):
+class Attention(torch.nn.Module):
     def __init__(
         self,
         dim: int,
@@ -703,7 +702,7 @@ class FlowAttention(torch.nn.Module):
         self.scale = head_dim**-0.5
 
         self.qkv_proj = QKVParallelLinear(
-            hidden_size=self.hidden_size,
+            hidden_size=dim,
             head_size=self.head_dim,
             total_num_heads=self.num_heads,
             params_dtype=dtype,
@@ -774,7 +773,6 @@ class FlowAttention(torch.nn.Module):
         x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)  # (b, nh, t, c)
         x = x.transpose(1, 2).reshape(b, t, -1)
         x = self.proj(x)
-        x = self.proj_drop(x)
         return x, new_att_cache
 
 
@@ -917,7 +915,7 @@ class DiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, head_dim, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = FlowAttention(
+        self.attn = Attention(
             hidden_size, num_heads=num_heads, head_dim=head_dim, qkv_bias=True, qk_norm=True, **block_kwargs
         )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -926,7 +924,7 @@ class DiTBlock(nn.Module):
         def approx_gelu():
             return nn.GELU(approximate="tanh")
 
-        self.mlp = FlowMLP(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.mlp = MLP(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu)
         self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.conv = CausalConvBlock(in_channels=hidden_size, out_channels=hidden_size, kernel_size=3)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 9 * hidden_size, bias=True))
@@ -1102,30 +1100,27 @@ class DiT(nn.Module):
 class CausalMaskedDiffWithXvec(torch.nn.Module):
     def __init__(
         self,
+        encoder,
+        decoder,
+        input_embedding,
         input_size: int = 512,
         output_size: int = 80,
         spk_embed_dim: int = 192,
         output_type: str = "mel",
         vocab_size: int = 5121,
-        encoder: UpsampleConformerEncoderV2 = None,
-        decoder: CausalConditionalCFM = None,
-        input_embedding: torch.nn.Module = None,
     ):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
         self.vocab_size = vocab_size
         self.output_type = output_type
-        self.pre_lookahead_len = int(encoder.pre_lookahead_layer.pre_lookahead_len)
-        self.up_rate = int(encoder.up_layer.stride)
-        if input_embedding is None:
-            self.input_embedding = nn.Embedding(vocab_size, input_size)
-        else:
-            self.input_embedding = input_embedding
-        self.spk_embed_affine_layer = torch.nn.Linear(spk_embed_dim, output_size)
+        self.input_embedding = input_embedding
         self.encoder = encoder
-        self.encoder_proj = torch.nn.Linear(self.encoder.output_size(), output_size)
         self.decoder = decoder
+        self.pre_lookahead_len = int(self.encoder.pre_lookahead_layer.pre_lookahead_len)
+        self.up_rate = int(self.encoder.up_layer.stride)
+        self.spk_embed_affine_layer = torch.nn.Linear(spk_embed_dim, output_size)
+        self.encoder_proj = torch.nn.Linear(self.encoder.output_size(), output_size)
 
     @torch.inference_mode()
     def inference(

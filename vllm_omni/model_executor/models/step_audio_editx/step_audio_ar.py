@@ -2,12 +2,12 @@ import logging
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn as nn
 from transformers import LlamaConfig
-from transformers.modeling_outputs import CausalLMOutputWithPast
-from vllm import SamplingParams
+from vllm.config import VllmConfig
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -15,15 +15,10 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.model_executor.models.step_audio_editx.utils import (
-    AUDIO_EDIT_CLONE_SYSTEM_PROMPT_TPL,
-    AUDIO_EDIT_SYSTEM_PROMPT,
-)
-
-from .step_audio_tokenizer import StepAudioTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -240,16 +235,23 @@ class Step1ForCausalLM(nn.Module):
         self.norm = RMSNorm(hidden_size=self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=dtype)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False, dtype=dtype)
 
-    def forward(
+    def forward_hidden_states(
         self,
-        input_ids=None,
-    ):
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         hidden_states = self.layers(hidden_states)
         hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
+        return hidden_states
 
-        return CausalLMOutputWithPast(logits=logits, past_key_values=None, hidden_states=None, attentions=None)
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(hidden_states)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.forward_hidden_states(input_ids)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
@@ -307,68 +309,48 @@ class Step1ForCausalLM(nn.Module):
         return loaded_params
 
 
-class StepAudioAR:
-    def __init__(self, config, vllm_config, **kwargs) -> None:
-        self.tokenizer = StepAudioTokenizer(**kwargs)
-        self.llm = Step1ForCausalLM(Step1CausalLMConfig())
-        self.edit_clone_sys_prompt_tpl = AUDIO_EDIT_CLONE_SYSTEM_PROMPT_TPL
-        self.edit_sys_prompt = AUDIO_EDIT_SYSTEM_PROMPT
+class StepAudioAR(nn.Module):
+    DEBUG_MARKER = "STEP_AUDIO_AR_RUNNER_MODEL"
 
-    def forward(self, prompt, input_audio, sr, task_type):
-        token_ids, vq0206_codes = self.tokenizer.forward(task_type, input_audio, prompt, sr)
-        output = self._generate(token_ids, max_tokens=8192 - len(token_ids))
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        self.vllm_config = vllm_config
+        hf_config = vllm_config.model_config.hf_config
+        self.config = hf_config
+        self.model = Step1ForCausalLM(hf_config)
+        self.logits_processor = LogitsProcessor(hf_config.vocab_size)
+        self.have_multimodal_outputs = False
+        self.has_preprocess = False
+        self.has_postprocess = False
 
-        return OmniOutput(
-            multimodal_outputs={
-                "codec_codes": output,
-            },
-            intermediate_tensors={
-                "vq0206_codes": vq0206_codes,
-            },
-        )
+    def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
 
-    def _generate(self, token_ids: list[int], max_tokens: int = 4096, temperature: float = 0.7) -> torch.Tensor:
-        audio_in = sum(1 for t in token_ids if 65536 <= t < 67584)
-        text_in = sum(1 for t in token_ids if t < 65536)
-        other_in = sum(1 for t in token_ids if t >= 67584)
-        logger.info(
-            f"INPUT tokens: total={len(token_ids)}, "
-            f"audio(65536-67583)={audio_in}, "
-            f"text(<65536)={text_in}, "
-            f"other(>=67584)={other_in}"
-        )
-        if token_ids:
-            logger.info(f"INPUT range: min={min(token_ids)}, max={max(token_ids)}")
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors=None,
+        inputs_embeds: torch.Tensor | None = None,
+        **_: Any,
+    ) -> torch.Tensor:
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+            hidden_states = self.model.layers(hidden_states)
+            hidden_states = self.model.norm(hidden_states)
+            return hidden_states
+        return self.model.forward_hidden_states(input_ids)
 
-        sampling_params = SamplingParams(
-            temperature=temperature,
-            max_tokens=max_tokens,
-            skip_special_tokens=False,
-        )
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor | OmniOutput,
+        sampling_metadata: Any = None,
+    ) -> torch.Tensor | None:
+        if isinstance(hidden_states, OmniOutput):
+            hidden_states = hidden_states.text_hidden_states
+        if hidden_states is None:
+            return None
+        return self.logits_processor(self.model.lm_head, hidden_states)
 
-        # Use prompt_token_ids directly instead of decoding to text
-        # This preserves audio tokens (65536+) which would be corrupted by decode
-        prompt = {"prompt_token_ids": token_ids}
-        outputs = self.llm.generate([prompt], sampling_params, use_tqdm=False)
-
-        # Extract output token IDs (vLLM only returns generated tokens, not input)
-        output_token_ids = list(outputs[0].outputs[0].token_ids)
-
-        if output_token_ids:
-            min_tok = min(output_token_ids)
-            max_tok = max(output_token_ids)
-            audio_count = sum(1 for t in output_token_ids if 65536 <= t < 67584)
-            text_count = sum(1 for t in output_token_ids if t < 65536)
-            other_count = sum(1 for t in output_token_ids if t >= 67584)
-            logger.info(
-                f"Generated {len(output_token_ids)} tokens: min={min_tok}, max={max_tok}, "
-                f"audio(65536-67583)={audio_count}, text(<65536)={text_count}, other(>=67584)={other_count}"
-            )
-
-        # Remove eos token if present
-        if len(output_token_ids) > 0 and output_token_ids[-1] == 3:  # <|EOT|>
-            output_token_ids = output_token_ids[:-1]
-
-        output_ids = torch.tensor(output_token_ids, dtype=torch.long)
-
-        return output_ids
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        return self.model.load_weights(weights)

@@ -44,7 +44,7 @@ def run_e2e():
     parser.add_argument(
         "--deploy-config",
         type=str,
-        default=None,
+        default="vllm-omni/vllm_omni/deploy/step_audio_editx.yaml",
         help="Override the deploy config path. If unset, auto-loads "
         "vllm_omni/deploy/step_audio_editx.yaml based on the HF model_type.",
     )
@@ -72,8 +72,8 @@ def run_e2e():
     if args.deploy_config is not None and not os.path.exists(args.deploy_config):
         raise FileNotFoundError(f"{args.deploy_config} does not exist!")
 
-    print(f"Initializing cosyvoice E2E with model={args.model}")
-
+    print(f"Initializing StepAudioEditx E2E with model={args.model}")
+    print(f"Deploy config: {args.deploy_config}")
     omni = Omni(
         model=args.model,
         deploy_config=args.deploy_config,

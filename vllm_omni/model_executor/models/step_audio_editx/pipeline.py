@@ -20,7 +20,7 @@ from vllm_omni.config.stage_config import (
 _PROC = "vllm_omni.model_executor.stage_input_processors.step_audio_editx"
 
 STEP_AUDIO_EDITX_PIPELINE = PipelineConfig(
-    model_type="StepAudioEditx",
+    model_type="step_audio_editx",
     stages=(
         StagePipelineConfig(
             stage_id=0,

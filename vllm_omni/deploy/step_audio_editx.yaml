@@ -1,6 +1,6 @@
 async_chunk: true
 
-stage_args:
+stages:
   - stage_id: 0
     stage_type: llm
     runtime:
@@ -9,7 +9,6 @@ stage_args:
       model_stage: ar_stage
       max_num_seqs: 64
       model_arch: StepAudioAR
-      worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       engine_output_type: latent
     default_sampling_params:
@@ -24,7 +23,6 @@ stage_args:
     engine_args:
       model_stage: code2wav
       model_arch: StepAudioCode2wav
-      worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       engine_output_type: audio
     engine_input_source: [0]
