@@ -2,7 +2,6 @@
 
 from typing import Any
 
-import torch
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import (
@@ -27,7 +26,7 @@ def ar2decoder(source_outputs: list[Any], _prompt: Any = None, _requires_multimo
         codec_codes = mm["codec_codes"]
         codec_codes = codec_codes - 65536
         vq0206_codes = (out.intermediate_tensors or {}).get("vq0206_codes")
-        vq0206_codes_vocoder = torch.tensor([vq0206_codes], dtype=torch.long) - 65536
+        vq0206_codes_vocoder = vq0206_codes - 65536
 
         additional_information = None
         if vq0206_codes_vocoder is not None:

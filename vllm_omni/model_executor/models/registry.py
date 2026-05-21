@@ -343,6 +343,13 @@ _OMNI_MODELS = {
         "minicpmo_4_5_omni_tts",
         "MiniCPMO45OmniTTSForConditionalGeneration",
     ),
+    "StepAudioEditxPipeline": (
+        "step_audio_editx",
+        "step_audio_editx",
+        "StepAudioEditxPipeline",
+    ),
+    "StepAudioAR": ("step_audio_editx", "step_audio_ar", "StepAudioAR"),
+    "StepAudioDecoder": ("step_audio_editx", "step_audio_decoder", "StepAudioCode2wav"),
 }
 
 

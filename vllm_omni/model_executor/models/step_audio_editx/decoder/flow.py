@@ -1,19 +1,21 @@
 import math
+from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
-from einops import pack, repeat
 from torch.nn import functional as F
-from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
-from vllm_omni.model_executor.models.step_audio_editx.tokenizer.transformer_utils import PositionwiseFeedForward
+from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalConditionalCFM
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
 from vllm_omni.model_executor.models.cosyvoice3.utils import make_pad_mask
+
+from ..audio_tokenizer.transformer_utils import PositionwiseFeedForward
 
 
 class DualCodebookEmbedding(torch.nn.Module):
@@ -70,13 +72,13 @@ class RelPositionMultiHeadedAttention(nn.Module):
         # We assume d_v always equals d_k
         self.d_k = n_feat // n_head
         self.h = n_head
-        self.linear_q = nn.Linear(n_feat, n_feat)
-        self.linear_k = nn.Linear(n_feat, n_feat, bias=key_bias)
-        self.linear_v = nn.Linear(n_feat, n_feat)
-        self.linear_out = nn.Linear(n_feat, n_feat)
+        self.linear_q = ReplicatedLinear(n_feat, n_feat)
+        self.linear_k = ReplicatedLinear(n_feat, n_feat, bias=key_bias)
+        self.linear_v = ReplicatedLinear(n_feat, n_feat)
+        self.linear_out = ReplicatedLinear(n_feat, n_feat)
+        self.linear_pos = ReplicatedLinear(n_feat, n_feat, bias=False)
 
-        # linear transformation for positional encoding
-        self.linear_pos = nn.Linear(n_feat, n_feat, bias=False)
+        # # linear transformation for positional encoding
         # these two learnable bias are used in matrix c and matrix d
         # as described in https://arxiv.org/abs/1901.02860 Section 3.3
         self.pos_bias_u = nn.Parameter(torch.Tensor(self.h, self.d_k))
@@ -122,13 +124,10 @@ class RelPositionMultiHeadedAttention(nn.Module):
                 and `head * d_k == size`
         """
         n_batch = query.size(0)
-        q = self.linear_q(query).view(n_batch, -1, self.h, self.d_k)
-        k = self.linear_k(key).view(n_batch, -1, self.h, self.d_k)
-        v = self.linear_v(value).view(n_batch, -1, self.h, self.d_k)
-        q = q.transpose(1, 2)  # (batch, head, time1, d_k)
-        k = k.transpose(1, 2)  # (batch, head, time2, d_k)
-        v = v.transpose(1, 2)  # (batch, head, time2, d_k)
-        q = q.transpose(1, 2)  # (batch, time1, head, d_k)
+
+        q = self.linea_q(query).view(n_batch, -1, self.h, self.d_k)  # (batch, time1, head, d_k)
+        k = self.linear_k(key).view(n_batch, -1, self.h, self.d_k).transpose(1, 2)  # (batch, head, time2, d_k)
+        v = self.linear_v(value).view(n_batch, -1, self.h, self.d_k).transpose(1, 2)  # (batch, head, time2, d_k)
 
         if cache is not None and cache.size(0) > 0:
             key_cache, value_cache = torch.split(cache, cache.size(-1) // 2, dim=-1)
@@ -363,7 +362,7 @@ class ConformerEncoderLayer(nn.Module):
         if self.normalize_before:
             x = self.norm_mha(x)
         # att_cache: (b, head, cache_t, d_k*2)
-        x_att, new_att_cache = self.self_attn(x, x, x, mask, pos_emb, att_cache)
+        x_att, new_att_cache = self.self_attn(x, mask, pos_emb, att_cache)
         x = residual + x_att
         if not self.normalize_before:
             x = self.norm_mha(x)
@@ -657,12 +656,6 @@ class UpsampleConformerEncoderV2(torch.nn.Module):
         return xs, new_cnn_cache, new_att_cache
 
 
-"""
-DiT-v5
-- Add convolution in DiTBlock to increase high-freq component
-"""
-
-
 class FlowMLP(torch.nn.Module):
     def __init__(
         self,
@@ -676,10 +669,12 @@ class FlowMLP(torch.nn.Module):
         super().__init__()
         hidden_features = hidden_features or in_features
         out_features = out_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias)
+        # self.fc1 = nn.Linear(in_features, hidden_features, bias=bias)
+        self.fc1 = ReplicatedLinear(in_features, hidden_features, bias=bias)
         self.act = act_layer()
         self.norm = norm_layer(hidden_features) if norm_layer is not None else nn.Identity()
-        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias)
+        # self.fc2 = nn.Linear(hidden_features, out_features, bias=bias)
+        self.fc2 = ReplicatedLinear(hidden_features, out_features, bias=bias)
 
     def forward(self, x):
         x = self.fc1(x)
@@ -698,6 +693,8 @@ class FlowAttention(torch.nn.Module):
         qkv_bias: bool = False,
         qk_norm: bool = False,
         norm_layer: nn.Module = nn.LayerNorm,
+        prefix="",
+        dtype=torch.float32,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -710,7 +707,6 @@ class FlowAttention(torch.nn.Module):
             head_size=self.head_dim,
             total_num_heads=self.num_heads,
             params_dtype=dtype,
-            disable_tp=True,
             prefix=f"{prefix}.qkv_proj",
             bias=qkv_bias,
         )
@@ -722,14 +718,7 @@ class FlowAttention(torch.nn.Module):
             input_size=self.inner_dim,
             output_size=dim,
             params_dtype=dtype,
-            prefix=f"{prefix}.o_proj",
             bias=False,
-        )
-        self.attn = Attention(
-            num_heads=self.num_heads,
-            head_size=self.head_dim,
-            scale=self.head_dim**-0.5,
-            prefix=f"{prefix}.attn",
         )
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
@@ -745,30 +734,25 @@ class FlowAttention(torch.nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        x = self.attn(
-            query=q,
-            key=k,
-            value=v,
-        )
-        # attn_mask = attn_mask.unsqueeze(1)
-        # x = F.scaled_dot_product_attention(
-        #     q,
-        #     k,
-        #     v,
-        #     attn_mask=attn_mask,
-        # )  # (b, nh, t, c)
+        attn_mask = attn_mask.unsqueeze(1)
+        x = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+        )  # (b, nh, t, c)
         x = x.transpose(1, 2).reshape(b, t, -1)
         x, _ = self.proj(x)
         return x
 
     def forward_chunk(self, x: torch.Tensor, att_cache: torch.Tensor = None, attn_mask: torch.Tensor = None):
         b, t, c = x.shape
-        q = self.to_q(x)
-        k = self.to_k(x)
-        v = self.to_v(x)
-        q = self.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)  # (b, nh, t, c)
-        k = self.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)
-        v = self.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)
+        qkv, _ = self.qkv_proj(x)
+        qkv = qkv.view(b, t, -1, self.head_dim)
+        q, k, v = qkv.chunk(3, dim=2)
+        q = q.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)  # (b, nh, t, c)
+        k = k.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)
+        v = v.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)
         q = self.q_norm(q)
         k = self.k_norm(k)
         if att_cache is not None:
@@ -971,13 +955,10 @@ class DiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp, shift_conv, scale_conv, gate_conv = (
             self.adaLN_modulation(c).chunk(9, dim=-1)
         )
-        # attention
         x_att, new_att_cache = self.attn.forward_chunk(modulate(self.norm1(x), shift_msa, scale_msa), att_cache, mask)
         x = x + gate_msa * x_att
-        # conv
         x_conv, new_cnn_cache = self.conv.forward_chunk(modulate(self.norm3(x), shift_conv, scale_conv), cnn_cache)
         x = x + gate_conv * x_conv
-        # mlp
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x, new_cnn_cache, new_att_cache
 
@@ -1034,12 +1015,12 @@ class DiT(nn.Module):
         cond: shape (b, c, t)
         """
         t = self.t_embedder(t).unsqueeze(1)  # (b, 1, c)
-        x = pack([x, mu], "b * t")[0]
+        x = torch.cat([x, mu], dim=1)
         if spks is not None:
-            spks = repeat(spks, "b c -> b c t", t=x.shape[-1])
-            x = pack([x, spks], "b * t")[0]
+            spks = spks.unsqueeze(-1).expand(-1, -1, x.shape[-1])
+            x = torch.cat([x, spks], dim=1)
         if cond is not None:
-            x = pack([x, cond], "b * t")[0]
+            x = torch.cat([x, cond], dim=1)
 
         return self.blocks_forward(x, t, mask)
 
@@ -1074,12 +1055,12 @@ class DiT(nn.Module):
             att_cache: shape (depth, b, nh, t, c * 2)
         """
         t = self.t_embedder(t).unsqueeze(1)  # (b, 1, c)
-        x = pack([x, mu], "b * t")[0]
+        x = torch.cat([x, mu], dim=1)
         if spks is not None:
-            spks = repeat(spks, "b c -> b c t", t=x.shape[-1])
-            x = pack([x, spks], "b * t")[0]
+            spks = spks.unsqueeze(-1).expand(-1, -1, x.shape[-1])
+            x = torch.cat([x, spks], dim=1)
         if cond is not None:
-            x = pack([x, cond], "b * t")[0]
+            x = torch.cat([x, cond], dim=1)
 
         # create fake cache
         if cnn_cache is None:
@@ -1151,7 +1132,6 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         prompt_token,
         prompt_token_len,
         prompt_feat,
-        prompt_feat_len,
         embedding,
         n_timesteps: int = 10,
     ):
@@ -1305,3 +1285,6 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         }
 
         return feat, new_cache
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        return AutoWeightsLoader(self).load_weights(weights)

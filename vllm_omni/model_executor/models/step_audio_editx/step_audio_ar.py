@@ -103,7 +103,6 @@ class Step1Attention(nn.Module):
             total_num_heads=self.num_heads,
             total_num_kv_heads=self.num_groups,
             params_dtype=dtype,
-            disable_tp=True,
             prefix=f"{prefix}.qkv_proj",
             bias=False,
         )
@@ -111,7 +110,6 @@ class Step1Attention(nn.Module):
         self.o_proj = RowParallelLinear(
             input_size=self.hidden_size,
             output_size=self.hidden_size,
-            disable_tp=True,
             params_dtype=dtype,
             prefix=f"{prefix}.o_proj",
             bias=False,
@@ -162,7 +160,6 @@ class Step1MLP(nn.Module):
             self.hidden_size,
             [self.intermediate_size] * 2,
             bias=False,
-            disable_tp=True,
             params_dtype=dtype,
             prefix=f"{prefix}.gate_up_proj",
         )
@@ -170,7 +167,6 @@ class Step1MLP(nn.Module):
             self.intermediate_size,
             self.hidden_size,
             bias=False,
-            disable_tp=True,
             params_dtype=dtype,
             prefix=f"{prefix}.down_proj",
         )
@@ -355,7 +351,6 @@ class StepAudioAR:
         # Extract output token IDs (vLLM only returns generated tokens, not input)
         output_token_ids = list(outputs[0].outputs[0].token_ids)
 
-        # Debug: analyze token distribution
         if output_token_ids:
             min_tok = min(output_token_ids)
             max_tok = max(output_token_ids)

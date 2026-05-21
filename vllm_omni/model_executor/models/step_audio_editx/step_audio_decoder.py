@@ -65,14 +65,13 @@ class CosyVoiceFrontEnd:
         return embedding
 
 
-class CosyVoice:
+class StepAudioCode2wav:
     def __init__(
         self,
         model_dir: str,
         chunk_size_list: list = [15, 24, 48],  # (0.6s, 0.96s, 1.92s)
         mel_cache_len: int = 8,
         n_timesteps: int = 10,
-        #  enable_cuda_graph: bool = False,
         dtype=torch.float32,
         yaml_path=None,
     ):
@@ -111,6 +110,8 @@ class CosyVoice:
         prompt_token : vq0206 codec tensor from audio_tokenizer
         """
         speech_feat, speech_embedding = self._feature_extract(input_wav, self.frontend.sample_rate)
+        speech_feat = speech_feat.to(torch.bfloat16)
+        speech_embedding = speech_embedding.to(torch.bfloat16)
 
         def _make_len(ts: torch.Tensor):
             return torch.tensor([ts.shape[1]], dtype=torch.long, device=ts.device)

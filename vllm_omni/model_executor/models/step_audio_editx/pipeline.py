@@ -19,7 +19,7 @@ from vllm_omni.config.stage_config import (
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.step_audio_editx"
 
-COSYVOICE3_PIPELINE = PipelineConfig(
+STEP_AUDIO_EDITX_PIPELINE = PipelineConfig(
     model_type="StepAudioEditx",
     model_arch="StepAudioEditxPipeline",
     stages=(

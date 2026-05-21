@@ -120,7 +120,11 @@ class StepAudioTokenizer:
         audio_tokens = self.merge_vq0206_to_token_str(vq02_codes_ori, vq06_codes_ori)
         return audio_tokens, vq0206_codes
 
-    def _text_tokenize(self, task_type, audio_tokens, prompt):
+    def _text_tokenize(self, task_type: str, audio_tokens: str, prompt: dict | tuple):
+        """
+        edit mode: prompt = (prompt_text: str, edit_type: str, edit_info: str | None = None, target_text: str | None = None)
+        clone mode: prompt = (prompt_text, target_text)
+        """
         if task_type == "edit":
             prompt_text, edit_type, edit_info, target_text = prompt
             instruct_prefix = self._build_audio_edit_instruction(prompt_text, edit_type, edit_info, target_text)
@@ -170,6 +174,7 @@ class StepAudioTokenizer:
         for idx in range(chunk_nums):
             speech_tokens += vq02[idx * chunk * 2 : (idx + 1) * chunk * 2]
             speech_tokens += vq06[idx * chunk * 3 : (idx + 1) * chunk * 3]
+        speech_tokens = torch.tensor([speech_tokens], dtype=torch.long)
         return speech_tokens, vq02_ori, vq06_ori
 
     def get_vq02_code(self, audio, session_id=None, is_final=True):
@@ -286,9 +291,6 @@ class StepAudioTokenizer:
             j += 3
         return "".join([f"<audio_{x}>" for x in result])
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return self.funasr_model.load_weights(weights)
-
     def _encode_edit_prompt(self, sys_prompt: str, instruct_prefix: str, audio_token_str: str) -> list[int]:
         """Encode audio edit prompt to token sequence"""
         messages = [
@@ -307,7 +309,7 @@ class StepAudioTokenizer:
         return self.text_tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
 
     def _build_audio_edit_instruction(
-        self, audio_text: str, edit_type: str, edit_info: Optional[str] = None, text: Optional[str] = None
+        self, audio_text: str, edit_type: str, edit_info: str | None = None, text: str | None = None
     ) -> str:
         """Build audio editing instruction based on request"""
         audio_text = audio_text.strip() if audio_text else ""
@@ -334,3 +336,6 @@ class StepAudioTokenizer:
         else:
             logger.error(f"Unsupported audio editing type: {edit_type}")
         return instruct_prefix
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        return self.funasr_model.load_weights(weights)
