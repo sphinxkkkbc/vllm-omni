@@ -44,7 +44,7 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
         from vllm_omni.model_executor.models.step_audio_editx.step_audio_ar import (
-              Step1CausalLMConfig,
+            Step1CausalLMConfig,
         )
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)

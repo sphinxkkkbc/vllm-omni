@@ -1,3 +1,5 @@
+import logging
+import os
 import threading
 from collections import defaultdict
 from collections.abc import Iterable
@@ -14,13 +16,14 @@ import torchaudio
 import torchaudio.compliance.kaldi as kaldi
 from hyperpyyaml import load_hyperpyyaml
 from vllm.config import VllmConfig
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models import SupportsPP
-from vllm.model_executor.models.utils import AutoWeightsLoader
-import logging
+
 from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = logging.getLogger(__name__)
+
 
 def fade_in_out(fade_in_mel: torch.Tensor, fade_out_mel: torch.Tensor, window: torch.Tensor):
     mel_overlap_len = int(window.shape[0] / 2)
@@ -81,7 +84,10 @@ class StepAudioCode2wav(nn.Module, SupportsPP):
         self.enable_update_additional_information = True
         self.requires_raw_input_tokens = True
 
-        self.core = CosyVoice(model_dir=self.model_path, yaml_path="/root/workspace/vllm-omni/vllm_omni/model_executor/models/step_audio_editx/decoder/cosyvoice.yaml")
+        self.core = CosyVoice(
+            model_dir=self.model_path,
+            yaml_path="/root/workspace/vllm-omni/vllm_omni/model_executor/models/step_audio_editx/decoder/cosyvoice.yaml",
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         if input_ids.numel() == 0:
@@ -149,13 +155,8 @@ class StepAudioCode2wav(nn.Module, SupportsPP):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        filtered_weights = []
-        for name, tensor in weights:
-            if name.startswith("flow.") or name.startswith("hift."):
-                filtered_weights.append((name, tensor))
-            else:
-                logger.debug("Skipping non-code2wav weight %s", name)
-        return AutoWeightsLoader(self.core).load_weights(filtered_weights)
+        loaded = self.core.load_weights(weights)
+        return {f"core.{k}" for k in loaded}
 
 
 class CosyVoice(nn.Module):
@@ -194,6 +195,43 @@ class CosyVoice(nn.Module):
         self.estimator_prompt_length_dict = {}
         self.spk_embedding_cache_dict = {}
         self.setup_lock = threading.Lock()
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loaded_params = set()
+        params_dict = dict(self.flow.named_parameters())
+        # params_dict = dict(self.hift.named_parameters())
+        model_path = os.path.join(self.model_dir, "CosyVoice-300M-25Hz")
+        weights = torch.load(f"{model_path}/flow.pt", map_location=self.device)
+        # weights = torch.load(f"{model_path}/hift.pt", map_location=self.device)
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("attn.qkv_proj", "attn.to_q", "q"),
+            ("attn.qkv_proj", "attn.to_k", "k"),
+            ("attn.qkv_proj", "attn.to_v", "v"),
+        ]
+        for name, loaded_weight in weights.items():
+            if name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                try:
+                    weight_loader(param, loaded_weight)
+                    # print(f"loaded weight from {name} to {name}")
+                except AssertionError as err:
+                    raise AssertionError(f"Failed to load weight {name!r} as {name!r}") from err
+                loaded_params.add(name)
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                stacked_name = name.replace(weight_name, param_name)
+                if stacked_name not in params_dict:
+                    continue
+                param = params_dict[stacked_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight, shard_id)
+                # print(f"loaded weight from {stacked_name} to {name}")
+                loaded_params.add(stacked_name)
+        # print(f"loaded_params: {loaded_params}")
+        return loaded_params
 
     def forward(self, token: torch.Tensor, prompt_token: torch.Tensor, input_wav: torch.Tensor, sample_rate: int):
         speech_feat, speech_embedding = self._feature_extract(input_wav, sample_rate)
@@ -244,7 +282,9 @@ class CosyVoice(nn.Module):
         mix_token_lookahead_len = _mixed_len(self.token_lookahead)
         if session_id not in self.chunk_cache_dict:
             if len(self.speech_token_dict[session_id]) >= mix_token_lookahead_len:
-                lookahead_token = self._reshape(self.speech_token_dict[session_id][:mix_token_lookahead_len]).unsqueeze(0)
+                lookahead_token = self._reshape(self.speech_token_dict[session_id][:mix_token_lookahead_len]).unsqueeze(
+                    0
+                )
                 prompt_token = self._reshape(prompt_token.squeeze().tolist()).unsqueeze(0)
                 prompt_feat = F.interpolate(
                     prompt_feat.transpose(1, 2), size=prompt_token.shape[1] * 2, mode="nearest"
@@ -395,5 +435,3 @@ class CosyVoice(nn.Module):
         self.chunk_cache_dict.pop(session_id, None)
         self.estimator_prompt_length_dict.pop(session_id, None)
         self.spk_embedding_cache_dict.pop(session_id, None)
-
-    
