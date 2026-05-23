@@ -13,9 +13,9 @@ via FlashAttention/SageAttention/SDPA backends.
 from __future__ import annotations
 
 import math
+import random
 import threading
 from collections import OrderedDict
-import random
 
 import torch
 import torch.nn as nn
