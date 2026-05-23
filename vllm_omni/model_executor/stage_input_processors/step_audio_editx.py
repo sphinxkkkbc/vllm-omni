@@ -15,7 +15,7 @@ def ar2decoder(source_outputs: list[Any], _prompt: Any = None, _requires_multimo
     from vllm_omni.inputs.data import OmniTokensPrompt
 
     code2wav_inputs: list[OmniTokensPrompt] = []
-
+    print(f"Data Inter Stage: {source_outputs}")
     for out in source_outputs:
         if not out.finished:
             continue

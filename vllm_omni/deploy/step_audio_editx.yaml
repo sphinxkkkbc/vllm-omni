@@ -1,13 +1,15 @@
-async_chunk: true
+async_chunk: false
 
 stages:
   - stage_id: 0
+    enforce_eager: true
     stage_type: llm
     runtime:
       devices: "0"
     engine_args:
+      worker_type: ar
       model_stage: ar_stage
-      max_num_seqs: 64
+      max_num_seqs: 16
       model_arch: StepAudioAR
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       engine_output_type: latent
@@ -15,12 +17,16 @@ stages:
       temperature: 0.9
       top_k: 50
       max_tokens: 2048
+    gpu_memory_utilization: 0.4
+    
 
   - stage_id: 1
     stage_type: llm
+    enforce_eager: true
     runtime:
       devices: "0"
     engine_args:
+      worker_type: generation
       model_stage: code2wav
       model_arch: StepAudioCode2wav
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
@@ -28,3 +34,4 @@ stages:
     engine_input_source: [0]
     final_output: true
     final_output_type: audio
+    gpu_memory_utilization: 0.4

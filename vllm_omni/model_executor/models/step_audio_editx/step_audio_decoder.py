@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from copy import deepcopy
 from functools import cached_property, reduce
 from typing import Any
-
+from types import SimpleNamespace
 import numpy as np
 import onnxruntime
 import torch
@@ -14,13 +14,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
-from hyperpyyaml import load_hyperpyyaml
+import yaml
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models import SupportsPP
 
+from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalConditionalCFM
+from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
 from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.step_audio_editx.decoder.flow import (
+    CausalMaskedDiffWithXvec,
+    DiT,
+    DualCodebookEmbedding,
+    UpsampleConformerEncoderV2,
+)
+from vllm_omni.model_executor.models.step_audio_editx.decoder.hift import StepAudioCausalConvRNNF0Predictor
 
 logger = logging.getLogger(__name__)
 
@@ -69,96 +78,6 @@ class CosyVoiceFrontEnd:
         return torch.tensor([embedding])
 
 
-class StepAudioCode2wav(nn.Module, SupportsPP):
-    DEBUG_MARKER = "STEP_AUDIO_CODE2WAV_RUNNER_MODEL"
-    input_modalities = "audio"
-
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__()
-        self.vllm_config = vllm_config
-        self.model_path = vllm_config.model_config.model
-
-        self.have_multimodal_outputs = True
-        self.has_preprocess = False
-        self.has_postprocess = False
-        self.enable_update_additional_information = True
-        self.requires_raw_input_tokens = True
-
-        self.core = CosyVoice(
-            model_dir=self.model_path,
-            yaml_path="/root/workspace/vllm-omni/vllm_omni/model_executor/models/step_audio_editx/decoder/cosyvoice.yaml",
-        )
-
-    def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
-        if input_ids.numel() == 0:
-            return torch.empty((0, 1), device=input_ids.device, dtype=torch.float32)
-        return torch.zeros((input_ids.shape[0], 1), device=input_ids.device, dtype=torch.float32)
-
-    def compute_logits(self, hidden_states, sampling_metadata: Any = None):
-        return None
-
-    @staticmethod
-    def _extract_runtime_inputs(
-        runtime_additional_information: list[dict[str, Any]] | None,
-        kwargs: dict[str, Any],
-    ) -> tuple[torch.Tensor | None, int | None]:
-        if runtime_additional_information:
-            info = runtime_additional_information[0] or {}
-            meta = info.get("meta", {}) if isinstance(info, dict) else {}
-            input_wav = meta.get("input_wav") or info.get("input_wav")
-            sample_rate = meta.get("sample_rate") or info.get("sample_rate")
-            if input_wav is not None:
-                return input_wav, sample_rate
-        return kwargs.get("input_wav"), kwargs.get("sample_rate")
-
-    @staticmethod
-    def _extract_prompt_token(intermediate_tensors: Any, kwargs: dict[str, Any]) -> torch.Tensor | None:
-        if intermediate_tensors is not None:
-            if hasattr(intermediate_tensors, "get"):
-                prompt_token = intermediate_tensors.get("vq0206_codes")
-                if prompt_token is not None:
-                    return prompt_token
-            if hasattr(intermediate_tensors, "vq0206_codes"):
-                return intermediate_tensors.vq0206_codes
-        return kwargs.get("prompt_token")
-
-    @torch.no_grad()
-    def forward(
-        self,
-        input_ids: torch.Tensor | None = None,
-        positions: torch.Tensor | None = None,
-        intermediate_tensors: Any = None,
-        inputs_embeds: torch.Tensor | None = None,
-        runtime_additional_information: list[dict[str, Any]] | None = None,
-        **kwargs: Any,
-    ) -> OmniOutput:
-        if input_ids is None:
-            raise ValueError("StepAudioCode2wav requires input_ids from the previous stage.")
-
-        token = input_ids.reshape(-1)
-        prompt_token = self._extract_prompt_token(intermediate_tensors, kwargs)
-        input_wav, sample_rate = self._extract_runtime_inputs(runtime_additional_information, kwargs)
-
-        if prompt_token is None:
-            raise ValueError("StepAudioCode2wav requires prompt_token (vq0206_codes) in intermediate_tensors.")
-        if input_wav is None or sample_rate is None:
-            raise ValueError(
-                "StepAudioCode2wav requires input_wav and sample_rate in runtime_additional_information or kwargs."
-            )
-
-        audio = self.core.forward(token, prompt_token, input_wav, sample_rate)
-        return OmniOutput(
-            text_hidden_states=None,
-            multimodal_outputs={
-                "audio": audio,
-            },
-        )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loaded = self.core.load_weights(weights)
-        return {f"core.{k}" for k in loaded}
-
-
 class CosyVoice(nn.Module):
     def __init__(
         self,
@@ -174,9 +93,42 @@ class CosyVoice(nn.Module):
         self._target_dtype = dtype
         config_path = yaml_path or f"{model_dir}/cosyvoice.yaml"
         with open(config_path) as f:
-            configs = load_hyperpyyaml(f)
-        self.flow = configs["flow"]
-        self.hift = configs["hift"]
+            configs = yaml.safe_load(f)
+
+        flow_cfg = configs["flow"]
+        decoder_cfg = flow_cfg["decoder"]
+
+        input_embedding = DualCodebookEmbedding(**flow_cfg["input_embedding"])
+        encoder = UpsampleConformerEncoderV2(**flow_cfg["encoder"])
+
+        estimator = DiT(**decoder_cfg["estimator"])
+        cfm_params = SimpleNamespace(**decoder_cfg["cfm_params"])
+        decoder = CausalConditionalCFM(
+            in_channels=decoder_cfg["in_channels"],
+            n_spks=decoder_cfg["n_spks"],
+            spk_emb_dim=decoder_cfg["spk_emb_dim"],
+            cfm_params=cfm_params,
+            estimator=estimator,
+        )
+
+        self.flow = CausalMaskedDiffWithXvec(
+            input_embedding=input_embedding,
+            encoder=encoder,
+            decoder=decoder,
+            input_size=flow_cfg["input_size"],
+            output_size=flow_cfg["output_size"],
+            spk_embed_dim=flow_cfg["spk_embed_dim"],
+            output_type=flow_cfg["output_type"],
+            vocab_size=flow_cfg["vocab_size"],
+        )
+
+        hift_cfg = configs["hift"]
+        f0_predictor = StepAudioCausalConvRNNF0Predictor(**hift_cfg["f0_predictor"])
+        self.hift = HiFTGenerator(
+            **{k: v for k, v in hift_cfg.items() if k != "f0_predictor"},
+            f0_predictor=f0_predictor,
+        )
+
         self.frontend = CosyVoiceFrontEnd(
             configs["mel_conf"],
             campplus_model=f"{model_dir}/CosyVoice-300M-25Hz/campplus.onnx",
@@ -195,43 +147,6 @@ class CosyVoice(nn.Module):
         self.estimator_prompt_length_dict = {}
         self.spk_embedding_cache_dict = {}
         self.setup_lock = threading.Lock()
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loaded_params = set()
-        params_dict = dict(self.flow.named_parameters())
-        # params_dict = dict(self.hift.named_parameters())
-        model_path = os.path.join(self.model_dir, "CosyVoice-300M-25Hz")
-        weights = torch.load(f"{model_path}/flow.pt", map_location=self.device)
-        # weights = torch.load(f"{model_path}/hift.pt", map_location=self.device)
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("attn.qkv_proj", "attn.to_q", "q"),
-            ("attn.qkv_proj", "attn.to_k", "k"),
-            ("attn.qkv_proj", "attn.to_v", "v"),
-        ]
-        for name, loaded_weight in weights.items():
-            if name in params_dict:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                try:
-                    weight_loader(param, loaded_weight)
-                    # print(f"loaded weight from {name} to {name}")
-                except AssertionError as err:
-                    raise AssertionError(f"Failed to load weight {name!r} as {name!r}") from err
-                loaded_params.add(name)
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                stacked_name = name.replace(weight_name, param_name)
-                if stacked_name not in params_dict:
-                    continue
-                param = params_dict[stacked_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, shard_id)
-                # print(f"loaded weight from {stacked_name} to {name}")
-                loaded_params.add(stacked_name)
-        # print(f"loaded_params: {loaded_params}")
-        return loaded_params
 
     def forward(self, token: torch.Tensor, prompt_token: torch.Tensor, input_wav: torch.Tensor, sample_rate: int):
         speech_feat, speech_embedding = self._feature_extract(input_wav, sample_rate)
@@ -435,3 +350,153 @@ class CosyVoice(nn.Module):
         self.chunk_cache_dict.pop(session_id, None)
         self.estimator_prompt_length_dict.pop(session_id, None)
         self.spk_embedding_cache_dict.pop(session_id, None)
+
+
+class StepAudioCode2wav(nn.Module, SupportsPP):
+    DEBUG_MARKER = "STEP_AUDIO_CODE2WAV_RUNNER_MODEL"
+    input_modalities = "audio"
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        self.vllm_config = vllm_config
+        self.model_path = vllm_config.model_config.model
+
+        self.have_multimodal_outputs = True
+        self.has_preprocess = False
+        self.has_postprocess = False
+        self.enable_update_additional_information = True
+        self.requires_raw_input_tokens = True
+
+        self.core = CosyVoice(
+            model_dir=self.model_path,
+            yaml_path="/root/workspace/vllm-omni/vllm_omni/model_executor/models/step_audio_editx/decoder/cosyvoice.yaml",
+        )
+
+    def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
+        if input_ids.numel() == 0:
+            return torch.empty((0, 1), device=input_ids.device, dtype=torch.float32)
+        return torch.zeros((input_ids.shape[0], 1), device=input_ids.device, dtype=torch.float32)
+
+    def compute_logits(self, hidden_states, sampling_metadata: Any = None):
+        return None
+
+    @staticmethod
+    def _extract_runtime_inputs(
+        runtime_additional_information: list[dict[str, Any]] | None,
+        kwargs: dict[str, Any],
+    ) -> tuple[torch.Tensor | None, int | None]:
+        if runtime_additional_information:
+            info = runtime_additional_information[0] or {}
+            meta = info.get("meta", {}) if isinstance(info, dict) else {}
+            input_wav = meta.get("input_wav") or info.get("input_wav")
+            sample_rate = meta.get("sample_rate") or info.get("sample_rate")
+            if input_wav is not None:
+                return input_wav, sample_rate
+        return kwargs.get("input_wav"), kwargs.get("sample_rate")
+
+    @staticmethod
+    def _extract_prompt_token(intermediate_tensors: Any, kwargs: dict[str, Any]) -> torch.Tensor | None:
+        if intermediate_tensors is not None:
+            if hasattr(intermediate_tensors, "get"):
+                prompt_token = intermediate_tensors.get("vq0206_codes")
+                if prompt_token is not None:
+                    return prompt_token
+            if hasattr(intermediate_tensors, "vq0206_codes"):
+                return intermediate_tensors.vq0206_codes
+        return kwargs.get("prompt_token")
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: Any = None,
+        inputs_embeds: torch.Tensor | None = None,
+        runtime_additional_information: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> OmniOutput:
+        if input_ids is None:
+            raise ValueError("StepAudioCode2wav requires input_ids from the previous stage.")
+        logger.info(f"intermediate_tensors: {intermediate_tensors}")
+        token = input_ids.reshape(-1)
+        prompt_token = self._extract_prompt_token(intermediate_tensors, kwargs)
+        input_wav, sample_rate = self._extract_runtime_inputs(runtime_additional_information, kwargs)
+
+        if prompt_token is None:
+            raise ValueError("StepAudioCode2wav requires prompt_token (vq0206_codes) in intermediate_tensors.")
+        if input_wav is None or sample_rate is None:
+            raise ValueError(
+                "StepAudioCode2wav requires input_wav and sample_rate in runtime_additional_information or kwargs."
+            )
+
+        audio = self.core.forward(token, prompt_token, input_wav, sample_rate)
+        return OmniOutput(
+            text_hidden_states=None,
+            multimodal_outputs={
+                "audio": audio,
+            },
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loaded_params = set()
+        params_dict = dict(self.core.flow.named_parameters())
+        model_path = os.path.join(self.model_path, "CosyVoice-300M-25Hz")
+        flow_weights = torch.load(f"{model_path}/flow.pt", map_location=self.core.device)
+        hift_weights = torch.load(f"{model_path}/hift.pt", map_location=self.core.device)
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("attn.qkv_proj", "attn.to_q", "q"),
+            ("attn.qkv_proj", "attn.to_k", "k"),
+            ("attn.qkv_proj", "attn.to_v", "v"),
+        ]
+        for name, loaded_weight in flow_weights.items():
+            mapped_name = f"core.flow.{name}"
+            if name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                try:
+                    weight_loader(param, loaded_weight)
+                    # print(f"loaded weight from {name} to {name}")
+                except AssertionError as err:
+                    raise AssertionError(f"Failed to load weight {name!r} as {name!r}") from err
+                loaded_params.add(mapped_name)
+                continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                stacked_name = name.replace(weight_name, param_name)
+                if stacked_name not in params_dict:
+                    continue
+                param = params_dict[stacked_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight, shard_id)
+                # print(f"loaded weight from {stacked_name} to {name}")
+                loaded_params.add(stacked_name)
+                break
+
+        params_dict = dict(self.core.hift.named_parameters())
+        for name, loaded_weight in hift_weights.items():
+            mapped_name = f"core.hift.{name}"
+            if name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                try:
+                    weight_loader(param, loaded_weight)
+                    # print(f"loaded weight from {name} to {name}")
+                except AssertionError as err:
+                    raise AssertionError(f"Failed to load weight {name!r} as {name!r}") from err
+                loaded_params.add(mapped_name)
+                continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                stacked_name = name.replace(weight_name, param_name)
+                if stacked_name not in params_dict:
+                    continue
+                param = params_dict[stacked_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight, shard_id)
+                # print(f"loaded weight from {stacked_name} to {name}")
+                loaded_params.add(stacked_name)
+                break
+        return loaded_params

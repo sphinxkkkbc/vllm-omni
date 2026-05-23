@@ -3,9 +3,11 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
-
+from urllib.parse import urlparse
+import numpy as np
 import torch
 import torch.nn as nn
+import vllm
 from transformers import LlamaConfig
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.attention import Attention
@@ -14,11 +16,13 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    ReplicatedLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from .step_audio_tokenizer import StepAudioTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -117,9 +121,13 @@ class Step1Attention(nn.Module):
             use_alibi_sqrt=True,
             scale=self.head_dim**-0.5,
             prefix=f"{prefix}.attn",
+            attn_backend=vllm.v1.attention.backends.triton_attn.TritonAttentionBackend,
         )
 
     def forward(self, x: torch.Tensor):
+        # logger.info(f"Step1Attention input shape: {x.shape}")
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
         batch_size, seq_len, _ = x.shape
         qkv, _ = self.qkv_proj(x)
         qkv = qkv.view(batch_size, seq_len, -1, self.head_dim)
@@ -129,17 +137,21 @@ class Step1Attention(nn.Module):
         split_sizes = [num_local_heads, num_local_kv_heads, num_local_kv_heads]
         q, k, v = qkv.split(split_sizes, dim=2)
 
-        q = q.view(batch_size, seq_len, self.num_heads * self.head_dim)
-        k = k.view(batch_size, seq_len, self.num_groups * self.head_dim)
-        v = v.view(batch_size, seq_len, self.num_groups * self.head_dim)
-
+        # q = q.view(batch_size, seq_len, self.num_heads * self.head_dim)
+        # k = k.view(batch_size, seq_len, self.num_groups * self.head_dim)
+        # v = v.view(batch_size, seq_len, self.num_groups * self.head_dim)
+        q = q.view(batch_size*seq_len, self.num_heads*self.head_dim)
+        k = k.view(batch_size*seq_len, self.num_groups*self.head_dim)
+        v = v.view(batch_size*seq_len, self.num_groups*self.head_dim)
+        # logger.info(f"q shape: {q.shape}, k shape: {k.shape}, v shape: {v.shape}")
         attn_output = self.attn(
             query=q,
             key=k,
             value=v,
         )
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
+        # logger.info(f"attn_output shape: {attn_output.shape}")
+        # attn_output = attn_output.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        # attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(batch_size, seq_len, -1)
         attn_output, _ = self.o_proj(attn_output)
 
@@ -233,7 +245,7 @@ class Step1ForCausalLM(nn.Module):
             *[Step1Layer(self.config, dtype=dtype, prefix=f"layers.{i}") for i in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(hidden_size=self.config.hidden_size, eps=self.config.rms_norm_eps, dtype=dtype)
-        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False, dtype=dtype)
+        self.lm_head = ReplicatedLinear(self.config.hidden_size, self.config.vocab_size, bias=False, params_dtype=dtype)
 
     def forward_hidden_states(
         self,
@@ -253,61 +265,6 @@ class Step1ForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.forward_hidden_states(input_ids)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params_dict = dict(self.named_parameters())
-        loaded_params = set()
-        name_mapping = {
-            "model.embed_tokens.weight": "embed_tokens.weight",
-            "model.norm.weight": "norm.weight",
-            "lm_head.weight": "lm_head.weight",
-        }
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("self_attn.qkv_proj", "self_attn.q_proj", "q"),
-            ("self_attn.qkv_proj", "self_attn.k_proj", "k"),
-            ("self_attn.qkv_proj", "self_attn.v_proj", "v"),
-            ("mlp.gate_up_proj", "mlp.gate_proj", 0),
-            ("mlp.gate_up_proj", "mlp.up_proj", 1),
-        ]
-        for name, loaded_weight in weights:
-            if name.startswith("model.layers."):
-                name = name[len("model.") :]
-            mapped_name = name_mapping.get(name, name)
-            if mapped_name in params_dict:
-                param = params_dict[mapped_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                try:
-                    weight_loader(param, loaded_weight)
-                    # print(f"loaded weight from {name} to {mapped_name}")
-                except AssertionError as err:
-                    raise AssertionError(f"Failed to load weight {name!r} as {mapped_name!r}") from err
-                loaded_params.add(mapped_name)
-            else:
-                Found = False
-                for param_name, weight_name, shard_id in stacked_params_mapping:
-                    if weight_name not in mapped_name:
-                        continue
-                    stacked_name = mapped_name.replace(weight_name, param_name)
-                    if stacked_name not in params_dict:
-                        continue
-                    param = params_dict[stacked_name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, loaded_weight, shard_id)
-                    # print(f"loaded weight from {stacked_name} to {name}")
-                    loaded_params.add(stacked_name)
-                    Found = True
-                    break
-                if not Found:
-                    logger.debug(f"Skipping weight {name} -> {mapped_name} - not found in model")
-        expected = set(params_dict.keys())
-        missing = expected - loaded_params
-
-        print("missing:")
-        for name in sorted(missing):
-            print(name)
-
-        return loaded_params
-
 
 class StepAudioAR(nn.Module):
     DEBUG_MARKER = "STEP_AUDIO_AR_RUNNER_MODEL"
@@ -316,12 +273,41 @@ class StepAudioAR(nn.Module):
         super().__init__()
         self.vllm_config = vllm_config
         hf_config = vllm_config.model_config.hf_config
+        self.model_path = vllm_config.model_config.model
+        print(vllm_config)
+        extra = getattr(vllm_config.model_config, "additional_kwargs", None) or {}
+        self.tokenizer_path = extra.get("audio_tokenizer")
         self.config = hf_config
         self.model = Step1ForCausalLM(hf_config)
         self.logits_processor = LogitsProcessor(hf_config.vocab_size)
         self.have_multimodal_outputs = False
-        self.has_preprocess = False
+        self.has_preprocess = True
         self.has_postprocess = False
+        self.tokenizer = StepAudioTokenizer(
+                tokenizer_path=self.tokenizer_path, 
+                config_path=self.model_path,
+            )
+
+    def _ensure_tokenizer_loaded(self):
+        assert self.tokenizer.loaded == True, logger.info("Tokenizer not loaded")
+        return self.tokenizer
+
+    def preprocess(self, info_dict):
+        pass
+
+    def _encode_ref_audio_to_code(self, wav: np.ndarray, sr: int) -> torch.Tensor:
+        tokenizer = self._ensure_audio_tokenizer_loaded()
+        codec_token = tokenizer._audio_tokenize(wav, sr=int(sr), return_dict=True)
+        ref_code = codec_token
+        # ref_code = getattr(codec_token, "audio_codes", None)
+        if isinstance(ref_code, list):
+            ref_code = ref_code[0] if ref_code else None
+        if isinstance(ref_code, torch.Tensor):
+            # 12Hz: likely [T, Q] or [B, T, Q]
+            if ref_code.ndim == 3:
+                ref_code = ref_code[0]
+            return ref_code.to(device=next(self.parameters()).device, dtype=torch.long)
+        raise ValueError("SpeechTokenizer.encode did not return audio_codes tensor")
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return self.model.embed_tokens(input_ids)
@@ -334,13 +320,33 @@ class StepAudioAR(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor:
+        # logger.info(f"input_ids:{input_ids}")
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
             hidden_states = self.model.layers(hidden_states)
             hidden_states = self.model.norm(hidden_states)
-            return hidden_states
-        return self.model.forward_hidden_states(input_ids)
+        else:
+            hidden_states = self.model.forward_hidden_states(input_ids)
 
+        num_tokens = int(input_ids.numel())
+
+        if hidden_states.dim() == 3:
+            b, s, h = hidden_states.shape
+            assert b * s == num_tokens, (
+                f"Hidden states token count mismatch: b*s={b*s}, num_tokens={num_tokens}, shape={hidden_states.shape}"
+            )
+            hidden_states = hidden_states.reshape(b * s, h)
+
+        assert hidden_states.dim() == 2, f"Expected 2D hidden_states, got {hidden_states.shape}"
+        assert hidden_states.shape[0] == num_tokens, (
+            f"Hidden states first dim mismatch: {hidden_states.shape[0]} vs num_tokens={num_tokens}"
+        )
+
+        # logger.info(
+        #     f"StepAudioAR.forward input_ids_shape={tuple(input_ids.shape)} "
+        #     f"hidden_states_shape={tuple(hidden_states.shape)}"
+        # )
+        return hidden_states
     def compute_logits(
         self,
         hidden_states: torch.Tensor | OmniOutput,
@@ -353,4 +359,53 @@ class StepAudioAR(nn.Module):
         return self.logits_processor(self.model.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return self.model.load_weights(weights)
+        params_dict = dict(self.named_parameters())
+        loaded_params = set()
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("self_attn.qkv_proj", "self_attn.q_proj", "q"),
+            ("self_attn.qkv_proj", "self_attn.k_proj", "k"),
+            ("self_attn.qkv_proj", "self_attn.v_proj", "v"),
+            ("mlp.gate_up_proj", "mlp.gate_proj", 0),
+            ("mlp.gate_up_proj", "mlp.up_proj", 1),
+        ]
+        for name, loaded_weight in weights:
+            if name == "lm_head.weight":
+                mapped_name = "model.lm_head.weight"
+                if mapped_name in params_dict:
+                    param = params_dict[mapped_name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    try:
+                        weight_loader(param, loaded_weight)
+                    except AssertionError as err:
+                        raise AssertionError(f"Failed to load weight {name!r} as {name!r}") from err
+                    loaded_params.add(mapped_name)
+                continue
+            if name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                try:
+                    weight_loader(param, loaded_weight)
+                    # print(f"loaded weight from {name} to {mapped_name}")
+                except AssertionError as err:
+                    raise AssertionError(f"Failed to load weight {name!r} as {name!r}") from err
+                loaded_params.add(name)
+            else:
+                Found = False
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    stacked_name = name.replace(weight_name, param_name)
+                    if stacked_name not in params_dict:
+                        continue
+                    param = params_dict[stacked_name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight, shard_id)
+                    # print(f"loaded weight from {stacked_name} to {name}")
+                    loaded_params.add(name)
+                    Found = True
+                    break
+                if not Found:
+                    logger.debug(f"Skipping weight {name} -> {name} - not found in model")
+
+        return loaded_params

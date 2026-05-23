@@ -4,6 +4,7 @@ import os.path
 import threading
 import time
 from collections.abc import Iterable
+from urllib.parse import urlparse
 
 import numpy as np
 import onnxruntime
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 class FunASRModel:
     def __init__(self, model_path, config_path):
+        config_path = "/root/workspace/vllm-omni/vllm_omni/model_executor/models/step_audio_editx/audio_tokenizer/tokenizer.yaml"
         with open(config_path, encoding="utf-8") as f:
             kwargs = yaml.safe_load(f)
         assert "model" in kwargs
@@ -86,21 +88,26 @@ class StepAudioTokenizer:
         tokenizer_path,
         config_path,
         funasr_model_id="dengcunqin/speech_paraformer-large_asr_nat-zh-cantonese-en-16k-vocab8501-online",
-    ):
-        self.text_tokenizer = AutoTokenizer.from_pretrained(config_path)
+    ):  
+        tokenizer_path = os.getenv("STEP_AUDIO_TOKENIZER_PATH")
+        if not tokenizer_path:
+            raise ValueError("STEP_AUDIO_TOKENIZER_PATH is not set")
+        self.text_tokenizer = AutoTokenizer.from_pretrained(config_path,use_fast=False)
+        # logger.info(f"Successfully load tokenizer from {config_path}")
+        self.funasr_tokenizer_path = os.path.join(tokenizer_path, funasr_model_id)
         self.funasr_model = FunASRModel(
-            model_path=os.path.join(tokenizer_path, funasr_model_id), config_path=config_path
+            model_path=self.funasr_tokenizer_path, config_path=self.funasr_tokenizer_path
         )
-        kms_path = os.path.join(tokenizer_path, "linguistic_tokenizer.npy")
-        cosy_tokenizer_path = os.path.join(tokenizer_path, "speech_tokenizer_v1.onnx")
-        self.kms = torch.tensor(np.load(kms_path))
+        self.kms_path = os.path.join(tokenizer_path, "linguistic_tokenizer.npy")
+        self.cosy_tokenizer_path = os.path.join(tokenizer_path, "speech_tokenizer_v1.onnx")
+        self.kms = torch.tensor(np.load(self.kms_path))
 
         providers = ["CUDAExecutionProvider"]
         session_option = onnxruntime.SessionOptions()
         session_option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         session_option.intra_op_num_threads = 1
         self.ort_session = onnxruntime.InferenceSession(
-            cosy_tokenizer_path, sess_options=session_option, providers=providers
+            self.cosy_tokenizer_path, sess_options=session_option, providers=providers
         )
         self.chunk_size = [0, 4, 5]
         self.encoder_chunk_look_back = 4
@@ -109,8 +116,24 @@ class StepAudioTokenizer:
         self.vq02_sessions = {}
         self.vq02_lock = threading.Lock()
         self.vq06_lock = threading.Lock()
+        self.loaded = True
 
-    def forward(self, task_type, audio, prompt, sr):
+    def _is_probably_base64(self, s: str) -> bool:
+        if s.startswith("data:audio"):
+            return True
+        # Heuristic: no filesystem path separators and long enough.
+        if ("/" not in s and "\\" not in s) and len(s) > 256:
+            return True
+        return False
+
+    def _is_url(self, s: str) -> bool:
+        try:
+            u = urlparse(s)
+            return u.scheme in ("http", "https") and bool(u.netloc)
+        except Exception:
+            return False
+
+    def encode(self, task_type, audio, prompt, sr):
         audio_tokens, vq0206_codes = self._audio_tokenize(audio, sr)
         token_ids = self._text_tokenize(task_type, audio_tokens, prompt)
         return token_ids, vq0206_codes
@@ -135,18 +158,18 @@ class StepAudioTokenizer:
             prompt_text, edit_type, edit_info, target_text = prompt
             instruct_prefix = self._build_audio_edit_instruction(prompt_text, edit_type, edit_info, target_text)
 
-            token_ids = self._encode_edit_prompt(self.edit_sys_prompt, instruct_prefix, audio_tokens)
+            prompt = self._build_edit_prompt(self.edit_sys_prompt, instruct_prefix, audio_tokens)
 
         if task_type == "clone":
             prompt_text, target_text = prompt
             prompt_speaker = "debug"
-            token_ids = self._encode_clone_prompt(
+            prompt = self._build_clone_prompt(
                 target_text,
                 prompt_text,
                 prompt_speaker,
                 audio_tokens,
             )
-
+        token_ids = self.text_tokenizer.apply_chat_template(prompt, tokenize=True, add_generation_prompt=True)
         return token_ids
 
     def _load_audio(self, prompt_wav: str | torch.Tensor):
@@ -310,22 +333,22 @@ class StepAudioTokenizer:
             j += 3
         return "".join([f"<audio_{x}>" for x in result])
 
-    def _encode_edit_prompt(self, sys_prompt: str, instruct_prefix: str, audio_token_str: str) -> list[int]:
+    def _build_edit_prompt(self, sys_prompt: str, instruct_prefix: str, audio_token_str: str) -> list[int]:
         """Encode audio edit prompt to token sequence"""
         messages = [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": f"{instruct_prefix}\n{audio_token_str}\n"},
         ]
 
-        return self.text_tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+        return messages
 
-    def _encode_clone_prompt(self, text: str, prompt_text: str, prompt_speaker: str, prompt_wav_tokens: str):
+    def _build_clone_prompt(self, text: str, prompt_text: str, prompt_speaker: str, prompt_wav_tokens: str):
         sys_prompt = self.edit_clone_sys_prompt_tpl.format(
             speaker=prompt_speaker, prompt_text=prompt_text, prompt_wav_tokens=prompt_wav_tokens
         )
         messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": f"{text}"}]
 
-        return self.text_tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+        return messages
 
     def _build_audio_edit_instruction(
         self, audio_text: str, edit_type: str, edit_info: str | None = None, text: str | None = None

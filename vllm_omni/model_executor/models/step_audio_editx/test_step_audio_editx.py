@@ -36,7 +36,7 @@ def run_e2e():
         help="Path to StepAudioEditx (e.g., stepfun-ai/Step-Audio-EditX).",
     )
     parser.add_argument(
-        "--tokenizer",
+        "--audio-tokenizer",
         type=str,
         required=True,
         help="Path to tokenizer directory (e.g., stepfun-ai/Step-Audio-Tokenizer).",
@@ -66,18 +66,18 @@ def run_e2e():
     nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
     # Ensure tokenizer directory exists
-    if not os.path.exists(args.tokenizer):
-        raise FileNotFoundError(f"{args.tokenizer} does not exist!")
+    if not os.path.exists(args.audio_tokenizer):
+        raise FileNotFoundError(f"{args.audio_tokenizer} does not exist!")
 
     if args.deploy_config is not None and not os.path.exists(args.deploy_config):
         raise FileNotFoundError(f"{args.deploy_config} does not exist!")
 
     print(f"Initializing StepAudioEditx E2E with model={args.model}")
     print(f"Deploy config: {args.deploy_config}")
+    os.environ["STEP_AUDIO_TOKENIZER_PATH"] = args.audio_tokenizer
     omni = Omni(
         model=args.model,
         deploy_config=args.deploy_config,
-        tokenizer=args.tokenizer,
         log_stats=True,
     )
 
