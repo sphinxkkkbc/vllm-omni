@@ -7,7 +7,6 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-from vllm import SamplingParams
 from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
@@ -48,7 +47,7 @@ def run_e2e():
         help="Override the deploy config path. If unset, auto-loads "
         "vllm_omni/deploy/step_audio_editx.yaml based on the HF model_type.",
     )
-    parser.add_argument("--text", type=str, default="Hello, this is a test of the CosyVoice system capability.")
+    parser.add_argument("--text", type=str, default="Hello, this is a test of the StepAudioEditx system capability.")
     parser.add_argument(
         "--prompt-text",
         type=str,
@@ -114,37 +113,13 @@ def run_e2e():
 
     print(f"Generating for prompt: {args.text}")
 
-    # Build SamplingParams for each stage (GPT, S2Mel, Vocoder)
-    gpt_sampling = SamplingParams(
-        temperature=1.0,
-        top_p=sampling_cfg["top_p"],
-        top_k=sampling_cfg["top_k"],
-        repetition_penalty=2.0,
-        stop_token_ids=[sampling_cfg["eos_token_id"]],
-        # allowed_token_ids=list(range(6561+3)),
-        detokenize=False,
-    )
-    # Not used
-    s2mel_sampling = SamplingParams(
-        temperature=1.0,
-        top_p=1.0,
-        top_k=-1,
-        repetition_penalty=2.0,
-        max_tokens=256,
-        detokenize=False,
-    )
-
-    sampling_params_list = [gpt_sampling, s2mel_sampling]
-
     # Start profiling (requires VLLM_TORCH_PROFILER_DIR env var)
     if os.environ.get("VLLM_TORCH_PROFILER_DIR"):
         print("Starting profiler...")
         omni.start_profile()
 
-    # Generate (Omni orchestrator requires a per-stage SamplingParams list)
-    outputs = list(omni.generate(prompts, sampling_params_list=sampling_params_list[:2]))
+    outputs = list(omni.generate(prompts))
 
-    # Stop profiling and get results
     if os.environ.get("VLLM_TORCH_PROFILER_DIR"):
         print("Stopping profiler...")
         profile_results = omni.stop_profile()

@@ -5,8 +5,9 @@ from collections import defaultdict
 from collections.abc import Iterable
 from copy import deepcopy
 from functools import cached_property, reduce
-from typing import Any
 from types import SimpleNamespace
+from typing import Any
+
 import numpy as np
 import onnxruntime
 import torch
@@ -17,7 +18,6 @@ import torchaudio.compliance.kaldi as kaldi
 import yaml
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models import SupportsPP
 
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalConditionalCFM
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
@@ -150,8 +150,11 @@ class CosyVoice(nn.Module):
 
     def forward(self, token: torch.Tensor, prompt_token: torch.Tensor, input_wav: torch.Tensor, sample_rate: int):
         speech_feat, speech_embedding = self._feature_extract(input_wav, sample_rate)
-        speech_feat = speech_feat.to(torch.bfloat16)
-        speech_embedding = speech_embedding.to(torch.bfloat16)
+        flow_dtype = next(self.flow.parameters()).dtype
+        flow_device = next(self.flow.parameters()).device
+
+        speech_feat = speech_feat.to(flow_device, flow_dtype)
+        speech_embedding = speech_embedding.to(flow_device, flow_dtype)
 
         def _make_len(ts: torch.Tensor):
             return torch.tensor([ts.shape[1]], dtype=torch.long, device=ts.device)
@@ -172,12 +175,14 @@ class CosyVoice(nn.Module):
             prompt_token,
             _make_len(prompt_token),
             speech_feat.to(self.dtype),
-            _make_len(speech_feat),
+            # _make_len(speech_feat),
             speech_embedding.to(self.dtype),
             self.n_timesteps,
         )
+        mel = mel.to(flow_device, flow_dtype)
         speech, _ = self.hift.inference(mel)
-        return speech.cpu().to(torch.float32)
+        # return speech.cpu().to(torch.float32)
+        return speech
 
     def chunk_decode_streaming(
         self,
@@ -352,7 +357,7 @@ class CosyVoice(nn.Module):
         self.spk_embedding_cache_dict.pop(session_id, None)
 
 
-class StepAudioCode2wav(nn.Module, SupportsPP):
+class StepAudioCode2wav(nn.Module):
     DEBUG_MARKER = "STEP_AUDIO_CODE2WAV_RUNNER_MODEL"
     input_modalities = "audio"
 
@@ -423,11 +428,11 @@ class StepAudioCode2wav(nn.Module, SupportsPP):
         input_wav, sample_rate = self._extract_runtime_inputs(runtime_additional_information, kwargs)
 
         if prompt_token is None:
-            raise ValueError("StepAudioCode2wav requires prompt_token (vq0206_codes) in intermediate_tensors.")
+            prompt_token = torch.zeros((5,), dtype=torch.long, device=token.device)
+
         if input_wav is None or sample_rate is None:
-            raise ValueError(
-                "StepAudioCode2wav requires input_wav and sample_rate in runtime_additional_information or kwargs."
-            )
+            sample_rate = 24000
+            input_wav = torch.zeros((1, sample_rate), dtype=torch.float32, device=token.device)
 
         audio = self.core.forward(token, prompt_token, input_wav, sample_rate)
         return OmniOutput(

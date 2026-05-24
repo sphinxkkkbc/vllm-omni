@@ -3,7 +3,7 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,13 +15,15 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
-    RowParallelLinear,
     ReplicatedLinear,
+    RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+
 from .step_audio_tokenizer import StepAudioTokenizer
 
 logger = logging.getLogger(__name__)
@@ -140,9 +142,9 @@ class Step1Attention(nn.Module):
         # q = q.view(batch_size, seq_len, self.num_heads * self.head_dim)
         # k = k.view(batch_size, seq_len, self.num_groups * self.head_dim)
         # v = v.view(batch_size, seq_len, self.num_groups * self.head_dim)
-        q = q.view(batch_size*seq_len, self.num_heads*self.head_dim)
-        k = k.view(batch_size*seq_len, self.num_groups*self.head_dim)
-        v = v.view(batch_size*seq_len, self.num_groups*self.head_dim)
+        q = q.view(batch_size * seq_len, self.num_heads * self.head_dim)
+        k = k.view(batch_size * seq_len, self.num_groups * self.head_dim)
+        v = v.view(batch_size * seq_len, self.num_groups * self.head_dim)
         # logger.info(f"q shape: {q.shape}, k shape: {k.shape}, v shape: {v.shape}")
         attn_output = self.attn(
             query=q,
@@ -274,7 +276,6 @@ class StepAudioAR(nn.Module):
         self.vllm_config = vllm_config
         hf_config = vllm_config.model_config.hf_config
         self.model_path = vllm_config.model_config.model
-        print(vllm_config)
         extra = getattr(vllm_config.model_config, "additional_kwargs", None) or {}
         self.tokenizer_path = extra.get("audio_tokenizer")
         self.config = hf_config
@@ -283,31 +284,42 @@ class StepAudioAR(nn.Module):
         self.have_multimodal_outputs = False
         self.has_preprocess = True
         self.has_postprocess = False
-        self.tokenizer = StepAudioTokenizer(
-                tokenizer_path=self.tokenizer_path, 
-                config_path=self.model_path,
-            )
+        self.tokenizer = None
 
-    def _ensure_tokenizer_loaded(self):
-        assert self.tokenizer.loaded == True, logger.info("Tokenizer not loaded")
-        return self.tokenizer
+    def embed_multimodal(self, **kwargs) -> torch.Tensor:
+        return self._encode_ref_audio_to_code(**kwargs)
+
+    def _ensure_audio_tokenizer_loaded(self):
+        self.tokenizer = StepAudioTokenizer(
+            tokenizer_path=self.tokenizer_path,
+            config_path=self.model_path,
+        )
+        if self.tokenizer is None:
+            raise RuntimeError("Failed to load audio tokenizer")
 
     def preprocess(self, info_dict):
-        pass
+        logger.info(f"Preprocessing info_dict: {info_dict}")
+        self._ensure_audio_tokenizer_loaded()
+        additional_information = info_dict.get("additional_information")
+        if isinstance(additional_information, dict):
+            merged: dict[str, Any] = {k: v for k, v in info_dict.items() if k != "additional_information"}
+            for k, v in additional_information.items():
+                merged.setdefault(k, v)
+            info_dict = merged
+
+        payload: OmniPayload = info_dict
+        embed = payload.get("embed", {})
+        hs = payload.get("hidden_states", {})
+        meta = payload.get("meta", {})
+        text_list = text_list = info_dict.get("text")
 
     def _encode_ref_audio_to_code(self, wav: np.ndarray, sr: int) -> torch.Tensor:
-        tokenizer = self._ensure_audio_tokenizer_loaded()
-        codec_token = tokenizer._audio_tokenize(wav, sr=int(sr), return_dict=True)
-        ref_code = codec_token
-        # ref_code = getattr(codec_token, "audio_codes", None)
-        if isinstance(ref_code, list):
-            ref_code = ref_code[0] if ref_code else None
-        if isinstance(ref_code, torch.Tensor):
-            # 12Hz: likely [T, Q] or [B, T, Q]
-            if ref_code.ndim == 3:
-                ref_code = ref_code[0]
-            return ref_code.to(device=next(self.parameters()).device, dtype=torch.long)
-        raise ValueError("SpeechTokenizer.encode did not return audio_codes tensor")
+        try:
+            self._ensure_audio_tokenizer_loaded()
+            audio_prompt, codec_token = self.tokenizer._audio_tokenize(wav, sr=int(sr), return_dict=True)
+            return audio_prompt, codec_token
+        except Exception as e:
+            logger.error("Failed to tokenize audio prompt", exc_info=e)
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return self.model.embed_tokens(input_ids)
@@ -333,7 +345,7 @@ class StepAudioAR(nn.Module):
         if hidden_states.dim() == 3:
             b, s, h = hidden_states.shape
             assert b * s == num_tokens, (
-                f"Hidden states token count mismatch: b*s={b*s}, num_tokens={num_tokens}, shape={hidden_states.shape}"
+                f"Hidden states token count mismatch: b*s={b * s}, num_tokens={num_tokens}, shape={hidden_states.shape}"
             )
             hidden_states = hidden_states.reshape(b * s, h)
 
@@ -346,7 +358,11 @@ class StepAudioAR(nn.Module):
         #     f"StepAudioAR.forward input_ids_shape={tuple(input_ids.shape)} "
         #     f"hidden_states_shape={tuple(hidden_states.shape)}"
         # )
-        return hidden_states
+        output = OmniOutput(
+            text_hidden_states=hidden_states,
+        )
+        return output
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor | OmniOutput,

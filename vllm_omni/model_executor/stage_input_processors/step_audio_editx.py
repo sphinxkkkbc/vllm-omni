@@ -12,6 +12,7 @@ logger = init_logger(__name__)
 
 
 def ar2decoder(source_outputs: list[Any], _prompt: Any = None, _requires_multimodal_data: bool = False):
+    logger.info(f"AR Stage: {source_outputs}")
     from vllm_omni.inputs.data import OmniTokensPrompt
 
     code2wav_inputs: list[OmniTokensPrompt] = []

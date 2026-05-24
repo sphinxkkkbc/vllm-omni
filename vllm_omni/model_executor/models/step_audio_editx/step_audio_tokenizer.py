@@ -23,7 +23,9 @@ logger = logging.getLogger(__name__)
 
 class FunASRModel:
     def __init__(self, model_path, config_path):
-        config_path = "/root/workspace/vllm-omni/vllm_omni/model_executor/models/step_audio_editx/audio_tokenizer/tokenizer.yaml"
+        config_path = (
+            "/root/workspace/vllm-omni/vllm_omni/model_executor/models/step_audio_editx/audio_tokenizer/tokenizer.yaml"
+        )
         with open(config_path, encoding="utf-8") as f:
             kwargs = yaml.safe_load(f)
         assert "model" in kwargs
@@ -88,16 +90,14 @@ class StepAudioTokenizer:
         tokenizer_path,
         config_path,
         funasr_model_id="dengcunqin/speech_paraformer-large_asr_nat-zh-cantonese-en-16k-vocab8501-online",
-    ):  
+    ):
         tokenizer_path = os.getenv("STEP_AUDIO_TOKENIZER_PATH")
         if not tokenizer_path:
             raise ValueError("STEP_AUDIO_TOKENIZER_PATH is not set")
-        self.text_tokenizer = AutoTokenizer.from_pretrained(config_path,use_fast=False)
+        self.text_tokenizer = AutoTokenizer.from_pretrained(config_path, use_fast=False)
         # logger.info(f"Successfully load tokenizer from {config_path}")
         self.funasr_tokenizer_path = os.path.join(tokenizer_path, funasr_model_id)
-        self.funasr_model = FunASRModel(
-            model_path=self.funasr_tokenizer_path, config_path=self.funasr_tokenizer_path
-        )
+        self.funasr_model = FunASRModel(model_path=self.funasr_tokenizer_path, config_path=self.funasr_tokenizer_path)
         self.kms_path = os.path.join(tokenizer_path, "linguistic_tokenizer.npy")
         self.cosy_tokenizer_path = os.path.join(tokenizer_path, "speech_tokenizer_v1.onnx")
         self.kms = torch.tensor(np.load(self.kms_path))

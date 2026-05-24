@@ -1,3 +1,4 @@
+import logging
 import math
 from collections.abc import Iterable
 
@@ -15,6 +16,8 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreL
 from vllm_omni.model_executor.models.cosyvoice3.utils import make_pad_mask
 
 from ..audio_tokenizer.transformer_utils import PositionwiseFeedForward
+
+logger = logging.getLogger(__name__)
 
 
 class DualCodebookEmbedding(torch.nn.Module):
@@ -80,10 +83,10 @@ class RelPositionMultiHeadedAttention(nn.Module):
         # # linear transformation for positional encoding
         # these two learnable bias are used in matrix c and matrix d
         # as described in https://arxiv.org/abs/1901.02860 Section 3.3
-        self.pos_bias_u = nn.Parameter(torch.Tensor(self.h, self.d_k))
-        self.pos_bias_v = nn.Parameter(torch.Tensor(self.h, self.d_k))
-        torch.nn.init.xavier_uniform_(self.pos_bias_u)
-        torch.nn.init.xavier_uniform_(self.pos_bias_v)
+        self.pos_bias_u = nn.Parameter(torch.randn(self.h, self.d_k)).to(device="cuda")
+        self.pos_bias_v = nn.Parameter(torch.randn(self.h, self.d_k)).to(device="cuda")
+        # torch.nn.init.xavier_uniform_(self.pos_bias_u)
+        # torch.nn.init.xavier_uniform_(self.pos_bias_v)
 
     def rel_shift(self, x: torch.Tensor) -> torch.Tensor:
         """Compute relative positional encoding."""
@@ -124,9 +127,13 @@ class RelPositionMultiHeadedAttention(nn.Module):
         """
         n_batch = query.size(0)
 
-        q = self.linea_q(query).view(n_batch, -1, self.h, self.d_k)  # (batch, time1, head, d_k)
-        k = self.linear_k(key).view(n_batch, -1, self.h, self.d_k).transpose(1, 2)  # (batch, head, time2, d_k)
-        v = self.linear_v(value).view(n_batch, -1, self.h, self.d_k).transpose(1, 2)  # (batch, head, time2, d_k)
+        q, _ = self.linear_q(query)
+        k, _ = self.linear_k(key)
+        v, _ = self.linear_v(value)
+
+        q = q.view(n_batch, -1, self.h, self.d_k)  # (batch, time1, head, d_k)
+        k = k.view(n_batch, -1, self.h, self.d_k).transpose(1, 2)  # (batch, head, time2, d_k)
+        v = v.view(n_batch, -1, self.h, self.d_k).transpose(1, 2)  # (batch, head, time2, d_k)
 
         if cache is not None and cache.size(0) > 0:
             key_cache, value_cache = torch.split(cache, cache.size(-1) // 2, dim=-1)
@@ -137,7 +144,8 @@ class RelPositionMultiHeadedAttention(nn.Module):
         new_cache = torch.cat((k, v), dim=-1)
 
         n_batch_pos = pos_emb.size(0)
-        p = self.linear_pos(pos_emb).view(n_batch_pos, -1, self.h, self.d_k)
+        p, _ = self.linear_pos(pos_emb)
+        p = p.view(n_batch_pos, -1, self.h, self.d_k)
         p = p.transpose(1, 2)  # (batch, head, time1, d_k)
 
         # (batch, head, time1, d_k)
@@ -172,7 +180,7 @@ class RelPositionMultiHeadedAttention(nn.Module):
 
         x = torch.matmul(attn, v)  # (batch, head, time1, d_k)
         x = x.transpose(1, 2).contiguous().view(n_batch, -1, self.h * self.d_k)  # (batch, time1, d_model)
-        output = self.linear_out(x)
+        output, _ = self.linear_out(x)
         return output, new_cache
 
 
@@ -361,7 +369,7 @@ class ConformerEncoderLayer(nn.Module):
         if self.normalize_before:
             x = self.norm_mha(x)
         # att_cache: (b, head, cache_t, d_k*2)
-        x_att, new_att_cache = self.self_attn(x, mask, pos_emb, att_cache)
+        x_att, new_att_cache = self.self_attn(x, x, x, mask, pos_emb, att_cache)
         x = residual + x_att
         if not self.normalize_before:
             x = self.norm_mha(x)
@@ -676,10 +684,10 @@ class MLP(torch.nn.Module):
         self.fc2 = ReplicatedLinear(hidden_features, out_features, bias=bias)
 
     def forward(self, x):
-        x = self.fc1(x)
+        x, _ = self.fc1(x)
         x = self.act(x)
         x = self.norm(x)
-        x = self.fc2(x)
+        x, _ = self.fc2(x)
         return x
 
 
@@ -693,7 +701,7 @@ class Attention(torch.nn.Module):
         qk_norm: bool = False,
         norm_layer: nn.Module = nn.LayerNorm,
         prefix="",
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -710,8 +718,8 @@ class Attention(torch.nn.Module):
             bias=qkv_bias,
         )
 
-        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.q_norm = norm_layer(self.head_dim, dtype=dtype) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim, dtype=dtype) if qk_norm else nn.Identity()
 
         self.proj = RowParallelLinear(
             input_size=self.inner_dim,
