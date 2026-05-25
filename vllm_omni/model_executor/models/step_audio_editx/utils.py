@@ -149,7 +149,8 @@ def trim_silence(audio, sr, keep_left_time=0.05, keep_right_time=0.22, hop_size=
     wav_len = len(audio)
     start_idx = index[0] - left_sil_samples
     trim_wav = audio
-
+    if isinstance(audio, torch.Tensor):
+        trim_wav = trim_wav.detach().cpu().numpy()
     if start_idx > 0:
         trim_wav = trim_wav[start_idx:]
     else:
@@ -161,6 +162,7 @@ def trim_silence(audio, sr, keep_left_time=0.05, keep_right_time=0.22, hop_size=
         trim_wav = trim_wav[:out_len]
     else:
         trim_wav = np.pad(trim_wav, (0, (out_len - wav_len)), mode="constant", constant_values=0.0)
+    trim_wav = torch.from_numpy(trim_wav)
     return trim_wav
 
 

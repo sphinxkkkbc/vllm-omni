@@ -1,6 +1,7 @@
 import logging
 import os
 import os.path
+import tempfile
 import threading
 import time
 from collections.abc import Iterable
@@ -8,15 +9,24 @@ from urllib.parse import urlparse
 
 import numpy as np
 import onnxruntime
+import requests
 import torch
-import torchaudio
+import soundfile as sf
 import whisper
 import yaml
 from transformers import AutoTokenizer
 
 from .audio_tokenizer.frontend import WavFrontendOnline
 from .audio_tokenizer.paraformer import ParaformerStreaming
-from .utils import energy_norm_fn, prepare_data_iterator, resample_audio, trim_silence
+from .utils import (
+    energy_norm_fn, 
+    prepare_data_iterator, 
+    resample_audio, 
+    trim_silence,
+    AUDIO_EDIT_CLONE_SYSTEM_PROMPT_TPL, 
+    AUDIO_EDIT_SYSTEM_PROMPT
+    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +84,7 @@ class FunASRModel:
                 batch["data_in"] = data_batch[0]
                 batch["data_lengths"] = input_len
 
-            results, meta_data, cache = self.model.infer_encoder(**batch, **kwargs, frontend=self.frontend)
+            results, meta_data, cache = self.model.infer_encoder(**batch, **kwargs)
             asr_result_list.extend(results)
 
         torch.accelerator.empty_cache()
@@ -116,7 +126,9 @@ class StepAudioTokenizer:
         self.vq02_sessions = {}
         self.vq02_lock = threading.Lock()
         self.vq06_lock = threading.Lock()
-        self.loaded = True
+
+        self.edit_clone_sys_prompt_tpl = AUDIO_EDIT_CLONE_SYSTEM_PROMPT_TPL
+        self.edit_sys_prompt = AUDIO_EDIT_SYSTEM_PROMPT
 
     def _is_probably_base64(self, s: str) -> bool:
         if s.startswith("data:audio"):
@@ -134,17 +146,6 @@ class StepAudioTokenizer:
             return False
 
     def encode(self, task_type, audio, prompt, sr):
-        audio_tokens, vq0206_codes = self._audio_tokenize(audio, sr)
-        token_ids = self._text_tokenize(task_type, audio_tokens, prompt)
-        return token_ids, vq0206_codes
-
-    def _audio_tokenize(self, audio, sr):
-        vq0206_codes, vq02_codes_ori, vq06_codes_ori = self.wav2token(audio, sr)
-        vq0206_codes = torch.tensor(vq0206_codes, dtype=torch.long) - 65536
-        audio_tokens = self.merge_vq0206_to_token_str(vq02_codes_ori, vq06_codes_ori)
-        return audio_tokens, vq0206_codes
-
-    def _text_tokenize(self, task_type: str, audio_tokens: str, prompt: dict | tuple):
         """
         edit mode: prompt = {
                             prompt_text: str,
@@ -154,6 +155,16 @@ class StepAudioTokenizer:
                         }
         clone mode: prompt = {prompt_text, target_text}
         """
+        audio_tokens, vq0206_codes = self._audio_tokenize(audio, sr)
+        token_ids = self._text_tokenize(task_type, audio_tokens, prompt)
+        return token_ids, vq0206_codes
+
+    def _audio_tokenize(self, audio, sr):
+        vq0206_codes, vq02_codes_ori, vq06_codes_ori = self.wav2token(audio, sr)
+        audio_tokens = self.merge_vq0206_to_token_str(vq02_codes_ori, vq06_codes_ori)
+        return audio_tokens, vq0206_codes
+
+    def _text_tokenize(self, task_type: str, audio_tokens: str, prompt: dict | tuple):
         if task_type == "edit":
             prompt_text, edit_type, edit_info, target_text = prompt
             instruct_prefix = self._build_audio_edit_instruction(prompt_text, edit_type, edit_info, target_text)
@@ -172,12 +183,45 @@ class StepAudioTokenizer:
         token_ids = self.text_tokenizer.apply_chat_template(prompt, tokenize=True, add_generation_prompt=True)
         return token_ids
 
-    def _load_audio(self, prompt_wav: str | torch.Tensor):
-        if isinstance(prompt_wav, str):
-            prompt_wav, prompt_wav_sr = torchaudio.load(prompt_wav)
-        return prompt_wav, prompt_wav_sr
+    def _load_audio(self, prompt_wav, prompt_wav_sr: int | None = None):
+      if isinstance(prompt_wav, list):
+          prompt_wav = prompt_wav[0]
+      if isinstance(prompt_wav, torch.Tensor):
+          if prompt_wav_sr is None:
+              raise ValueError("Tensor audio requires prompt_wav_sr.")
+          return prompt_wav, int(prompt_wav_sr)
+
+      if isinstance(prompt_wav, np.ndarray):
+          if prompt_wav_sr is None:
+              raise ValueError("NumPy audio requires prompt_wav_sr.")
+          wav = torch.from_numpy(prompt_wav.astype(np.float32))
+          if wav.ndim == 1:
+              wav = wav.unsqueeze(0)
+          return wav, int(prompt_wav_sr)
+
+      if isinstance(prompt_wav, str):
+          if self._is_url(prompt_wav):
+              with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
+                  r = requests.get(prompt_wav, timeout=30)
+                  r.raise_for_status()
+                  f.write(r.content)
+                  f.flush()
+                  data, sr = sf.read(f.name, dtype="float32", always_2d=False)
+          else:
+              data, sr = sf.read(prompt_wav, dtype="float32", always_2d=False)
+
+          # soundfile 返回 shape:
+          # mono: [T], multi-channel: [T, C]
+          if data.ndim == 1:
+              wav = torch.from_numpy(data).unsqueeze(0)       # [1, T]
+          else:
+              wav = torch.from_numpy(data).transpose(0, 1)    # [C, T]
+          return wav, int(sr)
+
+      raise TypeError(f"Unsupported prompt_wav type: {type(prompt_wav)}")
 
     def preprocess_wav(self, audio, sample_rate, enable_trim=True, energy_norm=True):
+        audio, sample_rate = self._load_audio(audio)
         if audio.shape[0] > 1:
             audio = audio.mean(dim=0, keepdim=True)
 
@@ -196,12 +240,11 @@ class StepAudioTokenizer:
             audio = energy_norm_fn(audio)
 
         if enable_trim:
-            audio_np = audio.numpy()
-            audio_np = trim_silence(audio_np, 16000)
-            audio = torch.from_numpy(audio_np).to(torch.float32)
+            audio = trim_silence(audio, 16000)
+            audio = audio.to(torch.float32)
             audio = audio.unsqueeze(0)
         return audio
-
+    
     def wav2token(self, audio, sample_rate, enable_trim=True, energy_norm=True):
         audio = self.preprocess_wav(audio, sample_rate, enable_trim=enable_trim, energy_norm=energy_norm)
 

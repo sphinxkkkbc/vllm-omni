@@ -2,28 +2,131 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import os
-import urllib.request
-from pathlib import Path
-
+from typing import Any
 import numpy as np
 import soundfile as sf
-from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 
-# Upstream zero-shot reference clip
-ZERO_SHOT_PROMPT_URL = "https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav"
+import logging
+logger = logging.getLogger(__name__)
+
+def _estimate_prompt_len(
+    additional_information: dict[str, Any],
+    model_path,
+    tokenizer_path,
+    _cache: dict[str, Any] = {},
+) -> int:
+    """Estimate prompt_token_ids placeholder length for the Talker stage.
+
+    The AR Talker replaces all input embeddings via ``preprocess``, so the
+    placeholder values are irrelevant but the **length** must match the
+    embeddings that ``preprocess`` will produce.
+    """
+    try:
+        from vllm_omni.model_executor.models.step_audio_editx.step_audio_ar import StepAudioAR
+        from transformers import AutoTokenizer
+        from vllm_omni.model_executor.models.step_audio_editx.step_audio_tokenizer import StepAudioTokenizer
+        speech_tok = StepAudioTokenizer(
+            tokenizer_path=tokenizer_path,
+            config_path=model_path,
+        )
+        tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, padding_side="left")
+        task_type = (additional_information.get("task_type") or ["clone"])[0]
+
+        def _estimate_ref_code_len(ref_audio: object) -> int | None:
+            """Encode ref_audio with the actual codec to get exact frame count."""
+            if not isinstance(ref_audio, (str, list)):
+                return None
+            audio_path = ref_audio[0] if isinstance(ref_audio, list) else ref_audio
+            if not isinstance(audio_path, str) or not audio_path.strip():
+                return None
+            try:
+                from urllib.parse import urlparse
+
+                import numpy as np
+
+                def _is_url(path: str) -> bool:
+                    try:
+                        parsed = urlparse(path)
+                        if parsed.scheme in ("http", "https"):
+                            return bool(parsed.netloc)
+                        return parsed.scheme in ("file", "data")
+                    except Exception:
+                        return False
+
+                if _is_url(audio_path):
+                    from vllm.multimodal.media import MediaConnector
+
+                    connector = MediaConnector(allowed_local_media_path="/")
+                    audio, sr = connector.fetch_audio(audio_path)
+                else:
+                    from vllm.multimodal.media.audio import load_audio
+
+                    audio, sr = load_audio(audio_path, sr=None, mono=True)
+
+                wav_np = np.asarray(audio, dtype=np.float32)
+
+                if speech_tok is not None:
+                    enc = speech_tok.encode(wav_np, sr=int(sr), return_dict=True)
+                    ref_code = getattr(enc, "token_ids", None)
+                    if isinstance(ref_code, list):
+                        ref_code = ref_code[0] if ref_code else None
+                    if ref_code is not None and hasattr(ref_code, "shape"):
+                        shape = ref_code.shape
+                        return int(shape[0]) if len(shape) == 2 else int(shape[1]) if len(shape) == 3 else None
+
+                codec_hz = 24
+                return int(len(audio) / sr * codec_hz)
+            except Exception:
+                return None
+
+        return StepAudioAR.estimate_prompt_len_from_additional_information(
+            additional_information=additional_information,
+            task_type=task_type,
+            tokenize_prompt=lambda t: tok(t, padding=False)["input_ids"],
+            estimate_ref_code_len=_estimate_ref_code_len,
+        )
+    except Exception as exc:
+        logger.warning("Failed to estimate prompt length, using fallback 2048: %s", exc)
+        return 2048
 
 
-def _default_ref_audio() -> str:
-    # Download the upstream zero_shot_prompt.wav into the current dir
-    dest = Path("zero_shot_prompt.wav")
-    if not dest.exists() or dest.stat().st_size == 0:
-        print(f"Downloading default reference audio to {dest}")
-        urllib.request.urlretrieve(ZERO_SHOT_PROMPT_URL, dest)
 
-    return str(dest)
+def get_base_query(args):
+    """Build Base (voice clone) sample inputs.
+    Returns:
+        QueryResult with Omni inputs and the Base model path.
+    """
+    task_type = "clone"
+    ref_audio_path_1 = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
+    ref_audio_single = ref_audio_path_1
+    ref_text_single = (
+        "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
+    )
+    syn_text_single = "Good one. Okay, fine, I'm just gonna leave this sock monkey here. Goodbye."
+    additional_information = {
+        "task_type": task_type,
+        "ref_audio": [ref_audio_single],
+        "ref_text": [ref_text_single],
+        "text": [syn_text_single],
+        "max_new_tokens": [2048],
+    }
+    inputs = {
+        "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, args.model, args.audio_tokenizer),
+        "additional_information": additional_information,
+    }
+    return inputs
+
+
+
+def _build_inputs(args) -> tuple[str, list]:
+    """Resolve model name and inputs list from CLI args."""
+    inputs = get_base_query(args)
+    inputs = inputs if isinstance(inputs, list) else [inputs]
+
+    return inputs
 
 
 def run_e2e():
@@ -80,36 +183,7 @@ def run_e2e():
         log_stats=True,
     )
 
-    sampling_cfg = {"top_p": 0.8, "top_k": 25, "eos_token_id": 6561 + 1}
-
-    print("Model initialized. Preparing inputs...")
-    ref_audio_path = args.ref_audio or _default_ref_audio()
-    if not os.path.exists(ref_audio_path):
-        raise FileNotFoundError(f"Audio file not found: {ref_audio_path}")
-    # Load at native sample rate
-    audio_signal, sr = load_audio(ref_audio_path, sr=None)
-
-    # Validate sample rate before processing (similar to original CosyVoice)
-    min_sr = 16000
-    if sr < min_sr:
-        raise ValueError(
-            f"Audio sample rate {sr} Hz is too low. "
-            f"Minimum required: {min_sr} Hz. "
-            f"Please provide audio with sample rate >= {min_sr} Hz."
-        )
-
-    audio_data = (audio_signal.astype(np.float32), sr)
-
-    prompts = {
-        "prompt": args.text,
-        "multi_modal_data": {
-            "audio": audio_data,
-        },
-        "mm_processor_kwargs": {
-            "prompt_text": args.prompt_text,
-            "sample_rate": audio_data[1],
-        },
-    }
+    inputs = _build_inputs(args)
 
     print(f"Generating for prompt: {args.text}")
 
@@ -118,7 +192,7 @@ def run_e2e():
         print("Starting profiler...")
         omni.start_profile()
 
-    outputs = list(omni.generate(prompts))
+    outputs = list(omni.generate(inputs))
 
     if os.environ.get("VLLM_TORCH_PROFILER_DIR"):
         print("Stopping profiler...")

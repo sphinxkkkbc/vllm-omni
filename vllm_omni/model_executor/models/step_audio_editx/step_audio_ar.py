@@ -1,6 +1,6 @@
 import logging
 import math
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -285,6 +285,7 @@ class StepAudioAR(nn.Module):
         self.has_preprocess = True
         self.has_postprocess = False
         self.tokenizer = None
+        
 
     def embed_multimodal(self, **kwargs) -> torch.Tensor:
         return self._encode_ref_audio_to_code(**kwargs)
@@ -297,8 +298,139 @@ class StepAudioAR(nn.Module):
         if self.tokenizer is None:
             raise RuntimeError("Failed to load audio tokenizer")
 
-    def preprocess(self, info_dict):
-        logger.info(f"Preprocessing info_dict: {info_dict}")
+    @staticmethod
+    def estimate_prompt_len_from_additional_information(
+        additional_information: dict[str, Any] | None,
+        *,
+        task_type: str,
+        tokenize_prompt: Callable[[str], list[int]],
+        estimate_ref_code_len: Callable[[object], int | None] | None = None,
+    ) -> int:
+        """Compute Stage-0 placeholder prompt length (length-only mirror of `_build_prompt_embeds()`).
+        It must match the model-side `inputs_embeds` length to avoid extra padding and quality drop."""
+
+        def _first(x: object, default: object) -> object:
+            if isinstance(x, list):
+                return x[0] if x else default
+            return x if x is not None else default
+
+        info: dict[str, Any] = additional_information or {}
+        text = _first(info.get("text"), "")
+        # Official defaults: CustomVoice/VoiceDesign -> non_streaming_mode=True; Base -> False.
+        non_streaming_mode = task_type in ("edit")
+
+        if not isinstance(text, str):
+            text = ""
+
+        # ---- codec prefix portion (matches _build_prompt_embeds) ----
+        prefill_len = 4
+
+        speaker_len = 1 if task_type in ("clone") else 0
+        codec_input_len = prefill_len + speaker_len + 2  # + [codec_pad, codec_bos]
+        codec_prefix_len = codec_input_len - 1  # codec_input[:-1] + tts_bos
+
+        # Role header: input_ids[:, :3] in model.
+        role_len = 3
+        prompt_len = role_len + codec_prefix_len
+
+        # ---- text conditioning portion (matches _build_prompt_embeds) ----
+        assistant_text = StepAudioAR._build_assistant_text(text)
+        assistant_len = len(tokenize_prompt(assistant_text))
+        if assistant_len < 8:
+            raise ValueError(f"Unexpected assistant prompt length: {assistant_len}")
+
+        if task_type == "clone":
+            voice_clone_prompt = _first(info.get("voice_clone_prompt"), None)
+
+            ref_code = None
+            if isinstance(voice_clone_prompt, dict):
+                ref_code = _first(voice_clone_prompt.get("ref_code"), None)
+
+            ref_code_len: int | None = None
+            if isinstance(ref_code, list):
+                if ref_code and isinstance(ref_code[0], list):
+                    ref_code_len = len(ref_code)
+                elif ref_code:
+                    ref_code_len = len(ref_code)
+            elif hasattr(ref_code, "shape"):
+                try:
+                    shape = getattr(ref_code, "shape")
+                    if shape and len(shape) >= 1:
+                        ref_code_len = int(shape[0])
+                except Exception:
+                    ref_code_len = None
+
+            if ref_code_len is None and estimate_ref_code_len is not None:
+                ref_code_len = estimate_ref_code_len(info.get("ref_audio"))
+            if ref_code_len is None:
+                raise ValueError(
+                    "Base in-context voice cloning requires either `voice_clone_prompt.ref_code` "
+                    "or a readable `ref_audio` that can be mapped to a codec frame length."
+                )
+
+            codec_lens = 1 + int(ref_code_len)  # codec_bos + ref_code
+            if non_streaming_mode:
+                # _generate_icl_prompt(non_streaming_mode=True):
+                # text_embed = ref_ids + text_ids + eos.
+                ref_ids = _first(info.get("ref_ids"), None)
+                if isinstance(voice_clone_prompt, dict) and ref_ids is None:
+                    ref_ids = _first(voice_clone_prompt.get("ref_ids") or voice_clone_prompt.get("ref_id"), None)
+
+                if ref_ids is None:
+                    ref_text = _first(info.get("ref_text"), "")
+                    if not isinstance(ref_text, str) or not ref_text.strip():
+                        raise ValueError(
+                            "Base in-context non-streaming requires `ref_text` or tokenized `ref_ids`."
+                        )
+                    ref_text_ids = tokenize_prompt(StepAudioAR._build_ref_text(ref_text))
+                    ref_ids_len = len(ref_text_ids)
+                elif hasattr(ref_ids, "shape"):
+                    shape = getattr(ref_ids, "shape", None)
+                    ref_ids_len = int(shape[-1]) if shape else 0
+                elif isinstance(ref_ids, list):
+                    ref_ids_len = len(ref_ids)
+                else:
+                    ref_ids_len = 0
+
+                # model uses ref_ids[:, 3:-2] (strip 5 tokens) and text_id=input_ids[:, 3:-5] (strip 8).
+                ref_id_len = max(0, int(ref_ids_len) - 5)
+                text_id_len = max(0, int(assistant_len) - 8)
+                text_embed_len = ref_id_len + text_id_len + 1  # + eos
+                prompt_len += text_embed_len + codec_lens
+            else:
+                # _generate_icl_prompt(non_streaming_mode=False): aligned to codec_lens.
+                prompt_len += codec_lens
+
+        return max(2, int(prompt_len))
+
+    def _build_prompt_embeds(
+        self,
+        *,
+        task_type: str,
+        info_dict: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int | None, torch.Tensor | None]:
+        logger.info(f"Building prompt embeds for task_type: {task_type}, info_dict: {info_dict}")
+        ref_audio = info_dict.get("ref_audio")
+        ref_text = info_dict.get("ref_text")
+        text = info_dict.get("text")
+        task_type = info_dict.get("task_type")
+        sr = info_dict.get("sr") or 16000
+        prompt_token, codec_token = self.tokenizer.encode(task_type, audio=ref_audio, prompt=(ref_text, text), sr=sr)
+        input_ids = torch.tensor(prompt_token.input_ids)
+        input_ids = input_ids.to(next(self.model.parameters()).device)
+        logger.info(f"input_ids shape: {input_ids.shape}, codec_token shape: {codec_token.shape}")
+        input_ids = self.embed_input_ids(input_ids)
+        tts_pad_id = self.tokenizer.text_tokenizer.pad_token_id
+        tts_pad_embed = self.embed_input_ids(torch.tensor([tts_pad_id]))
+        return input_ids, codec_token.shape[1], codec_token, tts_pad_embed
+    
+    def preprocess(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor | None,
+        **info_dict: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        # logger.info(f"Preprocessing info_dict: {info_dict}")
         self._ensure_audio_tokenizer_loaded()
         additional_information = info_dict.get("additional_information")
         if isinstance(additional_information, dict):
@@ -311,7 +443,89 @@ class StepAudioAR(nn.Module):
         embed = payload.get("embed", {})
         hs = payload.get("hidden_states", {})
         meta = payload.get("meta", {})
+
         text_list = text_list = info_dict.get("text")
+
+        span_len = int(input_ids.shape[0])
+        if span_len <= 0:
+            return input_ids, input_embeds if input_embeds is not None else self.embed_input_ids(input_ids), {}
+
+        text_list = info_dict.get("text")
+        if not isinstance(text_list, list) or not text_list or not text_list[0]:
+            raise ValueError("Missing additional_information.text for Qwen3-TTS AR talker.")
+
+        task_type = (info_dict.get("task_type") or ["clone"])[0]
+        codec_streaming = task_type == "clone"
+
+        prompt_embeds_cpu = embed.get("prefill")
+        tts_pad_embed_cpu = embed.get("tts_pad")
+        tts_pad_embed = None
+        if isinstance(tts_pad_embed_cpu, torch.Tensor) and tts_pad_embed_cpu.numel() > 0:
+            tts_pad_embed = tts_pad_embed_cpu.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+
+        # Subsequent prefill rounds (multi-chunk): prompt_embeds_cpu is a Tensor stored by the first round.
+        is_first_prefill = not isinstance(prompt_embeds_cpu, torch.Tensor) or prompt_embeds_cpu.ndim != 2
+        if is_first_prefill:
+            full_prompt_embeds, ref_code_len, ref_code, tts_pad_embed = (
+                self._build_prompt_embeds(task_type=task_type, info_dict=info_dict)
+            )
+            # Store full prompt embeddings on CPU (large, prefill-only).
+            # tailing_text_hidden and tts_pad_embed stay on GPU (gpu_resident_buffer_keys).
+            prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu").contiguous()
+            info_update: OmniPayload = {
+                "embed": {
+                    "prefill": prompt_embeds_cpu,
+                    "tts_pad": tts_pad_embed.detach(),
+                },
+                "meta": {
+                    "talker_prefill_offset": 0,
+                    "talker_text_offset": 0,
+                    "codec_streaming": codec_streaming,
+                },
+            }
+            if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
+                info_update.setdefault("codes", {})["ref"] = ref_code.detach().to("cpu").contiguous()
+            if ref_code_len is not None:
+                info_update["meta"]["ref_code_len"] = int(ref_code_len)
+            # Always return a span_len slice; if the scheduled placeholder is longer, pad with tts_pad_embed.
+            # This preserves placeholder/embedding alignment.
+            offset = 0
+            s = 0
+            e = span_len
+            take = prompt_embeds_cpu[s:e]
+            prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
+            info_update["meta"]["talker_prefill_offset"] = int(offset + span_len)
+        else:
+            offset = int(meta.get("talker_prefill_offset", 0) or 0)
+            if offset < 0:
+                offset = 0
+            s = max(0, min(offset, int(prompt_embeds_cpu.shape[0])))
+            e = max(0, min(offset + span_len, int(prompt_embeds_cpu.shape[0])))
+            take = prompt_embeds_cpu[s:e]
+            if int(take.shape[0]) < span_len:
+                pad_n = int(span_len - int(take.shape[0]))
+                pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
+                take = torch.cat([take, pad_rows], dim=0)
+            # Subsequent prefill chunk: slice from stored embeddings at running offset.
+            prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
+            info_update = {
+                "meta": {
+                    "talker_prefill_offset": int(offset + span_len),
+                    "codec_streaming": codec_streaming,
+                }
+            }
+
+        # When inputs_embeds is set, token ids are ignored by the model but must stay in-vocab for vLLM bookkeeping.
+        input_ids_out = input_ids.clone()
+        input_ids_out[:] = 0
+
+        zeros = torch.zeros(
+            (prompt_embeds.shape[0], 1),
+            device=input_ids.device,
+            dtype=torch.long,
+        )
+        info_update.setdefault("codes", {})["audio"] = zeros
+        return input_ids_out, prompt_embeds, info_update
 
     def _encode_ref_audio_to_code(self, wav: np.ndarray, sr: int) -> torch.Tensor:
         try:
