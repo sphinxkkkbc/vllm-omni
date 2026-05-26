@@ -285,18 +285,18 @@ class StepAudioAR(nn.Module):
         self.has_preprocess = True
         self.has_postprocess = False
         self.tokenizer = None
-        
 
     def embed_multimodal(self, **kwargs) -> torch.Tensor:
         return self._encode_ref_audio_to_code(**kwargs)
 
     def _ensure_audio_tokenizer_loaded(self):
+        if self.tokenizer is not None:
+            return
+
         self.tokenizer = StepAudioTokenizer(
             tokenizer_path=self.tokenizer_path,
             config_path=self.model_path,
         )
-        if self.tokenizer is None:
-            raise RuntimeError("Failed to load audio tokenizer")
 
     @staticmethod
     def estimate_prompt_len_from_additional_information(
@@ -379,9 +379,7 @@ class StepAudioAR(nn.Module):
                 if ref_ids is None:
                     ref_text = _first(info.get("ref_text"), "")
                     if not isinstance(ref_text, str) or not ref_text.strip():
-                        raise ValueError(
-                            "Base in-context non-streaming requires `ref_text` or tokenized `ref_ids`."
-                        )
+                        raise ValueError("Base in-context non-streaming requires `ref_text` or tokenized `ref_ids`.")
                     ref_text_ids = tokenize_prompt(StepAudioAR._build_ref_text(ref_text))
                     ref_ids_len = len(ref_text_ids)
                 elif hasattr(ref_ids, "shape"):
@@ -421,16 +419,80 @@ class StepAudioAR(nn.Module):
         logger.info(f"input_ids shape: {input_ids.shape}, codec_token shape: {codec_token.shape}")
         input_ids = self.embed_input_ids(input_ids)
         tts_pad_id = self.tokenizer.text_tokenizer.pad_token_id
-        tts_pad_embed = self.embed_input_ids(torch.tensor([tts_pad_id]))
+        tts_pad_embed = self.embed_input_ids(torch.tensor([tts_pad_id]).to(input_ids.device))
         return input_ids, codec_token.shape[1], codec_token, tts_pad_embed
-    
+
+    def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
+        if isinstance(model_outputs, OmniOutput):
+            return model_outputs
+
+        hidden = model_outputs
+        info_dicts = kwargs.get("model_intermediate_buffer")
+        if info_dicts is None:
+            info_dicts = kwargs.get("runtime_additional_information") or []
+        if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
+            logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
+        audio_codes_list: list[torch.Tensor] = []
+        ref_code_len_list: list[torch.Tensor] = []
+        ref_code_tensor: torch.Tensor | None = None
+        codec_streaming_list: list[torch.Tensor] = []
+        for info in info_dicts:
+            if not isinstance(info, dict):
+                continue
+            codes = info.get("codes", {})
+            meta = info.get("meta", {})
+            ac = codes.get("audio")
+            if isinstance(ac, torch.Tensor):
+                audio_codes_list.append(ac)
+                cs = meta.get("codec_streaming")
+                if isinstance(cs, bool):
+                    codec_streaming_list.append(
+                        torch.full((int(ac.shape[0]),), int(cs), dtype=torch.int8, device=ac.device)
+                    )
+            ref_code = codes.get("ref")
+            if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
+                ref_code_tensor = ref_code
+            ref_len = meta.get("ref_code_len")
+            if ref_len is None:
+                continue
+            if isinstance(ref_len, torch.Tensor):
+                if ref_len.numel() == 0:
+                    raise ValueError("ref_code_len is an empty tensor")
+                ref_len_val = int(ref_len.reshape(-1)[-1].item())
+            elif isinstance(ref_len, list):
+                if len(ref_len) != 1:
+                    raise ValueError(f"ref_code_len must be scalar or 1-element list, got len={len(ref_len)}")
+                ref_len_val = int(ref_len[0])
+            else:
+                ref_len_val = int(ref_len)
+            if isinstance(ac, torch.Tensor):
+                # Emit ref_code_len per-token span for runner slicing (consumer takes the last value).
+                ref_code_len_list.append(
+                    torch.full((int(ac.shape[0]),), ref_len_val, dtype=torch.int32, device=ac.device)
+                )
+
+        if not audio_codes_list:
+            return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+
+        audio_codes = torch.cat(audio_codes_list, dim=0)
+        span_len = int(audio_codes.shape[0])
+        # logger.info(f"span_len: {span_len}, hidden.shape: {hidden.shape}")
+        # hidden = hidden[:span_len]
+        mm: OmniPayload = {"codes": {"audio": audio_codes}}
+        if ref_code_len_list:
+            mm.setdefault("meta", {})["ref_code_len"] = torch.cat(ref_code_len_list, dim=0)[:span_len]
+        if ref_code_tensor is not None:
+            mm.setdefault("codes", {})["ref"] = [ref_code_tensor]
+        if codec_streaming_list:
+            mm.setdefault("meta", {})["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)[:span_len]
+        return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
+
     def preprocess(
         self,
         input_ids: torch.Tensor,
         input_embeds: torch.Tensor | None,
         **info_dict: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        # logger.info(f"Preprocessing info_dict: {info_dict}")
         self._ensure_audio_tokenizer_loaded()
         additional_information = info_dict.get("additional_information")
         if isinstance(additional_information, dict):
@@ -466,8 +528,8 @@ class StepAudioAR(nn.Module):
         # Subsequent prefill rounds (multi-chunk): prompt_embeds_cpu is a Tensor stored by the first round.
         is_first_prefill = not isinstance(prompt_embeds_cpu, torch.Tensor) or prompt_embeds_cpu.ndim != 2
         if is_first_prefill:
-            full_prompt_embeds, ref_code_len, ref_code, tts_pad_embed = (
-                self._build_prompt_embeds(task_type=task_type, info_dict=info_dict)
+            full_prompt_embeds, ref_code_len, ref_code, tts_pad_embed = self._build_prompt_embeds(
+                task_type=task_type, info_dict=info_dict
             )
             # Store full prompt embeddings on CPU (large, prefill-only).
             # tailing_text_hidden and tts_pad_embed stay on GPU (gpu_resident_buffer_keys).
@@ -546,7 +608,6 @@ class StepAudioAR(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor:
-        # logger.info(f"input_ids:{input_ids}")
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
             hidden_states = self.model.layers(hidden_states)
@@ -572,10 +633,7 @@ class StepAudioAR(nn.Module):
         #     f"StepAudioAR.forward input_ids_shape={tuple(input_ids.shape)} "
         #     f"hidden_states_shape={tuple(hidden_states.shape)}"
         # )
-        output = OmniOutput(
-            text_hidden_states=hidden_states,
-        )
-        return output
+        return hidden_states
 
     def compute_logits(
         self,

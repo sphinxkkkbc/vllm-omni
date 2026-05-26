@@ -10,8 +10,8 @@ from urllib.parse import urlparse
 import numpy as np
 import onnxruntime
 import requests
-import torch
 import soundfile as sf
+import torch
 import whisper
 import yaml
 from transformers import AutoTokenizer
@@ -19,14 +19,13 @@ from transformers import AutoTokenizer
 from .audio_tokenizer.frontend import WavFrontendOnline
 from .audio_tokenizer.paraformer import ParaformerStreaming
 from .utils import (
-    energy_norm_fn, 
-    prepare_data_iterator, 
-    resample_audio, 
+    AUDIO_EDIT_CLONE_SYSTEM_PROMPT_TPL,
+    AUDIO_EDIT_SYSTEM_PROMPT,
+    energy_norm_fn,
+    prepare_data_iterator,
+    resample_audio,
     trim_silence,
-    AUDIO_EDIT_CLONE_SYSTEM_PROMPT_TPL, 
-    AUDIO_EDIT_SYSTEM_PROMPT
-    )
-
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +103,7 @@ class StepAudioTokenizer:
         tokenizer_path = os.getenv("STEP_AUDIO_TOKENIZER_PATH")
         if not tokenizer_path:
             raise ValueError("STEP_AUDIO_TOKENIZER_PATH is not set")
-        self.text_tokenizer = AutoTokenizer.from_pretrained(config_path, use_fast=False)
+        self.text_tokenizer = AutoTokenizer.from_pretrained(config_path, trust_remote_code=True)
         # logger.info(f"Successfully load tokenizer from {config_path}")
         self.funasr_tokenizer_path = os.path.join(tokenizer_path, funasr_model_id)
         self.funasr_model = FunASRModel(model_path=self.funasr_tokenizer_path, config_path=self.funasr_tokenizer_path)
@@ -184,41 +183,41 @@ class StepAudioTokenizer:
         return token_ids
 
     def _load_audio(self, prompt_wav, prompt_wav_sr: int | None = None):
-      if isinstance(prompt_wav, list):
-          prompt_wav = prompt_wav[0]
-      if isinstance(prompt_wav, torch.Tensor):
-          if prompt_wav_sr is None:
-              raise ValueError("Tensor audio requires prompt_wav_sr.")
-          return prompt_wav, int(prompt_wav_sr)
+        if isinstance(prompt_wav, list):
+            prompt_wav = prompt_wav[0]
+        if isinstance(prompt_wav, torch.Tensor):
+            if prompt_wav_sr is None:
+                raise ValueError("Tensor audio requires prompt_wav_sr.")
+            return prompt_wav, int(prompt_wav_sr)
 
-      if isinstance(prompt_wav, np.ndarray):
-          if prompt_wav_sr is None:
-              raise ValueError("NumPy audio requires prompt_wav_sr.")
-          wav = torch.from_numpy(prompt_wav.astype(np.float32))
-          if wav.ndim == 1:
-              wav = wav.unsqueeze(0)
-          return wav, int(prompt_wav_sr)
+        if isinstance(prompt_wav, np.ndarray):
+            if prompt_wav_sr is None:
+                raise ValueError("NumPy audio requires prompt_wav_sr.")
+            wav = torch.from_numpy(prompt_wav.astype(np.float32))
+            if wav.ndim == 1:
+                wav = wav.unsqueeze(0)
+            return wav, int(prompt_wav_sr)
 
-      if isinstance(prompt_wav, str):
-          if self._is_url(prompt_wav):
-              with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
-                  r = requests.get(prompt_wav, timeout=30)
-                  r.raise_for_status()
-                  f.write(r.content)
-                  f.flush()
-                  data, sr = sf.read(f.name, dtype="float32", always_2d=False)
-          else:
-              data, sr = sf.read(prompt_wav, dtype="float32", always_2d=False)
+        if isinstance(prompt_wav, str):
+            if self._is_url(prompt_wav):
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
+                    r = requests.get(prompt_wav, timeout=30)
+                    r.raise_for_status()
+                    f.write(r.content)
+                    f.flush()
+                    data, sr = sf.read(f.name, dtype="float32", always_2d=False)
+            else:
+                data, sr = sf.read(prompt_wav, dtype="float32", always_2d=False)
 
-          # soundfile 返回 shape:
-          # mono: [T], multi-channel: [T, C]
-          if data.ndim == 1:
-              wav = torch.from_numpy(data).unsqueeze(0)       # [1, T]
-          else:
-              wav = torch.from_numpy(data).transpose(0, 1)    # [C, T]
-          return wav, int(sr)
+            # soundfile 返回 shape:
+            # mono: [T], multi-channel: [T, C]
+            if data.ndim == 1:
+                wav = torch.from_numpy(data).unsqueeze(0)  # [1, T]
+            else:
+                wav = torch.from_numpy(data).transpose(0, 1)  # [C, T]
+            return wav, int(sr)
 
-      raise TypeError(f"Unsupported prompt_wav type: {type(prompt_wav)}")
+        raise TypeError(f"Unsupported prompt_wav type: {type(prompt_wav)}")
 
     def preprocess_wav(self, audio, sample_rate, enable_trim=True, energy_norm=True):
         audio, sample_rate = self._load_audio(audio)
@@ -244,7 +243,7 @@ class StepAudioTokenizer:
             audio = audio.to(torch.float32)
             audio = audio.unsqueeze(0)
         return audio
-    
+
     def wav2token(self, audio, sample_rate, enable_trim=True, energy_norm=True):
         audio = self.preprocess_wav(audio, sample_rate, enable_trim=enable_trim, energy_norm=energy_norm)
 

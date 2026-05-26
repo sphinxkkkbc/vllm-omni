@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
+import logging
 import os
 from typing import Any
-import numpy as np
+
 import soundfile as sf
 
 from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 
-import logging
 logger = logging.getLogger(__name__)
+
 
 def _estimate_prompt_len(
     additional_information: dict[str, Any],
@@ -25,9 +26,11 @@ def _estimate_prompt_len(
     embeddings that ``preprocess`` will produce.
     """
     try:
-        from vllm_omni.model_executor.models.step_audio_editx.step_audio_ar import StepAudioAR
         from transformers import AutoTokenizer
+
+        from vllm_omni.model_executor.models.step_audio_editx.step_audio_ar import StepAudioAR
         from vllm_omni.model_executor.models.step_audio_editx.step_audio_tokenizer import StepAudioTokenizer
+
         speech_tok = StepAudioTokenizer(
             tokenizer_path=tokenizer_path,
             config_path=model_path,
@@ -93,7 +96,6 @@ def _estimate_prompt_len(
         return 2048
 
 
-
 def get_base_query(args):
     """Build Base (voice clone) sample inputs.
     Returns:
@@ -118,7 +120,6 @@ def get_base_query(args):
         "additional_information": additional_information,
     }
     return inputs
-
 
 
 def _build_inputs(args) -> tuple[str, list]:
