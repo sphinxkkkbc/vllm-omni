@@ -281,7 +281,7 @@ class StepAudioAR(nn.Module):
         self.config = hf_config
         self.model = Step1ForCausalLM(hf_config)
         self.logits_processor = LogitsProcessor(hf_config.vocab_size)
-        self.have_multimodal_outputs = False
+        self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = False
         self.tokenizer = None
@@ -321,18 +321,6 @@ class StepAudioAR(nn.Module):
 
         if not isinstance(text, str):
             text = ""
-
-        # ---- codec prefix portion (matches _build_prompt_embeds) ----
-        prefill_len = 4
-
-        speaker_len = 1 if task_type in ("clone") else 0
-        codec_input_len = prefill_len + speaker_len + 2  # + [codec_pad, codec_bos]
-        codec_prefix_len = codec_input_len - 1  # codec_input[:-1] + tts_bos
-
-        # Role header: input_ids[:, :3] in model.
-        role_len = 3
-        prompt_len = role_len + codec_prefix_len
-
         # ---- text conditioning portion (matches _build_prompt_embeds) ----
         assistant_text = StepAudioAR._build_assistant_text(text)
         assistant_len = len(tokenize_prompt(assistant_text))

@@ -137,7 +137,8 @@ class StepAudioTokenizer:
             return True
         return False
 
-    def _is_url(self, s: str) -> bool:
+    @staticmethod
+    def _is_url(s: str) -> bool:
         try:
             u = urlparse(s)
             return u.scheme in ("http", "https") and bool(u.netloc)
@@ -182,7 +183,8 @@ class StepAudioTokenizer:
         token_ids = self.text_tokenizer.apply_chat_template(prompt, tokenize=True, add_generation_prompt=True)
         return token_ids
 
-    def _load_audio(self, prompt_wav, prompt_wav_sr: int | None = None):
+    @staticmethod
+    def _load_audio(prompt_wav, prompt_wav_sr: int | None = None):
         if isinstance(prompt_wav, list):
             prompt_wav = prompt_wav[0]
         if isinstance(prompt_wav, torch.Tensor):
@@ -199,7 +201,7 @@ class StepAudioTokenizer:
             return wav, int(prompt_wav_sr)
 
         if isinstance(prompt_wav, str):
-            if self._is_url(prompt_wav):
+            if StepAudioTokenizer._is_url(prompt_wav):
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
                     r = requests.get(prompt_wav, timeout=30)
                     r.raise_for_status()

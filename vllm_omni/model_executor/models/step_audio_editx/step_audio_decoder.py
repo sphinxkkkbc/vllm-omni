@@ -401,13 +401,15 @@ class StepAudioCode2wav(nn.Module):
 
     @staticmethod
     def _extract_prompt_token(intermediate_tensors: Any, kwargs: dict[str, Any]) -> torch.Tensor | None:
-        if intermediate_tensors is not None:
-            if hasattr(intermediate_tensors, "get"):
-                prompt_token = intermediate_tensors.get("vq0206_codes")
-                if prompt_token is not None:
-                    return prompt_token
-            if hasattr(intermediate_tensors, "vq0206_codes"):
-                return intermediate_tensors.vq0206_codes
+        logger.info(f"intermediate_tensors: {intermediate_tensors}, kwargs: {kwargs}")
+        if (
+            isinstance(intermediate_tensors, list)
+            and intermediate_tensors
+            and isinstance(intermediate_tensors[0], dict)
+        ):
+            ref = intermediate_tensors[0].get("codes", {}).get("ref")
+            if isinstance(ref, torch.Tensor):
+                return ref[0]
         return kwargs.get("prompt_token")
 
     @torch.no_grad()
@@ -420,13 +422,13 @@ class StepAudioCode2wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
+        logger.info(f"input_ids: {input_ids}, runtime_additional_information: {runtime_additional_information}")
         if input_ids is None:
             raise ValueError("StepAudioCode2wav requires input_ids from the previous stage.")
-        logger.info(f"intermediate_tensors: {intermediate_tensors}")
         token = input_ids.reshape(-1)
-        prompt_token = self._extract_prompt_token(intermediate_tensors, kwargs)
+        prompt_token = self._extract_prompt_token(runtime_additional_information, kwargs)
         input_wav, sample_rate = self._extract_runtime_inputs(runtime_additional_information, kwargs)
-
+        logger.info(f"token: {token}, prompt_token: {prompt_token}, input_wav: {input_wav}, sample_rate: {sample_rate}")
         if prompt_token is None:
             prompt_token = torch.zeros((5,), dtype=torch.long, device=token.device)
 
