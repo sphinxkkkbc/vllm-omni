@@ -126,12 +126,6 @@ def main():
         help="Audio format (default: wav)",
     )
     parser.add_argument(
-        "--voice",
-        type=str,
-        default=None,
-        help="Optional voice name",
-    )
-    parser.add_argument(
         "--ref-audio",
         type=str,
         default=None,
