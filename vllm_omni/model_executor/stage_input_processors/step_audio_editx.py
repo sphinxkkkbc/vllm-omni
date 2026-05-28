@@ -14,13 +14,33 @@ from vllm_omni.data_entry_keys import (
 
 logger = init_logger(__name__)
 
+CODE_OFFSET = 65536
+BOS_ID, EOS_ID, PAD_ID = 1, 2, 0
+
+
+def extract_codec_codes(token_ids: list[int]) -> list[int]:
+    out: list[int] = []
+    for t in token_ids:
+        if t == EOS_ID:
+            break
+
+        if t >= CODE_OFFSET:
+            c = t - CODE_OFFSET
+            out.append(c)
+    return out
+
 
 def ar2decoder(source_outputs: list[Any], prompt: Any = None, _requires_multimodal_data: bool = False):
     from vllm_omni.inputs.data import OmniTokensPrompt
 
     talker_outputs = source_outputs
     logger.info(f"talker_outputs: {talker_outputs}")
-    logger.info(f"prompt: {prompt}")
+    additional_information = prompt.get("additional_information") or {}
+    if additional_information:
+        if additional_information.get("ref_audio"):
+            ref_audio = additional_information["ref_audio"]
+        else:
+            ref_audio = None
     code2wav_inputs: list[OmniTokensPrompt] = []
     for i, talker_output in enumerate(talker_outputs):
         if not talker_output.finished:
@@ -30,13 +50,13 @@ def ar2decoder(source_outputs: list[Any], prompt: Any = None, _requires_multimod
         output = talker_output.outputs[0]
         mm = output.multimodal_output
         if isinstance(output.token_ids, list):
-            codec_codes = [i - 65536 if i > 65536 else i for i in output.token_ids]
+            codec_codes = extract_codec_codes(output.token_ids)
         else:
             codec_codes = output.token_ids - 65536
         mm_codes = mm.get("codes", {})
         ref_code = mm_codes.get("ref")
         if isinstance(ref_code, list):
-            ref_code = [i - 65536 if i > 65536 else i for i in ref_code]
+            ref_code = [i - 65536 for i in ref_code]
         else:
             ref_code = ref_code - 65536
         ref_code_len = mm.get("meta", {}).get("ref_code_len")
@@ -53,7 +73,7 @@ def ar2decoder(source_outputs: list[Any], prompt: Any = None, _requires_multimod
         additional_information = to_dict(
             OmniPayloadStruct(
                 meta=MetaStruct(left_context_size=ref_code_len) if ref_code_len > 0 else None,
-                codes=CodesStruct(ref=ref_code),
+                codes=CodesStruct(ref=ref_code, audio=ref_audio),
             )
         )
         code2wav_inputs.append(

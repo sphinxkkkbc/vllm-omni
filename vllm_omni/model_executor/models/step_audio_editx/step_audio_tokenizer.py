@@ -211,7 +211,7 @@ class StepAudioTokenizer:
             else:
                 data, sr = sf.read(prompt_wav, dtype="float32", always_2d=False)
 
-            # soundfile 返回 shape:
+            # soundfile returns shape:
             # mono: [T], multi-channel: [T, C]
             if data.ndim == 1:
                 wav = torch.from_numpy(data).unsqueeze(0)  # [1, T]

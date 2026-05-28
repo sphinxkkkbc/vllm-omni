@@ -358,6 +358,7 @@ class StepAudioAR(nn.Module):
 
             codec_lens = 1 + int(ref_code_len)  # codec_bos + ref_code
             if non_streaming_mode:
+                prompt_len = 0
                 # _generate_icl_prompt(non_streaming_mode=True):
                 # text_embed = ref_ids + text_ids + eos.
                 ref_ids = _first(info.get("ref_ids"), None)
@@ -399,9 +400,9 @@ class StepAudioAR(nn.Module):
         ref_audio = info_dict.get("ref_audio")
         ref_text = info_dict.get("ref_text")
         text = info_dict.get("text")
-        task_type = info_dict.get("task_type")
         sr = info_dict.get("sr") or 16000
         prompt_token, codec_token = self.tokenizer.encode(task_type, audio=ref_audio, prompt=(ref_text, text), sr=sr)
+        logger.info(f"prompt_token: {prompt_token}")
         input_ids = torch.tensor(prompt_token.input_ids)
         input_ids = input_ids.to(next(self.model.parameters()).device)
         logger.info(f"input_ids shape: {input_ids.shape}, codec_token shape: {codec_token.shape}")
@@ -491,7 +492,6 @@ class StepAudioAR(nn.Module):
 
         payload: OmniPayload = info_dict
         embed = payload.get("embed", {})
-        hs = payload.get("hidden_states", {})
         meta = payload.get("meta", {})
 
         text_list = text_list = info_dict.get("text")
@@ -504,7 +504,7 @@ class StepAudioAR(nn.Module):
         if not isinstance(text_list, list) or not text_list or not text_list[0]:
             raise ValueError("Missing additional_information.text for Qwen3-TTS AR talker.")
 
-        task_type = (info_dict.get("task_type") or ["clone"])[0]
+        task_type = info_dict.get("task_type") or ["clone"]
         codec_streaming = task_type == "clone"
 
         prompt_embeds_cpu = embed.get("prefill")
@@ -617,10 +617,6 @@ class StepAudioAR(nn.Module):
             f"Hidden states first dim mismatch: {hidden_states.shape[0]} vs num_tokens={num_tokens}"
         )
 
-        # logger.info(
-        #     f"StepAudioAR.forward input_ids_shape={tuple(input_ids.shape)} "
-        #     f"hidden_states_shape={tuple(hidden_states.shape)}"
-        # )
         return hidden_states
 
     def compute_logits(

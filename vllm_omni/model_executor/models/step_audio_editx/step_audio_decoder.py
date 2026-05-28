@@ -31,6 +31,8 @@ from vllm_omni.model_executor.models.step_audio_editx.decoder.flow import (
 )
 from vllm_omni.model_executor.models.step_audio_editx.decoder.hift import StepAudioCausalConvRNNF0Predictor
 
+from .step_audio_tokenizer import StepAudioTokenizer
+
 logger = logging.getLogger(__name__)
 
 
@@ -385,18 +387,30 @@ class StepAudioCode2wav(nn.Module):
     def compute_logits(self, hidden_states, sampling_metadata: Any = None):
         return None
 
+    def preprocess_wav(self, audio, sample_rate):
+        audio, sample_rate = StepAudioTokenizer._load_audio(audio, sample_rate)
+        if audio.shape[0] > 1:
+            audio = audio.mean(dim=0, keepdim=True)
+
+        # volume-normalize avoid clipping
+        norm = torch.max(torch.abs(audio), dim=1, keepdim=True)[0]
+        if norm.item() > 0.6:
+            audio = audio / norm * 0.6
+        return audio, sample_rate
+
     @staticmethod
     def _extract_runtime_inputs(
         runtime_additional_information: list[dict[str, Any]] | None,
         kwargs: dict[str, Any],
     ) -> tuple[torch.Tensor | None, int | None]:
-        if runtime_additional_information:
-            info = runtime_additional_information[0] or {}
-            meta = info.get("meta", {}) if isinstance(info, dict) else {}
-            input_wav = meta.get("input_wav") or info.get("input_wav")
-            sample_rate = meta.get("sample_rate") or info.get("sample_rate")
-            if input_wav is not None:
-                return input_wav, sample_rate
+        logger.info(f"runtime_additional_information: {runtime_additional_information}, kwargs: {kwargs}")
+        if (
+            isinstance(runtime_additional_information, list)
+            and runtime_additional_information
+            and isinstance(runtime_additional_information[0], dict)
+        ):
+            ref = runtime_additional_information[0].get("codes", {}).get("audio")
+            return ref, kwargs.get("sample_rate")
         return kwargs.get("input_wav"), kwargs.get("sample_rate")
 
     @staticmethod
@@ -428,12 +442,13 @@ class StepAudioCode2wav(nn.Module):
         token = input_ids.reshape(-1)
         prompt_token = self._extract_prompt_token(runtime_additional_information, kwargs)
         input_wav, sample_rate = self._extract_runtime_inputs(runtime_additional_information, kwargs)
-        logger.info(f"token: {token}, prompt_token: {prompt_token}, input_wav: {input_wav}, sample_rate: {sample_rate}")
+        if input_wav is not None:
+            input_wav, sample_rate = self.preprocess_wav(input_wav, sample_rate)
         if prompt_token is None:
             prompt_token = torch.zeros((5,), dtype=torch.long, device=token.device)
 
         if input_wav is None or sample_rate is None:
-            sample_rate = 24000
+            sample_rate = 16000
             input_wav = torch.zeros((1, sample_rate), dtype=torch.float32, device=token.device)
 
         audio = self.core.forward(token, prompt_token, input_wav, sample_rate)
