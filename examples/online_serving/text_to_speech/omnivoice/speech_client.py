@@ -55,9 +55,6 @@ def run_tts(args) -> None:
     if args.language:
         payload["language"] = args.language
 
-    if args.voice:
-        payload["voice"] = args.voice
-
     if args.ref_audio:
         ref = args.ref_audio
         if ref.startswith(("http://", "https://", "data:")):
@@ -78,7 +75,7 @@ def run_tts(args) -> None:
 
     if args.voice:
         print(f"Voice: {args.voice}")
-        
+
     if args.language:
         print(f"Language: {args.language}")
     print("Generating audio...")
