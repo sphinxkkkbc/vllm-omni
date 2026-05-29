@@ -85,7 +85,7 @@ _NONVERBAL_PATTERN = re.compile(
 )
 
 
-def _tokenize_with_nonverbal_tags(text: str, tokenizer) -> torch.Tensor:
+def _tokenize_with_nonverbal_tags(text: str, tokenizer) -> list[int]:
     """Tokenize text containing non-verbal tags, handling each tag independently.
 
     Non-verbal tags are tokenized standalone to guarantee consistent token
@@ -116,7 +116,7 @@ def _tokenize_with_nonverbal_tags(text: str, tokenizer) -> torch.Tensor:
             parts.append(ids)
 
     if not parts:
-        return tokenizer.encode(text)
+        return tokenizer.encode(text).ids
     else:
         combined = []
         for p in parts:
