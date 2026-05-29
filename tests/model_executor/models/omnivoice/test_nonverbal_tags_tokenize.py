@@ -10,8 +10,10 @@ from vllm_omni.diffusion.models.omnivoice.pipeline_omnivoice import (
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+
 def _ids(tok: HFTokenizer, s: str) -> list[int]:
     return tok.encode(s).ids
+
 
 class TestNonVerbalTags:
     @classmethod
@@ -24,7 +26,13 @@ class TestNonVerbalTags:
         text = "hello world"
         assert _tokenize_with_nonverbal_tags(text, tok) == _ids(tok, text)
 
-    def test_single_nonverbal_tag_split_encoding(self):
+    def test_single_nonverbal_tag_at_beginning(self):
+        tok = self.tokenizer
+        text = "[laughter]HelloWorld"
+        expected = _ids(tok, "[laughter]") + _ids(tok, "Hello") + _ids(tok, "World")
+        assert _tokenize_with_nonverbal_tags(text, tok) == expected
+
+    def test_single_nonverbal_tag_in_middle(self):
         tok = self.tokenizer
         text = "Hello[laughter]world"
         expected = _ids(tok, "Hello") + _ids(tok, "[laughter]") + _ids(tok, "world")
