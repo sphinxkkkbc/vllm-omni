@@ -38,6 +38,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 
 from .sensenova_u1_transformer import (
     SenseNovaU1ForCausalLM,
@@ -488,7 +489,7 @@ def _optimized_scale(positive_flat, negative_flat):
 # ---------------------------------------------------------------------------
 
 
-class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
+class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin, CFGParallelMixin):
     """SenseNova-U1 text-to-image and image-to-image pipeline for vllm-omni.
 
     Builds the full model graph internally:
