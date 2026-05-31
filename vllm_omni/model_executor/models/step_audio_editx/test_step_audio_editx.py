@@ -182,6 +182,7 @@ def run_e2e():
         model=args.model,
         deploy_config=args.deploy_config,
         log_stats=True,
+        trust_remote_code=True,
     )
 
     inputs = _build_inputs(args)

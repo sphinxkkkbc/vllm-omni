@@ -360,7 +360,6 @@ class CosyVoice(nn.Module):
 
 
 class StepAudioCode2wav(nn.Module):
-    DEBUG_MARKER = "STEP_AUDIO_CODE2WAV_RUNNER_MODEL"
     input_modalities = "audio"
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
