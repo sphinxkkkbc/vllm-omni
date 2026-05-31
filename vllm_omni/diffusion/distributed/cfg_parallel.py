@@ -76,7 +76,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
     def predict_noise_maybe_with_cfg(
         self,
         do_true_cfg: bool,
-        true_cfg_scale: float,
+        true_cfg_scale: float | dict[str, float],
         positive_kwargs: dict[str, Any],
         negative_kwargs: dict[str, Any] | None,
         cfg_normalize: bool = True,
@@ -171,7 +171,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         self,
         positive_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
         negative_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
-        true_cfg_scale: float,
+        true_cfg_scale: float | dict[str, float],
         cfg_normalize: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """
@@ -276,7 +276,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         branches_kwargs: list[dict[str, Any]],
         n_branches: int,
         cfg_world_size: int,
-        true_cfg_scale: float,
+        true_cfg_scale: float | dict[str, float],
         cfg_normalize: bool,
         output_slice: int | None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
