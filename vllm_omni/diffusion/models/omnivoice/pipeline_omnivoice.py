@@ -218,6 +218,8 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         ref_text = None
         lang = "None"
         instruct = "None"
+        extra = req.sampling_params.extra_args or {}
+        seed = extra.get("seed", None)
 
         voice_name = None
         if isinstance(prompt, dict):
@@ -228,7 +230,6 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             voice_name = prompt.get("voice_name")
             lang = prompt.get("lang")
             instruct = prompt.get("instruct")
-
             # OmniTextPrompt format (used by offline Omni.generate path):
             # ref_audio comes via multi_modal_data["audio"] and the rest via
             # mm_processor_kwargs. Fall back to those when top-level keys are
@@ -332,7 +333,6 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         else:
             cond_ids = torch.cat([text_ids, target_ids], dim=1)
         cond_len = cond_ids.shape[1]
-
         uncond_ids = target_ids.clone()
         uncond_len = target_len
         max_len = max(cond_len, uncond_len)
@@ -367,8 +367,8 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             layer_penalty_factor=self.layer_penalty_factor,
             position_temperature=self.position_temperature,
             class_temperature=self.class_temperature,
+            seed=seed,
         )
-
         # Decode tokens to audio
         audio = self.decoder(tokens)  # [1, 1, samples]
 

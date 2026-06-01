@@ -20,6 +20,7 @@ logger = init_logger(__name__)
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
+    "GLMTTSForConditionalGeneration": "glm_tts",
     "OmniVoiceModel": "omnivoice",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
 }
@@ -27,6 +28,7 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
 _TOKENIZER_SUBFOLDER_MAP: dict[str, str] = {
     "CosyVoice3Model": "CosyVoice-BlankEN",
+    "GLMTTSForConditionalGeneration": "vq32k-phoneme-tokenizer",
 }
 
 
@@ -37,6 +39,10 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
+        from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+        from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
+        from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
+        from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
         return
@@ -51,6 +57,10 @@ def _register_omni_hf_configs() -> None:
 
     for model_type, config_cls in [
         ("qwen3_tts", Qwen3TTSConfig),
+        ("cosyvoice3", CosyVoice3Config),
+        ("glm_tts", GLMTTSConfig),
+        ("omnivoice", OmniVoiceConfig),
+        ("voxcpm2", VoxCPM2Config),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
@@ -134,7 +144,8 @@ class OmniEngineArgs(EngineArgs):
     force_cutlass_fp8: bool | None = None
     worker_type: str | None = None
     task_type: str | None = None
-    worker_cls: str = None
+    worker_cls: str = None  # type: ignore[assignment]  # Upstream default is "auto"; omni resolves
+    # in __post_init__ based on worker_type (ar/generation), so None is safe here.
     enable_sleep_mode: bool = False
     omni: bool = False
 
@@ -298,6 +309,7 @@ class OmniEngineArgs(EngineArgs):
                             model_path,
                             allow_patterns=[
                                 f"{subfolder}/tokenizer*",
+                                f"{subfolder}/tokenization_*",
                                 f"{subfolder}/special_tokens*",
                                 f"{subfolder}/vocab*",
                                 f"{subfolder}/merges*",
@@ -433,6 +445,48 @@ class OrchestratorArgs:
     # === Pre-built Objects ===
     parallel_config: Any = None
 
+    # === Diffusion model config ===
+    num_gpus: int | None = None
+    model_class_name: str | None = None
+    diffusion_load_format: str | None = None
+    diffusers_load_kwargs: str = "{}"
+    diffusers_call_kwargs: str = "{}"
+    ulysses_degree: int | None = None
+    ulysses_mode: str = "strict"
+    ring_degree: int | None = None
+    diffusion_quantization_config: str | None = None
+    use_hsdp: bool = False
+    hsdp_shard_size: int = -1
+    hsdp_replicate_size: int = 1
+    diffusion_attention_backend: str | None = None
+    diffusion_attention_config: str | None = None
+    cache_backend: str = "none"
+    cache_config: str | None = None
+    enable_cache_dit_summary: bool = False
+    step_execution: bool = False
+    vae_use_slicing: bool = False
+    vae_use_tiling: bool = False
+    enable_multithread_weight_load: bool = True
+    num_weight_load_threads: int = 4
+    enable_cpu_offload: bool = False
+    enable_layerwise_offload: bool = False
+    boundary_ratio: float | None = None
+    flow_shift: float | None = None
+    diffusion_kv_cache_dtype: str | None = None
+    diffusion_kv_cache_skip_steps: str | None = None
+    diffusion_kv_cache_skip_layers: str | None = None
+    cfg_parallel_size: int = 1
+    vae_patch_parallel_size: int = 1
+    default_sampling_params: str | None = None
+    max_generated_image_size: int | None = None
+    tts_max_instructions_length: int | None = None
+    enable_diffusion_pipeline_profiler: bool = False
+    enable_ar_profiler: bool = False
+    auxiliary_text_encoder: str | None = None
+    log_file: str | None = None
+    replica_id: int | None = None
+    omni_replica_address: str | None = None
+
     # === Multi-stage guards ===
     # --tokenizer is captured by the orchestrator and forwarded to stages
     # only when the stage does not define tokenizer/tokenizer_subdir itself.
@@ -448,6 +502,8 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "stage_id",  # orch: route (headless); engine: identity
         "log_stats",  # both want the flag
         "stage_configs_path",  # orch: load legacy YAML; engine: may reference for validation
+        "async_chunk",  # orch: read from CLI, redistribute; engine: per-stage flag
+        "tokenizer",  # orch: detect model type; engine: tokenization
     }
 )
 

@@ -2,6 +2,7 @@ from vllm.model_executor.models.registry import (
     _VLLM_MODELS,
     _LazyRegisteredModel,
     _ModelRegistry,
+    _resolve_module_name,
 )
 
 _OMNI_MODELS = {
@@ -102,6 +103,22 @@ _OMNI_MODELS = {
         "qwen3_tts_code2wav",
         "Qwen3TTSCode2Wav",
     ),
+    ## higgs-audio v2
+    "HiggsAudioV2ForConditionalGeneration": (
+        "higgs_audio_v2",
+        "higgs_audio_v2_talker",
+        "HiggsAudioV2TalkerForConditionalGeneration",
+    ),
+    "HiggsAudioV2TalkerForConditionalGeneration": (
+        "higgs_audio_v2",
+        "higgs_audio_v2_talker",
+        "HiggsAudioV2TalkerForConditionalGeneration",
+    ),
+    "HiggsAudioV2Code2WavForConditionalGeneration": (
+        "higgs_audio_v2",
+        "higgs_audio_v2_code2wav",
+        "HiggsAudioV2Code2WavForConditionalGeneration",
+    ),
     ## mimo_audio
     "MiMoAudioModel": (
         "mimo_audio",
@@ -128,6 +145,12 @@ _OMNI_MODELS = {
         "glm_image",
         "glm_image_ar",
         "GlmImageForConditionalGeneration",
+    ),
+    ## glm_tts
+    "GLMTTSForConditionalGeneration": (
+        "glm_tts",
+        "glm_tts",
+        "GLMTTSForConditionalGeneration",
     ),
     "OmniBagelForConditionalGeneration": (
         "bagel",
@@ -239,7 +262,7 @@ OmniModelRegistry = _ModelRegistry(
     {
         **{
             model_arch: _LazyRegisteredModel(
-                module_name=f"vllm.model_executor.models.{mod_relname}",
+                module_name=_resolve_module_name(mod_relname),
                 class_name=cls_name,
             )
             for model_arch, (mod_relname, cls_name) in _VLLM_MODELS.items()
