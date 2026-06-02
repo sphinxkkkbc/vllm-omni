@@ -1,4 +1,5 @@
 import dataclasses
+import io
 import json
 import logging
 import math
@@ -8,10 +9,10 @@ import string
 import tempfile
 from urllib.parse import urlparse
 
+import librosa
 import numpy as np
 import requests
 import torch
-import torch.nn.functional as F
 import torchaudio
 
 logger = logging.getLogger(__name__)
@@ -63,94 +64,17 @@ def energy_norm_fn(wav):
     return wav
 
 
-def _frame_rms(y: torch.Tensor, frame_length: int, hop_length: int) -> torch.Tensor:
-    """
-    y: (..., n)
-    return: (..., n_frames)
-    """
-    n = y.shape[-1]
-    if n < frame_length:
-        y = F.pad(y, (0, frame_length - n))
-    frames = y.unfold(-1, frame_length, hop_length)  # (..., n_frames, frame_length)
-    rms = torch.sqrt(torch.mean(frames * frames, dim=-1) + 1e-12)  # (..., n_frames)
-    return rms
-
-
-def _signal_to_frame_nonsilent(
-    y: torch.Tensor,
-    frame_length: int = 2048,
-    hop_length: int = 512,
-    top_db: float = 60.0,
-    aggregate: str = "max",
-) -> torch.Tensor:
-    """
-    y: (..., n) mono/stereo/multi-channel
-    return: (n_frames,) bool
-    """
-    rms = _frame_rms(y, frame_length=frame_length, hop_length=hop_length)  # (..., t)
-
-    ref = torch.max(rms)
-    if ref <= 0:
-        db = torch.full_like(rms, -float("inf"))
-    else:
-        db = 20.0 * torch.log10(torch.clamp(rms / ref, min=1e-12))
-
-    if db.ndim > 1:
-        reduce_dims = tuple(range(db.ndim - 1))
-        if aggregate == "max":
-            for d in reversed(reduce_dims):
-                db = db.max(dim=d).values
-        elif aggregate == "mean":
-            db = db.mean(dim=reduce_dims)
-        else:
-            raise ValueError(f"Unsupported aggregate: {aggregate}")
-
-    return db > (-top_db)
-
-
-def trim(
-    y: torch.Tensor,
-    top_db: float = 60.0,
-    frame_length: int = 2048,
-    hop_length: int = 512,
-    aggregate: str = "max",
-):
-    """
-    y: (..., n)
-    return: y_trimmed (..., m), index tensor([start, end], long)
-    """
-    non_silent = _signal_to_frame_nonsilent(
-        y,
-        frame_length=frame_length,
-        hop_length=hop_length,
-        top_db=top_db,
-        aggregate=aggregate,
-    )
-
-    nonzero = torch.nonzero(non_silent, as_tuple=False).squeeze(-1)
-    n = y.shape[-1]
-
-    if nonzero.numel() > 0:
-        start = int(nonzero[0].item() * hop_length)
-        end = int((nonzero[-1].item() + 1) * hop_length)
-        end = min(n, end)
-    else:
-        start, end = 0, 0
-
-    return y[..., start:end], torch.tensor([start, end], dtype=torch.long, device=y.device)
-
-
 def trim_silence(audio, sr, keep_left_time=0.05, keep_right_time=0.22, hop_size=240):
-    _, index = trim(audio, top_db=20, frame_length=512, hop_length=128)
+    _, index = librosa.effects.trim(audio, top_db=20, frame_length=512, hop_length=128)
     num_frames = int(math.ceil((index[1] - index[0]) / hop_size))  # 300
 
     left_sil_samples = int(keep_left_time * sr)
+    right_sil_samples = int(keep_right_time * sr)
 
     wav_len = len(audio)
     start_idx = index[0] - left_sil_samples
     trim_wav = audio
-    if isinstance(audio, torch.Tensor):
-        trim_wav = trim_wav.detach().cpu().numpy()
+
     if start_idx > 0:
         trim_wav = trim_wav[start_idx:]
     else:
@@ -162,7 +86,6 @@ def trim_silence(audio, sr, keep_left_time=0.05, keep_right_time=0.22, hop_size=
         trim_wav = trim_wav[:out_len]
     else:
         trim_wav = np.pad(trim_wav, (0, (out_len - wav_len)), mode="constant", constant_values=0.0)
-    trim_wav = torch.from_numpy(trim_wav)
     return trim_wav
 
 
@@ -180,6 +103,69 @@ def load_bytes(input):
     offset = i.min + abs_max
     array = np.frombuffer((middle_data.astype(dtype) - offset) / abs_max, dtype=np.float32)
     return array
+
+
+def load_audio_text_image_video(
+    data_or_path_or_list, fs: int = 16000, audio_fs: int = 16000, data_type="sound", tokenizer=None, **kwargs
+):
+    if isinstance(data_or_path_or_list, (list, tuple)):
+        if data_type is not None and isinstance(data_type, (list, tuple)):
+            data_types = [data_type] * len(data_or_path_or_list)
+            data_or_path_or_list_ret = [[] for d in data_type]
+            for i, (data_type_i, data_or_path_or_list_i) in enumerate(zip(data_types, data_or_path_or_list)):
+                for j, (data_type_j, data_or_path_or_list_j) in enumerate(zip(data_type_i, data_or_path_or_list_i)):
+                    data_or_path_or_list_j = load_audio_text_image_video(
+                        data_or_path_or_list_j,
+                        fs=fs,
+                        audio_fs=audio_fs,
+                        data_type=data_type_j,
+                        tokenizer=tokenizer,
+                        **kwargs,
+                    )
+                    data_or_path_or_list_ret[j].append(data_or_path_or_list_j)
+
+            return data_or_path_or_list_ret
+        else:
+            return [
+                load_audio_text_image_video(audio, fs=fs, audio_fs=audio_fs, data_type=data_type, **kwargs)
+                for audio in data_or_path_or_list
+            ]
+
+    if isinstance(data_or_path_or_list, str) and data_or_path_or_list.startswith("http"):  # download url to local file
+        data_or_path_or_list = download_from_url(data_or_path_or_list)
+
+    if isinstance(data_or_path_or_list, io.BytesIO):
+        data_or_path_or_list, audio_fs = torchaudio.load(data_or_path_or_list)
+        if kwargs.get("reduce_channels", True):
+            data_or_path_or_list = data_or_path_or_list.mean(0)
+    elif isinstance(data_or_path_or_list, str) and os.path.exists(data_or_path_or_list):  # local file
+        if data_type is None or data_type == "sound":
+            data_or_path_or_list, audio_fs = torchaudio.load(data_or_path_or_list)
+            if kwargs.get("reduce_channels", True):
+                data_or_path_or_list = data_or_path_or_list.mean(0)
+        elif data_type == "text" and tokenizer is not None:
+            data_or_path_or_list = tokenizer.encode(data_or_path_or_list)
+        elif data_type == "image":  # undo
+            pass
+        elif data_type == "video":  # undo
+            pass
+
+        # if data_in is a file or url, set is_final=True
+        if "cache" in kwargs:
+            kwargs["cache"]["is_final"] = True
+            kwargs["cache"]["is_streaming_input"] = False
+    elif isinstance(data_or_path_or_list, str) and data_type == "text" and tokenizer is not None:
+        data_or_path_or_list = tokenizer.encode(data_or_path_or_list)
+    elif isinstance(data_or_path_or_list, np.ndarray):  # audio sample point
+        data_or_path_or_list = torch.from_numpy(data_or_path_or_list).squeeze()  # [n_samples,]
+    else:
+        pass
+        # print(f"unsupported data type: {data_or_path_or_list}, return raw data")
+
+    if audio_fs != fs and data_type != "text":
+        resampler = torchaudio.transforms.Resample(audio_fs, fs)
+        data_or_path_or_list = resampler(data_or_path_or_list[None, :])[0, :]
+    return data_or_path_or_list
 
 
 def prepare_data_iterator(data_in, data_type=None, key=None):

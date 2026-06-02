@@ -1,3 +1,4 @@
+import io
 import logging
 import os
 import os.path
@@ -242,13 +243,12 @@ class StepAudioTokenizer:
 
         if enable_trim:
             audio = trim_silence(audio, 16000)
-            audio = audio.to(torch.float32)
+            audio = torch.from_numpy(audio)
             audio = audio.unsqueeze(0)
         return audio
 
     def wav2token(self, audio, sample_rate, enable_trim=True, energy_norm=True):
         audio = self.preprocess_wav(audio, sample_rate, enable_trim=enable_trim, energy_norm=energy_norm)
-
         vq02_ori = self.get_vq02_code(audio)
         vq02 = [int(x) + 65536 for x in vq02_ori]
         vq06_ori = self.get_vq06_code(audio)
@@ -264,10 +264,10 @@ class StepAudioTokenizer:
         return speech_tokens, vq02_ori, vq06_ori
 
     def get_vq02_code(self, audio, session_id=None, is_final=True):
-        if audio.dim() == 2:
-            audio_in = audio.squeeze(0).cpu()
-        else:
-            audio_in = audio.cpu()
+        audio_in = io.BytesIO()
+        audio_np = audio.squeeze(0).cpu().numpy() if audio.dim() > 1 else audio.cpu().numpy()
+        sf.write(audio_in, audio_np, 16000, format="WAV")
+        audio_in.seek(0)
 
         with self.vq02_lock:
             cache = {}

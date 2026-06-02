@@ -9,7 +9,7 @@ from torch.amp import autocast
 from torch.nn.utils.rnn import pad_sequence
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.model_executor.models.step_audio_editx.utils import to_device
+from vllm_omni.model_executor.models.step_audio_editx.utils import load_audio_text_image_video, to_device
 
 # 这里的Encoder可能用非流式的SinusoidalPositionEncoder
 from .transformer_utils import (
@@ -347,7 +347,7 @@ class Paraformer(torch.nn.Module):
     ):
         super().__init__()
         print(encoder_conf)
-        encoder = SANMEncoderChunkOpt(input_size=input_size, **encoder_conf)
+        self.encoder = SANMEncoderChunkOpt(input_size=input_size, **encoder_conf)
 
         self.blank_id = blank_id
         self.sos = sos if sos is not None else vocab_size - 1
@@ -355,7 +355,6 @@ class Paraformer(torch.nn.Module):
         self.vocab_size = vocab_size
         self.ignore_id = ignore_id
         self.normalize = normalize
-        self.encoder = encoder
         self.sampling_ratio = sampling_ratio
         self.share_embedding = share_embedding
 
@@ -453,8 +452,13 @@ class ParaformerStreaming(Paraformer):
         if isinstance(data_in[0], torch.Tensor):
             audio_sample_list = data_in
         else:
-            logger.error(f"Wrong data type: {type(data_in[0])}")
-
+            audio_sample_list = load_audio_text_image_video(
+                data_in,
+                fs=frontend.fs,
+                audio_fs=kwargs.get("fs", 16000),
+                data_type=kwargs.get("data_type", "sound"),
+                cache=cfg,
+            )
         _is_final = cfg["is_final"]  # if data_in is a file or url, set is_final=True
         time2 = time.perf_counter()
         meta_data["load_data"] = f"{time2 - time1:0.3f}"
