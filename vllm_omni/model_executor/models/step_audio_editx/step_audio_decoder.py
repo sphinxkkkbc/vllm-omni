@@ -157,6 +157,7 @@ class CosyVoice(nn.Module):
 
         speech_feat = speech_feat.to(flow_device, flow_dtype)
         speech_embedding = speech_embedding.to(flow_device, flow_dtype)
+        print(f"cosyvoice_input_ids: {token}")
 
         def _make_len(ts: torch.Tensor):
             return torch.tensor([ts.shape[1]], dtype=torch.long, device=ts.device)
@@ -375,7 +376,7 @@ class StepAudioCode2wav(nn.Module):
 
         self.core = CosyVoice(
             model_dir=self.model_path,
-            yaml_path="/root/workspace/vllm-omni/vllm_omni/model_executor/models/step_audio_editx/decoder/cosyvoice.yaml",
+            yaml_path="/root/autodl-tmp/vllm-omni/vllm_omni/model_executor/models/step_audio_editx/decoder/cosyvoice.yaml",
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
@@ -402,7 +403,6 @@ class StepAudioCode2wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None,
         kwargs: dict[str, Any],
     ) -> tuple[torch.Tensor | None, int | None]:
-        logger.info(f"runtime_additional_information: {runtime_additional_information}, kwargs: {kwargs}")
         if (
             isinstance(runtime_additional_information, list)
             and runtime_additional_information
@@ -414,7 +414,6 @@ class StepAudioCode2wav(nn.Module):
 
     @staticmethod
     def _extract_prompt_token(intermediate_tensors: Any, kwargs: dict[str, Any]) -> torch.Tensor | None:
-        logger.info(f"intermediate_tensors: {intermediate_tensors}, kwargs: {kwargs}")
         if (
             isinstance(intermediate_tensors, list)
             and intermediate_tensors
@@ -435,7 +434,6 @@ class StepAudioCode2wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
-        logger.info(f"input_ids: {input_ids}, runtime_additional_information: {runtime_additional_information}")
         if input_ids is None:
             raise ValueError("StepAudioCode2wav requires input_ids from the previous stage.")
         token = input_ids.reshape(-1)

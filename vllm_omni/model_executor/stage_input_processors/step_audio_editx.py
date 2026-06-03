@@ -14,21 +14,6 @@ from vllm_omni.data_entry_keys import (
 
 logger = init_logger(__name__)
 
-CODE_OFFSET = 65536
-BOS_ID, EOS_ID, PAD_ID = 1, 2, 0
-
-
-def extract_codec_codes(token_ids: list[int]) -> list[int]:
-    out: list[int] = []
-    for t in token_ids:
-        if t == EOS_ID:
-            break
-
-        if t >= CODE_OFFSET:
-            c = t - CODE_OFFSET
-            out.append(c)
-    return out
-
 
 def ar2decoder(source_outputs: list[Any], prompt: Any = None, _requires_multimodal_data: bool = False):
     from vllm_omni.inputs.data import OmniTokensPrompt
@@ -49,10 +34,11 @@ def ar2decoder(source_outputs: list[Any], prompt: Any = None, _requires_multimod
             continue
         output = talker_output.outputs[0]
         mm = output.multimodal_output
-        if isinstance(output.token_ids, list):
-            codec_codes = extract_codec_codes(output.token_ids)
-        else:
-            codec_codes = output.token_ids - 65536
+        token_ids = output.token_ids
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.detach().cpu().tolist()
+
+        codec_codes = [int(tid) - 65536 for tid in token_ids if int(tid) >= 65536]
         mm_codes = mm.get("codes", {})
         ref_code = mm_codes.get("ref")
         if isinstance(ref_code, list):

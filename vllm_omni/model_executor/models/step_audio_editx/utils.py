@@ -69,7 +69,6 @@ def trim_silence(audio, sr, keep_left_time=0.05, keep_right_time=0.22, hop_size=
     num_frames = int(math.ceil((index[1] - index[0]) / hop_size))  # 300
 
     left_sil_samples = int(keep_left_time * sr)
-    right_sil_samples = int(keep_right_time * sr)
 
     wav_len = len(audio)
     start_idx = index[0] - left_sil_samples

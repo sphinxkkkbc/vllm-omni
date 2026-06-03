@@ -6,6 +6,7 @@ import os
 from typing import Any
 
 import soundfile as sf
+from vllm import SamplingParams
 
 from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
@@ -26,71 +27,37 @@ def _estimate_prompt_len(
     embeddings that ``preprocess`` will produce.
     """
     try:
-        from transformers import AutoTokenizer
-
-        from vllm_omni.model_executor.models.step_audio_editx.step_audio_ar import StepAudioAR
         from vllm_omni.model_executor.models.step_audio_editx.step_audio_tokenizer import StepAudioTokenizer
 
-        speech_tok = StepAudioTokenizer(
-            tokenizer_path=tokenizer_path,
-            config_path=model_path,
+        cache_key = (model_path, tokenizer_path)
+        speech_tok = _cache.get(cache_key)
+        if speech_tok is None:
+            speech_tok = StepAudioTokenizer(
+                tokenizer_path=tokenizer_path,
+                config_path=model_path,
+            )
+            _cache[cache_key] = speech_tok
+
+        def _first(x, default=None):
+            if isinstance(x, list):
+                return x[0] if x else default
+            return x if x is not None else default
+
+        task_type = _first(additional_information.get("task_type"), "clone")
+        ref_audio = _first(additional_information.get("ref_audio"), None)
+        ref_text = _first(additional_information.get("ref_text"), "")
+        text = _first(additional_information.get("text"), "")
+        sr = _first(additional_information.get("sr"), 16000)
+        logger.info(f"task_type: {task_type}, ref_audio: {ref_audio}, ref_text: {ref_text}, text: {text}, sr: {sr}")
+        prompt_token, _ = speech_tok.encode(
+            task_type,
+            audio=ref_audio,
+            prompt=(ref_text, text),
+            sr=sr,
         )
-        tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, padding_side="left")
-        task_type = (additional_information.get("task_type") or ["clone"])[0]
 
-        def _estimate_ref_code_len(ref_audio: object) -> int | None:
-            """Encode ref_audio with the actual codec to get exact frame count."""
-            if not isinstance(ref_audio, (str, list)):
-                return None
-            audio_path = ref_audio[0] if isinstance(ref_audio, list) else ref_audio
-            if not isinstance(audio_path, str) or not audio_path.strip():
-                return None
-            try:
-                from urllib.parse import urlparse
+        return max(2, len(prompt_token.input_ids))
 
-                import numpy as np
-
-                def _is_url(path: str) -> bool:
-                    try:
-                        parsed = urlparse(path)
-                        if parsed.scheme in ("http", "https"):
-                            return bool(parsed.netloc)
-                        return parsed.scheme in ("file", "data")
-                    except Exception:
-                        return False
-
-                if _is_url(audio_path):
-                    from vllm.multimodal.media import MediaConnector
-
-                    connector = MediaConnector(allowed_local_media_path="/")
-                    audio, sr = connector.fetch_audio(audio_path)
-                else:
-                    from vllm.multimodal.media.audio import load_audio
-
-                    audio, sr = load_audio(audio_path, sr=None, mono=True)
-
-                wav_np = np.asarray(audio, dtype=np.float32)
-
-                if speech_tok is not None:
-                    enc = speech_tok.encode(wav_np, sr=int(sr), return_dict=True)
-                    ref_code = getattr(enc, "token_ids", None)
-                    if isinstance(ref_code, list):
-                        ref_code = ref_code[0] if ref_code else None
-                    if ref_code is not None and hasattr(ref_code, "shape"):
-                        shape = ref_code.shape
-                        return int(shape[0]) if len(shape) == 2 else int(shape[1]) if len(shape) == 3 else None
-
-                codec_hz = 24
-                return int(len(audio) / sr * codec_hz)
-            except Exception:
-                return None
-
-        return StepAudioAR.estimate_prompt_len_from_additional_information(
-            additional_information=additional_information,
-            task_type=task_type,
-            tokenize_prompt=lambda t: tok(t, padding=False)["input_ids"],
-            estimate_ref_code_len=_estimate_ref_code_len,
-        )
     except Exception as exc:
         logger.warning("Failed to estimate prompt length, using fallback 2048: %s", exc)
         return 2048
@@ -113,10 +80,10 @@ def get_base_query(args):
         "ref_audio": [ref_audio_single],
         "ref_text": [ref_text_single],
         "text": [syn_text_single],
-        "max_new_tokens": [2048],
     }
+    input_length = _estimate_prompt_len(additional_information, args.model, args.audio_tokenizer)
     inputs = {
-        "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, args.model, args.audio_tokenizer),
+        "prompt_token_ids": [0] * input_length,
         "additional_information": additional_information,
     }
     return inputs
@@ -193,8 +160,22 @@ def run_e2e():
     if os.environ.get("VLLM_TORCH_PROFILER_DIR"):
         print("Starting profiler...")
         omni.start_profile()
+    prompt_token_ids = inputs[0].get("prompt_token_ids", [])
+    print(f"Prompt length: {len(prompt_token_ids)}")
+    prompt_len = len(prompt_token_ids)
+    max_tokens = 8192 - prompt_len
 
-    outputs = list(omni.generate(inputs))
+    gpt_sampling = SamplingParams(temperature=0.7, max_tokens=max_tokens, skip_special_tokens=False)
+    s2mel_sampling = SamplingParams(
+        temperature=1.0,
+        top_p=1.0,
+        top_k=-1,
+        repetition_penalty=2.0,
+        max_tokens=256,
+        detokenize=False,
+    )
+    sampling_params_list = [gpt_sampling, s2mel_sampling]
+    outputs = list(omni.generate(inputs, sampling_params_list=sampling_params_list))
 
     if os.environ.get("VLLM_TORCH_PROFILER_DIR"):
         print("Stopping profiler...")

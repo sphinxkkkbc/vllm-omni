@@ -148,79 +148,79 @@ class EncoderLayerSANM(nn.Module):
         return x, mask, cache, mask_shift_chunk, mask_att_chunk_encoder
 
     def forward_chunk(self, x, cache=None, chunk_size=None, look_back=0, debug=False):
-        if debug:
-            print("[ENC0_0] input x:", x)
-            print("[ENC0_0] input cache:", cache)
+        # if debug:
+        # print("[ENC0_0] input x:", x)
+        # print("[ENC0_0] input cache:", cache)
 
         residual = x
-        if debug:
-            print("x shape", x.shape)
-            print("x first", x.flatten()[:20])
-            print("x sum", x.sum())
-            print("x mean", x.mean())
-            print("x max", x.max())
+        # if debug:
+        # print("x shape", x.shape)
+        # print("x first", x.flatten()[:20])
+        # print("x sum", x.sum())
+        # print("x mean", x.mean())
+        # print("x max", x.max())
 
-            print("norm1 weight", self.norm1.weight.flatten()[:20])
-            print("norm1 bias", self.norm1.bias.flatten()[:20])
-            print("norm1 eps", self.norm1.eps)
+        # print("norm1 weight", self.norm1.weight.flatten()[:20])
+        # print("norm1 bias", self.norm1.bias.flatten()[:20])
+        # print("norm1 eps", self.norm1.eps)
 
-            print("x dtype", x.dtype)
-            print("norm1 weight dtype", self.norm1.weight.dtype)
-            print("norm1 bias dtype", self.norm1.bias.dtype)
+        # print("x dtype", x.dtype)
+        # print("norm1 weight dtype", self.norm1.weight.dtype)
+        # print("norm1 bias dtype", self.norm1.bias.dtype)
 
         if self.normalize_before:
             x = self.norm1(x)
 
-        if debug:
-            print("[ENC0_0] after norm1 x:", x)
+        # if debug:
+        # print("[ENC0_0] after norm1 x:", x)
 
         if self.in_size == self.size:
             attn, cache = self.self_attn.forward_chunk(x, cache, chunk_size, look_back)
 
-            if debug:
-                print("[ENC0_0] attn:", attn)
-                print("[ENC0_0] cache after self_attn:", cache)
+            # if debug:
+            #     print("[ENC0_0] attn:", attn)
+            #     print("[ENC0_0] cache after self_attn:", cache)
 
             x = residual + attn
 
-            if debug:
-                print("[ENC0_0] after residual + attn x:", x)
+            # if debug:
+            #     print("[ENC0_0] after residual + attn x:", x)
         else:
             x, cache = self.self_attn.forward_chunk(x, cache, chunk_size, look_back)
 
-            if debug:
-                print("[ENC0_0] x after self_attn no residual branch:", x)
-                print("[ENC0_0] cache after self_attn:", cache)
+            # if debug:
+            #     print("[ENC0_0] x after self_attn no residual branch:", x)
+            #     print("[ENC0_0] cache after self_attn:", cache)
 
         if not self.normalize_before:
             x = self.norm1(x)
 
-        if debug:
-            print("[ENC0_0] after optional norm1 x:", x)
+        # if debug:
+        #     print("[ENC0_0] after optional norm1 x:", x)
 
         residual = x
 
         if self.normalize_before:
             x = self.norm2(x)
 
-        if debug:
-            print("[ENC0_0] after norm2 x:", x)
+        # if debug:
+        #     print("[ENC0_0] after norm2 x:", x)
 
         ffn = self.feed_forward(x)
 
-        if debug:
-            print("[ENC0_0] ffn:", ffn)
+        # if debug:
+        #     print("[ENC0_0] ffn:", ffn)
 
         x = residual + ffn
 
-        if debug:
-            print("[ENC0_0] after residual + ffn x:", x)
+        # if debug:
+        #     print("[ENC0_0] after residual + ffn x:", x)
 
         if not self.normalize_before:
             x = self.norm2(x)
 
-        if debug:
-            print("[ENC0_0] final x:", x)
+        # if debug:
+        #     print("[ENC0_0] final x:", x)
 
         return x, cache
 

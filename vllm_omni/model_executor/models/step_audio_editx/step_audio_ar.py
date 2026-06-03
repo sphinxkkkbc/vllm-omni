@@ -65,10 +65,6 @@ class StepAudioAR(nn.Module):
         if not isinstance(text, str):
             text = ""
         # ---- text conditioning portion (matches _build_prompt_embeds) ----
-        assistant_text = StepAudioAR._build_assistant_text(text)
-        assistant_len = len(tokenize_prompt(assistant_text))
-        if assistant_len < 8:
-            raise ValueError(f"Unexpected assistant prompt length: {assistant_len}")
 
         if task_type == "clone":
             voice_clone_prompt = _first(info.get("voice_clone_prompt"), None)
@@ -124,8 +120,7 @@ class StepAudioAR(nn.Module):
 
                 # model uses ref_ids[:, 3:-2] (strip 5 tokens) and text_id=input_ids[:, 3:-5] (strip 8).
                 ref_id_len = max(0, int(ref_ids_len) - 5)
-                text_id_len = max(0, int(assistant_len) - 8)
-                text_embed_len = ref_id_len + text_id_len + 1  # + eos
+                text_embed_len = ref_id_len + 1  # + eos
                 prompt_len += text_embed_len + codec_lens
             else:
                 # _generate_icl_prompt(non_streaming_mode=False): aligned to codec_lens.
@@ -140,12 +135,20 @@ class StepAudioAR(nn.Module):
         info_dict: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int | None, torch.Tensor | None]:
         logger.info(f"Building prompt embeds for task_type: {task_type}, info_dict: {info_dict}")
-        ref_audio = info_dict.get("ref_audio")
-        ref_text = info_dict.get("ref_text")
-        text = info_dict.get("text")
-        sr = info_dict.get("sr") or 16000
+
+        def _first(x, default=None):
+            if isinstance(x, list):
+                return x[0] if x else default
+            return x if x is not None else default
+
+        ref_audio = _first(info_dict.get("ref_audio"), None)
+        ref_text = _first(info_dict.get("ref_text"), "")
+        text = _first(info_dict.get("text"), "")
+        task_type = _first(task_type, "clone")
+        sr = _first(info_dict.get("sr"), 16000)
+        logger.info(f"ref_audio: {ref_audio}, ref_text: {ref_text}, text: {text}, sr: {sr}")
         prompt_token, codec_token = self.tokenizer.encode(task_type, audio=ref_audio, prompt=(ref_text, text), sr=sr)
-        logger.info(f"prompt_token: {prompt_token}, codec_token: {codec_token}")
+        logger.info(f"prompt_token: {prompt_token}, len(input_ids): {len(prompt_token.input_ids)}")
         input_ids = torch.tensor(prompt_token.input_ids)
         input_ids = input_ids.to(next(self.model.parameters()).device)
         logger.info(f"input_ids shape: {input_ids.shape}, codec_token shape: {codec_token.shape}")
@@ -203,20 +206,24 @@ class StepAudioAR(nn.Module):
                     torch.full((int(ac.shape[0]),), ref_len_val, dtype=torch.int32, device=ac.device)
                 )
 
-        if not audio_codes_list:
+        if not audio_codes_list and ref_code_tensor is None:
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
 
-        audio_codes = torch.cat(audio_codes_list, dim=0)
-        span_len = int(audio_codes.shape[0])
-        # logger.info(f"span_len: {span_len}, hidden.shape: {hidden.shape}")
-        # hidden = hidden[:span_len]
-        mm: OmniPayload = {"codes": {"audio": audio_codes}}
-        if ref_code_len_list:
-            mm.setdefault("meta", {})["ref_code_len"] = torch.cat(ref_code_len_list, dim=0)[:span_len]
+        mm: OmniPayload = {"codes": {}}
+
+        if audio_codes_list:
+            audio_codes = torch.cat(audio_codes_list, dim=0)
+            span_len = int(audio_codes.shape[0])
+            mm["codes"]["audio"] = audio_codes
+
+            if ref_code_len_list:
+                mm.setdefault("meta", {})["ref_code_len"] = torch.cat(ref_code_len_list, dim=0)[:span_len]
+            if codec_streaming_list:
+                mm.setdefault("meta", {})["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)[:span_len]
+
         if ref_code_tensor is not None:
-            mm.setdefault("codes", {})["ref"] = [ref_code_tensor]
-        if codec_streaming_list:
-            mm.setdefault("meta", {})["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)[:span_len]
+            mm["codes"]["ref"] = [ref_code_tensor]
+
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
 
     def preprocess(
@@ -226,6 +233,7 @@ class StepAudioAR(nn.Module):
         **info_dict: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         self._ensure_audio_tokenizer_loaded()
+
         additional_information = info_dict.get("additional_information")
         if isinstance(additional_information, dict):
             merged: dict[str, Any] = {k: v for k, v in info_dict.items() if k != "additional_information"}
@@ -237,87 +245,107 @@ class StepAudioAR(nn.Module):
         embed = payload.get("embed", {})
         meta = payload.get("meta", {})
 
-        text_list = text_list = info_dict.get("text")
-
         span_len = int(input_ids.shape[0])
         if span_len <= 0:
-            return input_ids, input_embeds if input_embeds is not None else self.embed_input_ids(input_ids), {}
+            embeds = input_embeds
+            if embeds is None:
+                embeds = self.embed_input_ids(input_ids.to(torch.long))
+            return input_ids, embeds, {}
 
         text_list = info_dict.get("text")
         if not isinstance(text_list, list) or not text_list or not text_list[0]:
-            raise ValueError("Missing additional_information.text for Qwen3-TTS AR talker.")
+            raise ValueError("Missing additional_information.text for StepAudioEditX AR talker.")
 
         task_type = info_dict.get("task_type") or ["clone"]
-        codec_streaming = task_type == "clone"
 
         prompt_embeds_cpu = embed.get("prefill")
-        tts_pad_embed_cpu = embed.get("tts_pad")
+        tts_pad_embed_buf = embed.get("tts_pad")
         tts_pad_embed = None
-        if isinstance(tts_pad_embed_cpu, torch.Tensor) and tts_pad_embed_cpu.numel() > 0:
-            tts_pad_embed = tts_pad_embed_cpu.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+        if isinstance(tts_pad_embed_buf, torch.Tensor) and tts_pad_embed_buf.numel() > 0:
+            tts_pad_embed = tts_pad_embed_buf.to(
+                device=input_ids.device,
+                dtype=torch.bfloat16,
+            ).reshape(1, -1)
 
-        # Subsequent prefill rounds (multi-chunk): prompt_embeds_cpu is a Tensor stored by the first round.
         is_first_prefill = not isinstance(prompt_embeds_cpu, torch.Tensor) or prompt_embeds_cpu.ndim != 2
+
         if is_first_prefill:
             full_prompt_embeds, ref_code_len, ref_code, tts_pad_embed = self._build_prompt_embeds(
-                task_type=task_type, info_dict=info_dict
+                task_type=task_type,
+                info_dict=info_dict,
             )
-            # Store full prompt embeddings on CPU (large, prefill-only).
-            # tailing_text_hidden and tts_pad_embed stay on GPU (gpu_resident_buffer_keys).
             prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu").contiguous()
+            total_prefill_len = int(prompt_embeds_cpu.shape[0])
+
+            take = prompt_embeds_cpu[:span_len]
+            if int(take.shape[0]) < span_len:
+                pad_n = span_len - int(take.shape[0])
+                pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
+                take = torch.cat([take, pad_rows], dim=0)
+
+            prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
+
             info_update: OmniPayload = {
                 "embed": {
                     "prefill": prompt_embeds_cpu,
                     "tts_pad": tts_pad_embed.detach(),
                 },
                 "meta": {
-                    "talker_prefill_offset": 0,
+                    "talker_prefill_offset": min(span_len, total_prefill_len),
                     "talker_text_offset": 0,
-                    "codec_streaming": codec_streaming,
                 },
             }
+
             if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
                 info_update.setdefault("codes", {})["ref"] = ref_code.detach().to("cpu").contiguous()
             if ref_code_len is not None:
                 info_update["meta"]["ref_code_len"] = int(ref_code_len)
-            # Always return a span_len slice; if the scheduled placeholder is longer, pad with tts_pad_embed.
-            # This preserves placeholder/embedding alignment.
+
+            input_ids_out = input_ids.clone()
+            input_ids_out[:] = 0
+            return input_ids_out, prompt_embeds, info_update
+
+        total_prefill_len = int(prompt_embeds_cpu.shape[0])
+        offset = int(meta.get("talker_prefill_offset", 0) or 0)
+        if offset < 0:
             offset = 0
-            s = 0
-            e = span_len
+
+        # Subsequent prefill chunk.
+        if offset < total_prefill_len:
+            if tts_pad_embed is None:
+                raise RuntimeError(
+                    "Missing `embed.tts_pad` in additional_information; first prefill must initialize it."
+                )
+
+            s = max(0, min(offset, total_prefill_len))
+            e = max(0, min(offset + span_len, total_prefill_len))
             take = prompt_embeds_cpu[s:e]
-            prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
-            info_update["meta"]["talker_prefill_offset"] = int(offset + span_len)
-        else:
-            offset = int(meta.get("talker_prefill_offset", 0) or 0)
-            if offset < 0:
-                offset = 0
-            s = max(0, min(offset, int(prompt_embeds_cpu.shape[0])))
-            e = max(0, min(offset + span_len, int(prompt_embeds_cpu.shape[0])))
-            take = prompt_embeds_cpu[s:e]
+
             if int(take.shape[0]) < span_len:
-                pad_n = int(span_len - int(take.shape[0]))
+                pad_n = span_len - int(take.shape[0])
                 pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
                 take = torch.cat([take, pad_rows], dim=0)
-            # Subsequent prefill chunk: slice from stored embeddings at running offset.
+
             prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
-            info_update = {
+
+            input_ids_out = input_ids.clone()
+            input_ids_out[:] = 0
+
+            info_update: OmniPayload = {
                 "meta": {
-                    "talker_prefill_offset": int(offset + span_len),
-                    "codec_streaming": codec_streaming,
+                    "talker_prefill_offset": min(offset + span_len, total_prefill_len),
                 }
             }
-        # When inputs_embeds is set, token ids are ignored by the model but must stay in-vocab for vLLM bookkeeping.
-        input_ids_out = input_ids.clone()
-        input_ids_out[:] = 0
+            return input_ids_out, prompt_embeds, info_update
 
-        zeros = torch.zeros(
-            (prompt_embeds.shape[0], 1),
+        # Decode stage.
+        # The prompt prefill is finished. Feed the sampled token itself back into the AR model.
+        input_ids_out = input_ids.to(torch.long)
+        prompt_embeds = self.embed_input_ids(input_ids_out).to(
             device=input_ids.device,
-            dtype=torch.long,
+            dtype=torch.bfloat16,
         )
-        info_update.setdefault("codes", {})["audio"] = zeros
-        return input_ids_out, prompt_embeds, info_update
+        return input_ids_out, prompt_embeds, {}
 
     def _encode_ref_audio_to_code(self, wav: np.ndarray, sr: int) -> torch.Tensor:
         try:

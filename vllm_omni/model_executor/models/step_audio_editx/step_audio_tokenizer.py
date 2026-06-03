@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 class FunASRModel:
     def __init__(self, model_path, config_path):
         config_path = (
-            "/root/workspace/vllm-omni/vllm_omni/model_executor/models/step_audio_editx/audio_tokenizer/tokenizer.yaml"
+            "/root/autodl-tmp/vllm-omni/vllm_omni/model_executor/models/step_audio_editx/audio_tokenizer/tokenizer.yaml"
         )
         with open(config_path, encoding="utf-8") as f:
             kwargs = yaml.safe_load(f)
@@ -162,11 +162,13 @@ class StepAudioTokenizer:
         clone mode: prompt = {prompt_text, target_text}
         """
         audio_tokens, vq0206_codes = self._audio_tokenize(audio, sr)
+
         token_ids = self._text_tokenize(task_type, audio_tokens, prompt)
         return token_ids, vq0206_codes
 
     def _audio_tokenize(self, audio, sr):
         vq0206_codes, vq02_codes_ori, vq06_codes_ori = self.wav2token(audio, sr)
+        print(f"vq02_codes_ori: {vq02_codes_ori}, vq06_codes_ori: {vq06_codes_ori}")
         audio_tokens = self.merge_vq0206_to_token_str(vq02_codes_ori, vq06_codes_ori)
         return audio_tokens, vq0206_codes
 
@@ -186,7 +188,20 @@ class StepAudioTokenizer:
                 prompt_speaker,
                 audio_tokens,
             )
-        token_ids = self.text_tokenizer.apply_chat_template(prompt, tokenize=True, add_generation_prompt=True)
+        print("Final prompt for text tokenization repr:", repr(prompt), flush=True)
+        chat_text = self.text_tokenizer.apply_chat_template(
+            prompt,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        print("Final chat text repr:", repr(chat_text), flush=True)
+
+        token_ids = self.text_tokenizer.apply_chat_template(
+            prompt,
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+
         return token_ids
 
     @staticmethod
