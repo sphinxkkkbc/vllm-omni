@@ -60,7 +60,12 @@ class FunASRModel:
             encoder_conf=kwargs["encoder_conf"],
             input_size=kwargs["input_size"],
         )
-        # self.model.load_weight(kwargs["init_param"])
+        state = torch.load(kwargs["init_param"], map_location="cpu")
+
+        if isinstance(state, dict):
+            state = state.get("state_dict", state.get("model", state))
+
+        self.model.load_weights(state.items())
         self.model.to(device).eval()
         init_param = kwargs.get("init_param", None)
         if init_param is None:

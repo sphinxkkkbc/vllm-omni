@@ -147,39 +147,80 @@ class EncoderLayerSANM(nn.Module):
 
         return x, mask, cache, mask_shift_chunk, mask_att_chunk_encoder
 
-    def forward_chunk(self, x, cache=None, chunk_size=None, look_back=0):
-        """Compute encoded features.
-
-        Args:
-            x_input (torch.Tensor): Input tensor (#batch, time, size).
-            mask (torch.Tensor): Mask tensor for the input (#batch, time).
-            cache (torch.Tensor): Cache tensor of the input (#batch, time - 1, size).
-
-        Returns:
-            torch.Tensor: Output tensor (#batch, time, size).
-            torch.Tensor: Mask tensor (#batch, time).
-
-        """
+    def forward_chunk(self, x, cache=None, chunk_size=None, look_back=0, debug=False):
+        if debug:
+            print("[ENC0_0] input x:", x)
+            print("[ENC0_0] input cache:", cache)
 
         residual = x
+        if debug:
+            print("x shape", x.shape)
+            print("x first", x.flatten()[:20])
+            print("x sum", x.sum())
+            print("x mean", x.mean())
+            print("x max", x.max())
+
+            print("norm1 weight", self.norm1.weight.flatten()[:20])
+            print("norm1 bias", self.norm1.bias.flatten()[:20])
+            print("norm1 eps", self.norm1.eps)
+
+            print("x dtype", x.dtype)
+            print("norm1 weight dtype", self.norm1.weight.dtype)
+            print("norm1 bias dtype", self.norm1.bias.dtype)
+
         if self.normalize_before:
             x = self.norm1(x)
+
+        if debug:
+            print("[ENC0_0] after norm1 x:", x)
 
         if self.in_size == self.size:
             attn, cache = self.self_attn.forward_chunk(x, cache, chunk_size, look_back)
+
+            if debug:
+                print("[ENC0_0] attn:", attn)
+                print("[ENC0_0] cache after self_attn:", cache)
+
             x = residual + attn
+
+            if debug:
+                print("[ENC0_0] after residual + attn x:", x)
         else:
             x, cache = self.self_attn.forward_chunk(x, cache, chunk_size, look_back)
+
+            if debug:
+                print("[ENC0_0] x after self_attn no residual branch:", x)
+                print("[ENC0_0] cache after self_attn:", cache)
 
         if not self.normalize_before:
             x = self.norm1(x)
 
+        if debug:
+            print("[ENC0_0] after optional norm1 x:", x)
+
         residual = x
+
         if self.normalize_before:
             x = self.norm2(x)
-        x = residual + self.feed_forward(x)
+
+        if debug:
+            print("[ENC0_0] after norm2 x:", x)
+
+        ffn = self.feed_forward(x)
+
+        if debug:
+            print("[ENC0_0] ffn:", ffn)
+
+        x = residual + ffn
+
+        if debug:
+            print("[ENC0_0] after residual + ffn x:", x)
+
         if not self.normalize_before:
             x = self.norm2(x)
+
+        if debug:
+            print("[ENC0_0] final x:", x)
 
         return x, cache
 
@@ -294,14 +335,21 @@ class SANMEncoderChunkOpt(nn.Module):
         else:
             new_cache = cache["opt"]
 
+        debug_once = not getattr(self, "_debug_enc0_done", False)
+
         for layer_idx, encoder_layer in enumerate(self.encoders0):
+            do_debug = debug_once and layer_idx == 0
             encoder_outs = encoder_layer.forward_chunk(
                 xs_pad,
                 new_cache[layer_idx],
                 cache["chunk_size"],
                 cache["encoder_chunk_look_back"],
+                debug=do_debug,
             )
             xs_pad, new_cache[0] = encoder_outs[0], encoder_outs[1]
+
+        if debug_once:
+            self._debug_enc0_done = True
 
         for layer_idx, encoder_layer in enumerate(self.encoders):
             encoder_outs = encoder_layer.forward_chunk(
