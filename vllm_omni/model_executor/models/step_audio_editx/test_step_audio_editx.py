@@ -1,5 +1,28 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""OpenAI-compatible client for Qwen3-TTS via /v1/audio/speech endpoint.
+
+This script demonstrates how to use the OpenAI-compatible speech API
+to generate audio from text using Qwen3-TTS models.
+
+Examples:
+    # Voice Clone task
+    python3 step_audio_editx/offline_inference.py \
+    --model  /path/to/model \
+    --audio-tokenizer /path/to/tokenizer \
+    --ref-audio /path/to/ref_audio.wav \
+    --ref-text "This is the reference transcript" \
+    --text "Hello world"
+
+    # Voice Edit task
+    python3 step_audio_editx/offline_inference.py \
+        --model  /path/to/model \
+        --audio-tokenizer /path/to/tokenizer \
+        --ref-audio /path/to/ref_audio.wav \
+        --ref-text "This is the reference transcript" \
+        --text "Hello world" \
+        --edit-type "emotion" \
+        --edit-info "fear" \
+"""
+
 import argparse
 import logging
 import os
@@ -43,16 +66,26 @@ def _estimate_prompt_len(
                 return x[0] if x else default
             return x if x is not None else default
 
-        task_type = _first(additional_information.get("task_type"), "clone")
         ref_audio = _first(additional_information.get("ref_audio"), None)
         ref_text = _first(additional_information.get("ref_text"), "")
         text = _first(additional_information.get("text"), "")
         sr = _first(additional_information.get("sr"), 16000)
-        logger.info(f"task_type: {task_type}, ref_audio: {ref_audio}, ref_text: {ref_text}, text: {text}, sr: {sr}")
+        task_type = _first(additional_information.get("task_type"))
+        if task_type == "edit":
+            edit_type = _first(additional_information.get("edit_type"))
+            edit_info = _first(additional_information.get("edit_info"))
+            prompt = (ref_text, edit_type, edit_info, text)
+            logger.info(
+                f"Audio Edit with info: ref_audio: {ref_audio}, ref_text: {ref_text}, "
+                f"edit_type: {edit_type}, edit_info: {edit_info}, text: {text}"
+            )
+        else:
+            prompt = (ref_text, text)
+            logger.info(f"Audio Clone with info: ref_audio: {ref_audio}, ref_text: {ref_text}, text: {text}")
         prompt_token, _ = speech_tok.encode(
             task_type,
             audio=ref_audio,
-            prompt=(ref_text, text),
+            prompt=prompt,
             sr=sr,
         )
 
@@ -63,37 +96,49 @@ def _estimate_prompt_len(
         return 2048
 
 
-def get_base_query(args):
-    """Build Base (voice clone) sample inputs.
+def _build_inputs(args):
+    """Build sample inputs for StepAudioEditx.
     Returns:
         QueryResult with Omni inputs and the Base model path.
     """
-    task_type = "clone"
-    ref_audio_path_1 = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
-    ref_audio_single = ref_audio_path_1
-    ref_text_single = (
-        "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
-    )
-    syn_text_single = "Good one. Okay, fine, I'm just gonna leave this sock monkey here. Goodbye."
+    if args.ref_audio is not None:
+        ref_audio_single = args.ref_audio
+        if args.ref_text is not None:
+            ref_text_single = args.ref_text
+        else:
+            raise ValueError("ref_text must be provided when ref_audio is specified.")
+    else:
+        # Default reference audio and text for voice cloning if not provided via CLI args.
+        ref_audio_single = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
+        ref_text_single = (
+            "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
+        )
+    if args.text is not None:
+        syn_text_single = args.text
+    else:
+        syn_text_single = "Good one. Okay, fine, I'm just gonna leave this sock monkey here. Goodbye."
     additional_information = {
-        "task_type": task_type,
+        "task_type": args.task_type,
         "ref_audio": [ref_audio_single],
         "ref_text": [ref_text_single],
         "text": [syn_text_single],
     }
+    if args.task_type == "edit":
+        assert args.edit_type is not None and args.edit_info is not None, (
+            "edit_type and edit_info must be provided for edit task."
+        )
+        additional_information.update(
+            {
+                "edit_type": args.edit_type,
+                "edit_info": args.edit_info,
+            }
+        )
     input_length = _estimate_prompt_len(additional_information, args.model, args.audio_tokenizer)
     inputs = {
         "prompt_token_ids": [0] * input_length,
         "additional_information": additional_information,
     }
-    return inputs
-
-
-def _build_inputs(args) -> tuple[str, list]:
-    """Resolve model name and inputs list from CLI args."""
-    inputs = get_base_query(args)
     inputs = inputs if isinstance(inputs, list) else [inputs]
-
     return inputs
 
 
@@ -118,20 +163,20 @@ def run_e2e():
         help="Override the deploy config path. If unset, auto-loads "
         "vllm_omni/deploy/step_audio_editx.yaml based on the HF model_type.",
     )
+    parser.add_argument(
+        "--task-type",
+        choices=("clone", "edit"),
+        default="clone",
+        help="Task type: clone or edit.",
+    )
     parser.add_argument("--text", type=str, default="Hello, this is a test of the StepAudioEditx system capability.")
     parser.add_argument(
         "--prompt-text",
         type=str,
         default="You are a helpful assistant.<|endofprompt|>希望你以后，能够做的比我还好呦!",
     )
-    parser.add_argument(
-        "--ref-audio",
-        type=str,
-        default=None,
-        help="Path to reference audio for voice cloning. "
-        "If unset, downloads the upstream CosyVoice3 zero-shot prompt audio clip",
-    )
-    parser.add_argument("--edit-type", type=str, default=None, help="Type of edit to perform. ")
+    parser.add_argument("--ref-audio", type=str, default=None, help="Path to reference audio for voice cloning. ")
+    parser.add_argument("--edit-type", type=str, default=None, help="Type of edit to perform.")
     parser.add_argument("--edit-info", type=str, default=None, help="Additional information for the edit. ")
     nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
@@ -145,6 +190,7 @@ def run_e2e():
     print(f"Initializing StepAudioEditx E2E with model={args.model}")
     print(f"Deploy config: {args.deploy_config}")
     os.environ["STEP_AUDIO_TOKENIZER_PATH"] = args.audio_tokenizer
+
     omni = Omni(
         model=args.model,
         deploy_config=args.deploy_config,

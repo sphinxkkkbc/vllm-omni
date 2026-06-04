@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
@@ -40,93 +40,6 @@ class StepAudioAR(nn.Module):
             tokenizer_path=self.tokenizer_path,
             config_path=self.model_path,
         )
-
-    @staticmethod
-    def estimate_prompt_len_from_additional_information(
-        additional_information: dict[str, Any] | None,
-        *,
-        task_type: str,
-        tokenize_prompt: Callable[[str], list[int]],
-        estimate_ref_code_len: Callable[[object], int | None] | None = None,
-    ) -> int:
-        """Compute Stage-0 placeholder prompt length (length-only mirror of `_build_prompt_embeds()`).
-        It must match the model-side `inputs_embeds` length to avoid extra padding and quality drop."""
-
-        def _first(x: object, default: object) -> object:
-            if isinstance(x, list):
-                return x[0] if x else default
-            return x if x is not None else default
-
-        info: dict[str, Any] = additional_information or {}
-        text = _first(info.get("text"), "")
-        # Official defaults: CustomVoice/VoiceDesign -> non_streaming_mode=True; Base -> False.
-        non_streaming_mode = task_type in ("edit")
-
-        if not isinstance(text, str):
-            text = ""
-        # ---- text conditioning portion (matches _build_prompt_embeds) ----
-
-        if task_type == "clone":
-            voice_clone_prompt = _first(info.get("voice_clone_prompt"), None)
-
-            ref_code = None
-            if isinstance(voice_clone_prompt, dict):
-                ref_code = _first(voice_clone_prompt.get("ref_code"), None)
-
-            ref_code_len: int | None = None
-            if isinstance(ref_code, list):
-                if ref_code and isinstance(ref_code[0], list):
-                    ref_code_len = len(ref_code)
-                elif ref_code:
-                    ref_code_len = len(ref_code)
-            elif hasattr(ref_code, "shape"):
-                try:
-                    shape = getattr(ref_code, "shape")
-                    if shape and len(shape) >= 1:
-                        ref_code_len = int(shape[0])
-                except Exception:
-                    ref_code_len = None
-
-            if ref_code_len is None and estimate_ref_code_len is not None:
-                ref_code_len = estimate_ref_code_len(info.get("ref_audio"))
-            if ref_code_len is None:
-                raise ValueError(
-                    "Base in-context voice cloning requires either `voice_clone_prompt.ref_code` "
-                    "or a readable `ref_audio` that can be mapped to a codec frame length."
-                )
-
-            codec_lens = 1 + int(ref_code_len)  # codec_bos + ref_code
-            if non_streaming_mode:
-                prompt_len = 0
-                # _generate_icl_prompt(non_streaming_mode=True):
-                # text_embed = ref_ids + text_ids + eos.
-                ref_ids = _first(info.get("ref_ids"), None)
-                if isinstance(voice_clone_prompt, dict) and ref_ids is None:
-                    ref_ids = _first(voice_clone_prompt.get("ref_ids") or voice_clone_prompt.get("ref_id"), None)
-
-                if ref_ids is None:
-                    ref_text = _first(info.get("ref_text"), "")
-                    if not isinstance(ref_text, str) or not ref_text.strip():
-                        raise ValueError("Base in-context non-streaming requires `ref_text` or tokenized `ref_ids`.")
-                    ref_text_ids = tokenize_prompt(StepAudioAR._build_ref_text(ref_text))
-                    ref_ids_len = len(ref_text_ids)
-                elif hasattr(ref_ids, "shape"):
-                    shape = getattr(ref_ids, "shape", None)
-                    ref_ids_len = int(shape[-1]) if shape else 0
-                elif isinstance(ref_ids, list):
-                    ref_ids_len = len(ref_ids)
-                else:
-                    ref_ids_len = 0
-
-                # model uses ref_ids[:, 3:-2] (strip 5 tokens) and text_id=input_ids[:, 3:-5] (strip 8).
-                ref_id_len = max(0, int(ref_ids_len) - 5)
-                text_embed_len = ref_id_len + 1  # + eos
-                prompt_len += text_embed_len + codec_lens
-            else:
-                # _generate_icl_prompt(non_streaming_mode=False): aligned to codec_lens.
-                prompt_len += codec_lens
-
-        return max(2, int(prompt_len))
 
     def _build_prompt_embeds(
         self,
