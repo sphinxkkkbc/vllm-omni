@@ -1099,6 +1099,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
                 positive_kwargs=cond_kwargs,
                 negative_kwargs=uncond_kwargs,
                 cfg_normalize=p.cfg_norm,
+                kwargs={"step_i": step_i},
             )
             return noise_pred
         else:
@@ -1158,13 +1159,15 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
     def predict_noise(self, **kwargs):
         return self._t2i_predict_v(**kwargs)
 
-    def combine_cfg_noise(self, out_cond, out_uncond, cfg_scale, cfg_norm):
+    def combine_cfg_noise(self, out_cond, out_uncond, cfg_scale, cfg_norm, kwargs=None):
+        out_cond = out_cond[0]
+        out_uncond = out_uncond[0]
         batch_size = out_cond.shape[0]
-        ###
-        step_i = 0  # This should be passed in or tracked properly
-        ###
         if isinstance(cfg_scale, (int, float)):
             if cfg_norm == "cfg_zero_star":
+                if not isinstance(kwargs, dict) or not isinstance(kwargs.get("step_i"), int):
+                    raise ValueError("SenseNovaU1 T2I CFG requires kwargs['step_i'] as int")
+                step_i = kwargs.get("step_i")
                 pos_flat = out_cond.view(batch_size, -1)
                 neg_flat = out_uncond.view(batch_size, -1)
                 alpha = _optimized_scale(pos_flat, neg_flat)
