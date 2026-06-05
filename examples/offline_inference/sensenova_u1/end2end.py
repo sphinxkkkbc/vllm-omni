@@ -26,6 +26,7 @@ See README.md for more examples.
 
 import argparse
 import os
+import time
 
 from PIL import Image
 
@@ -141,6 +142,12 @@ def parse_args():
         help="Number of GPUs for tensor parallelism.",
     )
     parser.add_argument(
+        "--cfg-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs for CFG parallelism.",
+    )
+    parser.add_argument(
         "--enforce-eager",
         action="store_true",
         help="Disable torch.compile and force eager execution.",
@@ -182,6 +189,7 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=args.enforce_eager,
         enable_cpu_offload=args.enable_cpu_offload,
+        cfg_parallel_size=args.cfg_parallel_size,
     )
 
     extra_args = {
@@ -225,6 +233,7 @@ def main():
     print(f"  Seed           : {args.seed}")
     print(f"  Think mode     : {args.think}")
     print(f"  TP size        : {args.tensor_parallel_size}")
+    print(f"  CFG size       : {args.cfg_parallel_size}")
     print(f"{'=' * 60}\n")
 
     # Build prompt dict
@@ -249,12 +258,17 @@ def main():
     else:
         prompt_dict = {"prompt": args.prompt, "modalities": ["image"]}
 
+    t0 = time.perf_counter()
+
     outputs = list(
         omni.generate(
             prompts=prompt_dict,
             sampling_params_list=sampling_params,
         )
     )
+
+    e2e_s = time.perf_counter() - t0
+    print(f"e2e time for generation: {e2e_s:.3f}s")
 
     for req_output in outputs:
         custom = getattr(req_output, "_custom_output", {}) or {}
