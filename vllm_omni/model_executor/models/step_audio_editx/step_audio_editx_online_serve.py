@@ -60,7 +60,6 @@ def run_tts_generation(args) -> None:
     payload = {
         "model": args.model,
         "input": args.text,
-        "voice": args.speaker,
         "response_format": args.response_format,
     }
 
@@ -125,7 +124,7 @@ def run_tts_generation(args) -> None:
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="OpenAI-compatible client for Qwen3-TTS via /v1/audio/speech",
+        description="OpenAI-compatible client for Step-Audio-Editx via /v1/audio/speech",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -152,7 +151,6 @@ def parse_args():
     )
     parser.add_argument(
         "--audio-tokenizer",
-        "-m",
         type=str,
         default="stepfun-ai/Step-Audio-Tokenizer",
         help="Model name/path",
@@ -162,7 +160,7 @@ def parse_args():
     parser.add_argument(
         "--task-type",
         choices=("clone", "edit"),
-        default="clone",
+        default=None,
         help="Task type: clone or edit.",
     )
 

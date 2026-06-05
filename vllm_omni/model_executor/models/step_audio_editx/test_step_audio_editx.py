@@ -75,13 +75,13 @@ def _estimate_prompt_len(
             edit_type = _first(additional_information.get("edit_type"))
             edit_info = _first(additional_information.get("edit_info"))
             prompt = (ref_text, edit_type, edit_info, text)
-            logger.info(
+            print(
                 f"Audio Edit with info: ref_audio: {ref_audio}, ref_text: {ref_text}, "
                 f"edit_type: {edit_type}, edit_info: {edit_info}, text: {text}"
             )
         else:
             prompt = (ref_text, text)
-            logger.info(f"Audio Clone with info: ref_audio: {ref_audio}, ref_text: {ref_text}, text: {text}")
+            print(f"Audio Clone with info: ref_audio: {ref_audio}, ref_text: {ref_text}, text: {text}")
         prompt_token, _ = speech_tok.encode(
             task_type,
             audio=ref_audio,
@@ -169,15 +169,16 @@ def run_e2e():
         default="clone",
         help="Task type: clone or edit.",
     )
-    parser.add_argument("--text", type=str, default="Hello, this is a test of the StepAudioEditx system capability.")
+    parser.add_argument("--text", type=str, default=None)
     parser.add_argument(
         "--prompt-text",
         type=str,
         default="You are a helpful assistant.<|endofprompt|>希望你以后，能够做的比我还好呦!",
     )
-    parser.add_argument("--ref-audio", type=str, default=None, help="Path to reference audio for voice cloning. ")
+    parser.add_argument("--ref-audio", type=str, default=None, help="Path to reference audio for voice cloning.")
     parser.add_argument("--edit-type", type=str, default=None, help="Type of edit to perform.")
     parser.add_argument("--edit-info", type=str, default=None, help="Additional information for the edit. ")
+    parser.add_argument("--output", type=str, default=None, help="Output audio path.")
     nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
     # Ensure tokenizer directory exists
@@ -200,7 +201,7 @@ def run_e2e():
 
     inputs = _build_inputs(args)
 
-    print(f"Generating for prompt: {args.text}")
+    print(f"Generating for prompt: {args.text} In {args.task_type} task")
 
     # Start profiling (requires VLLM_TORCH_PROFILER_DIR env var)
     if os.environ.get("VLLM_TORCH_PROFILER_DIR"):
@@ -248,7 +249,7 @@ def run_e2e():
                 if "audio" in mm:
                     audio_out = mm["audio"]
                     print(f"Generated Audio Shape: {audio_out.shape}")
-                    out_path = f"output_{i}.wav"
+                    out_path = args.output if args.output else f"output_{i}.wav"
                     sf.write(out_path, audio_out.cpu().numpy().squeeze(), 22050)
                     print(f"Saved audio to {out_path}")
             else:

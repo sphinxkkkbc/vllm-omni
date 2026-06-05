@@ -106,7 +106,7 @@ class StepAudioTokenizer:
         config_path,
         funasr_model_id="dengcunqin/speech_paraformer-large_asr_nat-zh-cantonese-en-16k-vocab8501-online",
     ):
-        tokenizer_path = os.getenv("STEP_AUDIO_TOKENIZER_PATH")
+        tokenizer_path = tokenizer_path or os.getenv("STEP_AUDIO_TOKENIZER_PATH")
         if not tokenizer_path:
             raise ValueError("STEP_AUDIO_TOKENIZER_PATH is not set")
         self.text_tokenizer = AutoTokenizer.from_pretrained(config_path, trust_remote_code=True)
@@ -222,7 +222,19 @@ class StepAudioTokenizer:
             return wav, int(prompt_wav_sr)
 
         if isinstance(prompt_wav, str):
-            if StepAudioTokenizer._is_url(prompt_wav):
+            if prompt_wav.startswith("data:audio"):
+                import base64
+                import io
+
+                _, b64_data = prompt_wav.split(",", 1)
+                audio_bytes = base64.b64decode(b64_data)
+                data, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
+                if data.ndim == 1:
+                    wav = torch.from_numpy(data).unsqueeze(0)  # [1, T]
+                else:
+                    wav = torch.from_numpy(data).transpose(0, 1)  # [C, T]
+
+            elif StepAudioTokenizer._is_url(prompt_wav):
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
                     r = requests.get(prompt_wav, timeout=30)
                     r.raise_for_status()
@@ -263,8 +275,12 @@ class StepAudioTokenizer:
 
         if enable_trim:
             audio = trim_silence(audio, 16000)
-            audio = torch.from_numpy(audio)
-            audio = audio.unsqueeze(0)
+            if isinstance(audio, np.ndarray):
+                audio = torch.from_numpy(audio.astype(np.float32))
+                if audio.ndim == 1:
+                    audio = audio.unsqueeze(0)  # [1, T]
+                elif audio.ndim == 2:
+                    audio = audio.transpose(0, 1)
         return audio
 
     def wav2token(self, audio, sample_rate, enable_trim=True, energy_norm=True):

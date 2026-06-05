@@ -57,10 +57,17 @@ class StepAudioAR(nn.Module):
         ref_audio = _first(info_dict.get("ref_audio"), None)
         ref_text = _first(info_dict.get("ref_text"), "")
         text = _first(info_dict.get("text"), "")
-        task_type = _first(task_type, "clone")
+        task_type = _first(info_dict.get("task_type"), "clone")
+        if task_type == "clone":
+            prompt = (ref_text, text)
+        else:
+            edit_type = _first(info_dict.get("edit_type"), None)
+            edit_info = _first(info_dict.get("edit_info"), None)
+            prompt = (ref_text, edit_type, edit_info, text)
+
         sr = _first(info_dict.get("sr"), 16000)
-        logger.info(f"ref_audio: {ref_audio}, ref_text: {ref_text}, text: {text}, sr: {sr}")
-        prompt_token, codec_token = self.tokenizer.encode(task_type, audio=ref_audio, prompt=(ref_text, text), sr=sr)
+        # logger.info(f"ref_audio: {ref_audio}, ref_text: {ref_text}, text: {text}, sr: {sr}")
+        prompt_token, codec_token = self.tokenizer.encode(task_type, audio=ref_audio, prompt=prompt, sr=sr)
         logger.info(f"prompt_token: {prompt_token}, len(input_ids): {len(prompt_token.input_ids)}")
         input_ids = torch.tensor(prompt_token.input_ids)
         input_ids = input_ids.to(next(self.model.parameters()).device)
@@ -205,7 +212,6 @@ class StepAudioAR(nn.Module):
                 },
                 "meta": {
                     "talker_prefill_offset": min(span_len, total_prefill_len),
-                    "talker_text_offset": 0,
                 },
             }
 
