@@ -141,6 +141,12 @@ def parse_args():
         help="Number of GPUs for tensor parallelism.",
     )
     parser.add_argument(
+        "--cfg-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs for CFG parallelism.",
+    )
+    parser.add_argument(
         "--enforce-eager",
         action="store_true",
         help="Disable torch.compile and force eager execution.",
@@ -182,6 +188,7 @@ def main():
         tensor_parallel_size=args.tensor_parallel_size,
         enforce_eager=args.enforce_eager,
         enable_cpu_offload=args.enable_cpu_offload,
+        cfg_parallel_size=args.cfg_parallel_size,
     )
 
     extra_args = {
@@ -225,6 +232,7 @@ def main():
     print(f"  Seed           : {args.seed}")
     print(f"  Think mode     : {args.think}")
     print(f"  TP size        : {args.tensor_parallel_size}")
+    print(f"  CFG size       : {args.cfg_parallel_size}")
     print(f"{'=' * 60}\n")
 
     # Build prompt dict

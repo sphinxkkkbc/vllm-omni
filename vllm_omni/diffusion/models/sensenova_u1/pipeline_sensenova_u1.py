@@ -1064,20 +1064,10 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
 
     def _denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i):
         cond_kwargs = dict(
-            image_embeds=image_embeds,
-            kv_cond=caches["cond"],
-            idx_cond=caches["idx_cond"],
-            mask_cond=caches["mask_cond"],
-            t=t,
-            z=z,
-            image_token_num=ns.token_h * ns.token_w,
-            image_size=p.image_size,
-        )
-        uncond_kwargs = dict(
-            image_embeds=image_embeds,
-            kv_uncond=caches["uncond"],
-            idx_uncond=caches["idx_uncond"],
-            mask_uncond=caches["mask_uncond"],
+            input_embeds=image_embeds,
+            past_key_values=caches["cond"],
+            indexes_image=caches["idx_cond"],
+            attn_mask=caches["mask_cond"],
             t=t,
             z=z,
             image_token_num=ns.token_h * ns.token_w,
@@ -1086,6 +1076,16 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         is_it2i = "img_cond" in caches
         if not is_it2i:
             in_interval = t >= p.cfg_interval[0] and t <= p.cfg_interval[1]
+            uncond_kwargs = dict(
+                input_embeds=image_embeds,
+                past_key_values=caches["uncond"],
+                indexes_image=caches["idx_uncond"],
+                attn_mask=caches["mask_uncond"],
+                t=t,
+                z=z,
+                image_token_num=ns.token_h * ns.token_w,
+                image_size=p.image_size,
+            )
             if in_interval and p.cfg_scale > 1:
                 do_true_cfg_t2i = True
                 true_cfg_scale = p.cfg_scale
@@ -1103,16 +1103,6 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             )
             return noise_pred
         else:
-            image_cond_kwargs = dict(
-                image_embeds=image_embeds,
-                kv_cond=caches["img_cond"],
-                idx_cond=caches["idx_img_cond"],
-                mask_cond=caches["mask_img_cond"],
-                t=t,
-                z=z,
-                image_token_num=ns.token_h * ns.token_w,
-                image_size=p.image_size,
-            )
             use_cfg = (t > p.cfg_interval[0] and t < p.cfg_interval[1]) or p.cfg_interval[0] == 0
             needs_cfg = p.cfg_scale != 1 or p.img_cfg_scale != 1
 
@@ -1128,6 +1118,16 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
 
             cfg_norm = p.cfg_norm if (p.cfg_scale > 1 or p.img_cfg_scale > 1) else None
             if p.img_cfg_scale == 1:
+                image_cond_kwargs = dict(
+                    input_embeds=image_embeds,
+                    past_key_values=caches["img_cond"],
+                    indexes_image=caches["idx_img_cond"],
+                    attn_mask=caches["mask_img_cond"],
+                    t=t,
+                    z=z,
+                    image_token_num=ns.token_h * ns.token_w,
+                    image_size=p.image_size,
+                )
                 noise_pred = self.predict_noise_maybe_with_cfg(
                     do_true_cfg=do_true_cfg_it2i,
                     true_cfg_scale=true_cfg_scale,
@@ -1136,6 +1136,16 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
                     cfg_normalize=cfg_norm,
                 )
             elif p.cfg_scale == p.img_cfg_scale:
+                uncond_kwargs = dict(
+                    input_embeds=image_embeds,
+                    past_key_values=caches["uncond"],
+                    indexes_image=caches["idx_uncond"],
+                    attn_mask=caches["mask_uncond"],
+                    t=t,
+                    z=z,
+                    image_token_num=ns.token_h * ns.token_w,
+                    image_size=p.image_size,
+                )
                 noise_pred = self.predict_noise_maybe_with_cfg(
                     do_true_cfg=do_true_cfg_it2i,
                     true_cfg_scale=true_cfg_scale,
@@ -1144,6 +1154,26 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
                     cfg_normalize=cfg_norm,
                 )
             else:
+                uncond_kwargs = dict(
+                    input_embeds=image_embeds,
+                    past_key_values=caches["uncond"],
+                    indexes_image=caches["idx_uncond"],
+                    attn_mask=caches["mask_uncond"],
+                    t=t,
+                    z=z,
+                    image_token_num=ns.token_h * ns.token_w,
+                    image_size=p.image_size,
+                )
+                image_cond_kwargs = dict(
+                    input_embeds=image_embeds,
+                    past_key_values=caches["img_cond"],
+                    indexes_image=caches["idx_img_cond"],
+                    attn_mask=caches["mask_img_cond"],
+                    t=t,
+                    z=z,
+                    image_token_num=ns.token_h * ns.token_w,
+                    image_size=p.image_size,
+                )
                 noise_pred = self.predict_noise_with_multi_branch_cfg(
                     do_true_cfg=do_true_cfg_it2i,
                     true_cfg_scale=true_cfg_scale,
