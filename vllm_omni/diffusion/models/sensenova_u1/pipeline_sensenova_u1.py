@@ -1630,7 +1630,6 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
                 timestep_embeddings = timestep_embeddings + ns_emb
             image_embeds = image_embeds + timestep_embeddings
 
-            # v_pred = self._denoise_step(image_prediction, ns, t, z, image_embeds, caches, p, step_i)
             v_pred = self._denoise(image_prediction, ns, t, z, image_embeds, caches, p, step_i)
             z = z + (t_next - t) * v_pred
             image_prediction = _unpatchify(z, self.patch_size * merge_size, p.image_size[1], p.image_size[0])
