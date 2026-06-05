@@ -3042,8 +3042,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _build_step_audio_editx_prompt(
         self,
         request: OpenAICreateSpeechRequest,
-        *,
-        has_inline_ref_audio: bool = False,
     ) -> dict[str, Any]:
         from vllm_omni.inputs.data import token_inputs_omni
 
@@ -3053,7 +3051,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "ref_text": [request.ref_text],
             "ref_audio": [ref_audio],
         }
-        prompt_len = 489
+        prompt_len = 512
         prompt = token_inputs_omni(
             prompt_token_ids=[0] * prompt_len,
             additional_information=additional_information,
