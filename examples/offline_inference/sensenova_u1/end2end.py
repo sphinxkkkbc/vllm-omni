@@ -26,6 +26,7 @@ See README.md for more examples.
 
 import argparse
 import os
+import time
 
 from PIL import Image
 
@@ -257,12 +258,17 @@ def main():
     else:
         prompt_dict = {"prompt": args.prompt, "modalities": ["image"]}
 
+    t0 = time.perf_counter()
+
     outputs = list(
         omni.generate(
             prompts=prompt_dict,
             sampling_params_list=sampling_params,
         )
     )
+
+    e2e_s = time.perf_counter() - t0
+    print(f"e2e time for generation: {e2e_s:.3f}s")
 
     for req_output in outputs:
         custom = getattr(req_output, "_custom_output", {}) or {}
