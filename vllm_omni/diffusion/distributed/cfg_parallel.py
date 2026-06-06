@@ -195,7 +195,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
         self,
         positive_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
         negative_noise_pred: torch.Tensor | tuple[torch.Tensor, ...],
-        true_cfg_scale: float | dict[str, float],
+        true_cfg_scale: float,
         cfg_normalize: bool = False,
         kwargs: dict[str, Any] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
