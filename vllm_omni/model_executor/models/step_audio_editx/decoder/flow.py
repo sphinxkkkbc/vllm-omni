@@ -6,9 +6,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from vllm.model_executor.layers.linear import (
-    QKVParallelLinear,
     ReplicatedLinear,
-    RowParallelLinear,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -678,11 +676,9 @@ class MLP(torch.nn.Module):
         super().__init__()
         hidden_features = hidden_features or in_features
         out_features = out_features or in_features
-        # self.fc1 = nn.Linear(in_features, hidden_features, bias=bias)
         self.fc1 = ReplicatedLinear(in_features, hidden_features, bias=bias)
         self.act = act_layer()
         self.norm = norm_layer(hidden_features) if norm_layer is not None else nn.Identity()
-        # self.fc2 = nn.Linear(hidden_features, out_features, bias=bias)
         self.fc2 = ReplicatedLinear(hidden_features, out_features, bias=bias)
 
     def forward(self, x):
@@ -702,8 +698,6 @@ class Attention(torch.nn.Module):
         qkv_bias: bool = False,
         qk_norm: bool = False,
         norm_layer: nn.Module = nn.LayerNorm,
-        prefix="",
-        dtype=torch.bfloat16,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -711,34 +705,28 @@ class Attention(torch.nn.Module):
         self.inner_dim = num_heads * head_dim
         self.scale = head_dim**-0.5
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size=dim,
-            head_size=self.head_dim,
-            total_num_heads=self.num_heads,
-            params_dtype=dtype,
-            prefix=f"{prefix}.qkv_proj",
-            bias=qkv_bias,
-        )
+        # Keep DiT attention unfused: QKVParallelLinear/RowParallelLinear causes
+        # measurable decoder drift from the official Step-Audio implementation.
+        self.to_q = nn.Linear(dim, self.inner_dim, bias=qkv_bias)
+        self.to_k = nn.Linear(dim, self.inner_dim, bias=qkv_bias)
+        self.to_v = nn.Linear(dim, self.inner_dim, bias=qkv_bias)
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.proj = nn.Linear(self.inner_dim, dim)
 
-        self.q_norm = norm_layer(self.head_dim, dtype=dtype) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim, dtype=dtype) if qk_norm else nn.Identity()
-
-        self.proj = RowParallelLinear(
-            input_size=self.inner_dim,
-            output_size=dim,
-            params_dtype=dtype,
-            bias=True,
-        )
+    def get_qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        b, t, _ = x.shape
+        q = self.to_q(x).view(b, t, self.num_heads, self.head_dim)
+        k = self.to_k(x).view(b, t, self.num_heads, self.head_dim)
+        v = self.to_v(x).view(b, t, self.num_heads, self.head_dim)
+        q = q.reshape(b, t, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(b, t, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(b, t, self.num_heads, self.head_dim).transpose(1, 2)
+        return q, k, v
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
         b, t, c = x.shape
-        qkv, _ = self.qkv_proj(x)
-        qkv = qkv.view(b, t, -1, self.head_dim)
-        q, k, v = qkv.chunk(3, dim=2)
-
-        q = q.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)  # (b, nh, t, c)
-        k = k.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)
-        v = v.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)
+        q, k, v = self.get_qkv(x)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -751,17 +739,11 @@ class Attention(torch.nn.Module):
             attn_mask=attn_mask,
         )  # (b, nh, t, c)
         x = x.transpose(1, 2).reshape(b, t, -1)
-        x, _ = self.proj(x)
-        return x
+        return self.proj(x)
 
     def forward_chunk(self, x: torch.Tensor, att_cache: torch.Tensor = None, attn_mask: torch.Tensor = None):
         b, t, c = x.shape
-        qkv, _ = self.qkv_proj(x)
-        qkv = qkv.view(b, t, -1, self.head_dim)
-        q, k, v = qkv.chunk(3, dim=2)
-        q = q.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)  # (b, nh, t, c)
-        k = k.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)
-        v = v.reshape(b, t, self.num_heads, c // self.num_heads).transpose(1, 2)
+        q, k, v = self.get_qkv(x)
         q = self.q_norm(q)
         k = self.k_norm(k)
         if att_cache is not None:
@@ -782,8 +764,7 @@ class Attention(torch.nn.Module):
             attn_mask = attn_mask.unsqueeze(1)
         x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)  # (b, nh, t, c)
         x = x.transpose(1, 2).reshape(b, t, -1)
-        x = self.proj(x)
-        return x, new_att_cache
+        return self.proj(x), new_att_cache
 
 
 def modulate(x, shift, scale):
@@ -943,7 +924,8 @@ class DiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp, shift_conv, scale_conv, gate_conv = (
             self.adaLN_modulation(c).chunk(9, dim=-1)
         )
-        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), attn_mask)
+        attn_in = modulate(self.norm1(x), shift_msa, scale_msa)
+        x = x + gate_msa * self.attn(attn_in, attn_mask)
         x = x + gate_conv * self.conv(modulate(self.norm3(x), shift_conv, scale_conv))
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
@@ -1140,6 +1122,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         prompt_token,
         prompt_token_len,
         prompt_feat,
+        prompt_feat_len,
         embedding,
         n_timesteps: int = 10,
     ):

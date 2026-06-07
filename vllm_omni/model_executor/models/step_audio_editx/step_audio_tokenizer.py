@@ -468,10 +468,8 @@ class StepAudioTokenizer:
             )
         elif edit_type == "paralinguistic":
             instruct_prefix = (
-                "Add some non-verbal sounds to make the audio more natural, "
-                f"the new text is : {text}\n"
-                "  The text corresponding to the audio is: "
-                f"{audio_text}\n"
+                f"Add some non-verbal sounds to make the audio more natural, the new text is : {text}\n"
+                f"  The text corresponding to the audio is: {audio_text}\n"
             )
         else:
             logger.error("Unsupported audio editing type: %s", edit_type)

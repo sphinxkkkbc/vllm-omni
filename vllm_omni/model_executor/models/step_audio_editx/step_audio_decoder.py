@@ -5,7 +5,6 @@ from collections import defaultdict
 from collections.abc import Iterable
 from copy import deepcopy
 from functools import cached_property, reduce
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -105,12 +104,7 @@ class CosyVoice(nn.Module):
         encoder = UpsampleConformerEncoderV2(**flow_cfg["encoder"])
 
         estimator = DiT(**decoder_cfg["estimator"])
-        cfm_params = SimpleNamespace(**decoder_cfg["cfm_params"])
         decoder = CausalConditionalCFM(
-            # in_channels=decoder_cfg["in_channels"],
-            # n_spks=decoder_cfg["n_spks"],
-            # spk_emb_dim=decoder_cfg["spk_emb_dim"],
-            # cfm_params=cfm_params,
             estimator=estimator,
         )
 
@@ -158,7 +152,6 @@ class CosyVoice(nn.Module):
 
         speech_feat = speech_feat.to(flow_device, flow_dtype)
         speech_embedding = speech_embedding.to(flow_device, flow_dtype)
-        print(f"cosyvoice_input_ids: {token}")
 
         def _make_len(ts: torch.Tensor):
             return torch.tensor([ts.shape[1]], dtype=torch.long, device=ts.device)
@@ -179,6 +172,7 @@ class CosyVoice(nn.Module):
             prompt_token,
             _make_len(prompt_token),
             speech_feat.to(self.dtype),
+            _make_len(speech_feat),
             speech_embedding.to(self.dtype),
             self.n_timesteps,
         )
@@ -465,12 +459,6 @@ class StepAudioCode2wav(nn.Module):
         model_path = os.path.join(self.model_path, "CosyVoice-300M-25Hz")
         flow_weights = torch.load(f"{model_path}/flow.pt", map_location=self.core.device)
         hift_weights = torch.load(f"{model_path}/hift.pt", map_location=self.core.device)
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("attn.qkv_proj", "attn.to_q", "q"),
-            ("attn.qkv_proj", "attn.to_k", "k"),
-            ("attn.qkv_proj", "attn.to_v", "v"),
-        ]
         for name, loaded_weight in flow_weights.items():
             mapped_name = f"core.flow.{name}"
             if name in params_dict:
@@ -478,23 +466,10 @@ class StepAudioCode2wav(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 try:
                     weight_loader(param, loaded_weight)
-                    # print(f"loaded weight from {name} to {name}")
                 except AssertionError as err:
                     raise AssertionError(f"Failed to load weight {name!r} as {name!r}") from err
                 loaded_params.add(mapped_name)
                 continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                stacked_name = name.replace(weight_name, param_name)
-                if stacked_name not in params_dict:
-                    continue
-                param = params_dict[stacked_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, shard_id)
-                # print(f"loaded weight from {stacked_name} to {name}")
-                loaded_params.add(stacked_name)
-                break
 
         params_dict = dict(self.core.hift.named_parameters())
         for name, loaded_weight in hift_weights.items():
@@ -504,21 +479,8 @@ class StepAudioCode2wav(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 try:
                     weight_loader(param, loaded_weight)
-                    # print(f"loaded weight from {name} to {name}")
                 except AssertionError as err:
                     raise AssertionError(f"Failed to load weight {name!r} as {name!r}") from err
                 loaded_params.add(mapped_name)
                 continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                stacked_name = name.replace(weight_name, param_name)
-                if stacked_name not in params_dict:
-                    continue
-                param = params_dict[stacked_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, shard_id)
-                # print(f"loaded weight from {stacked_name} to {name}")
-                loaded_params.add(stacked_name)
-                break
         return loaded_params
