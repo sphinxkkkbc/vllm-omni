@@ -1198,7 +1198,6 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
                     },
                     branches_kwargs=[cond_kwargs, image_cond_kwargs, uncond_kwargs],
                     cfg_normalize=cfg_norm,
-                    kwargs={"is_it2i": is_it2i},
                 )
             return noise_pred
 
