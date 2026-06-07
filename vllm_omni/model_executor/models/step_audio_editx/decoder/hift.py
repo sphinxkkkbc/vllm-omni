@@ -1,6 +1,5 @@
+import torch
 import torch.nn as nn
-
-from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import CausalConv1d, CausalConvRNNF0Predictor
 
 try:
     from torch.nn.utils.parametrizations import weight_norm
@@ -8,33 +7,31 @@ except ImportError:
     from torch.nn.utils import weight_norm
 
 
-class StepAudioCausalConvRNNF0Predictor(CausalConvRNNF0Predictor):
+class StepAudioCausalConvRNNF0Predictor(nn.Module):
     def __init__(
         self,
         num_class: int = 1,
         in_channels: int = 80,
         cond_channels: int = 512,
     ):
-        nn.Module.__init__(self)
+        super().__init__()
 
         self.num_class = num_class
         self.condnet = nn.Sequential(
-            weight_norm(
-                CausalConv1d(
-                    in_channels,
-                    cond_channels,
-                    kernel_size=3,
-                    causal_type="right",
-                )
-            ),
+            weight_norm(nn.Conv1d(in_channels, cond_channels, kernel_size=3, padding=1)),
             nn.ELU(),
-            weight_norm(CausalConv1d(cond_channels, cond_channels, kernel_size=3, causal_type="left")),
+            weight_norm(nn.Conv1d(cond_channels, cond_channels, kernel_size=3, padding=1)),
             nn.ELU(),
-            weight_norm(CausalConv1d(cond_channels, cond_channels, kernel_size=3, causal_type="left")),
+            weight_norm(nn.Conv1d(cond_channels, cond_channels, kernel_size=3, padding=1)),
             nn.ELU(),
-            weight_norm(CausalConv1d(cond_channels, cond_channels, kernel_size=3, causal_type="left")),
+            weight_norm(nn.Conv1d(cond_channels, cond_channels, kernel_size=3, padding=1)),
             nn.ELU(),
-            weight_norm(CausalConv1d(cond_channels, cond_channels, kernel_size=3, causal_type="left")),
+            weight_norm(nn.Conv1d(cond_channels, cond_channels, kernel_size=3, padding=1)),
             nn.ELU(),
         )
         self.classifier = nn.Linear(in_features=cond_channels, out_features=self.num_class)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.condnet(x)
+        x = x.transpose(1, 2)
+        return torch.abs(self.classifier(x).squeeze(-1))

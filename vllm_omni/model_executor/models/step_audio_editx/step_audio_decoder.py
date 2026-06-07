@@ -19,7 +19,7 @@ import yaml
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalConditionalCFM
+# from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalConditionalCFM
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
 from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -31,6 +31,7 @@ from vllm_omni.model_executor.models.step_audio_editx.decoder.flow import (
 )
 from vllm_omni.model_executor.models.step_audio_editx.decoder.hift import StepAudioCausalConvRNNF0Predictor
 
+from .decoder.cfm import CausalConditionalCFM
 from .step_audio_tokenizer import StepAudioTokenizer
 
 logger = logging.getLogger(__name__)
@@ -106,10 +107,10 @@ class CosyVoice(nn.Module):
         estimator = DiT(**decoder_cfg["estimator"])
         cfm_params = SimpleNamespace(**decoder_cfg["cfm_params"])
         decoder = CausalConditionalCFM(
-            in_channels=decoder_cfg["in_channels"],
-            n_spks=decoder_cfg["n_spks"],
-            spk_emb_dim=decoder_cfg["spk_emb_dim"],
-            cfm_params=cfm_params,
+            # in_channels=decoder_cfg["in_channels"],
+            # n_spks=decoder_cfg["n_spks"],
+            # spk_emb_dim=decoder_cfg["spk_emb_dim"],
+            # cfm_params=cfm_params,
             estimator=estimator,
         )
 
@@ -178,11 +179,11 @@ class CosyVoice(nn.Module):
             prompt_token,
             _make_len(prompt_token),
             speech_feat.to(self.dtype),
-            # _make_len(speech_feat),
             speech_embedding.to(self.dtype),
             self.n_timesteps,
         )
-        mel = mel.to(flow_device, flow_dtype)
+        hift_dtype = next(self.hift.parameters()).dtype
+        mel = mel.to(self.device, hift_dtype)
         speech, _ = self.hift.inference(mel)
         # return speech.cpu().to(torch.float32)
         return speech
@@ -409,7 +410,8 @@ class StepAudioCode2wav(nn.Module):
             and isinstance(runtime_additional_information[0], dict)
         ):
             ref = runtime_additional_information[0].get("codes", {}).get("audio")
-            return ref, kwargs.get("sample_rate")
+            ref_audio, sr = StepAudioTokenizer._load_audio(ref, kwargs.get("sample_rate"))
+            return ref_audio, sr
         return kwargs.get("input_wav"), kwargs.get("sample_rate")
 
     @staticmethod
@@ -439,6 +441,7 @@ class StepAudioCode2wav(nn.Module):
         token = input_ids.reshape(-1)
         prompt_token = self._extract_prompt_token(runtime_additional_information, kwargs)
         input_wav, sample_rate = self._extract_runtime_inputs(runtime_additional_information, kwargs)
+        logger.info(f"input_wav:{input_wav}, sample_rate:{sample_rate}")
         if input_wav is not None:
             input_wav, sample_rate = self.preprocess_wav(input_wav, sample_rate)
         if prompt_token is None:

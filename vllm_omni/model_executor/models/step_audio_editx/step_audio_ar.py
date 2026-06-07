@@ -54,7 +54,10 @@ class StepAudioAR(nn.Module):
                 return x[0] if x else default
             return x if x is not None else default
 
-        ref_audio = _first(info_dict.get("ref_audio"), None)
+        audio = _first(info_dict.get("ref_audio"), None)
+        sample_rate = _first(info_dict.get("sr"), 16000)
+        ref_audio, sr = self.tokenizer._load_audio(audio, sample_rate)
+        logger.info(f"ref_audio: {ref_audio}, sr: {sr}")
         ref_text = _first(info_dict.get("ref_text"), "")
         text = _first(info_dict.get("text"), "")
         task_type = _first(info_dict.get("task_type"), "clone")
@@ -65,7 +68,6 @@ class StepAudioAR(nn.Module):
             edit_info = _first(info_dict.get("edit_info"), None)
             prompt = (ref_text, edit_type, edit_info, text)
 
-        sr = _first(info_dict.get("sr"), 16000)
         # logger.info(f"ref_audio: {ref_audio}, ref_text: {ref_text}, text: {text}, sr: {sr}")
         prompt_token, codec_token = self.tokenizer.encode(task_type, audio=ref_audio, prompt=prompt, sr=sr)
         logger.info(f"prompt_token: {prompt_token}, len(input_ids): {len(prompt_token.input_ids)}")

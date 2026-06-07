@@ -255,7 +255,8 @@ class StepAudioTokenizer:
         raise TypeError(f"Unsupported prompt_wav type: {type(prompt_wav)}")
 
     def preprocess_wav(self, audio, sample_rate, enable_trim=True, energy_norm=True):
-        audio, sample_rate = self._load_audio(audio)
+        audio, sample_rate = self._load_audio(audio, sample_rate)
+
         if audio.shape[0] > 1:
             audio = audio.mean(dim=0, keepdim=True)
 

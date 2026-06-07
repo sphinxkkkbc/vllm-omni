@@ -218,15 +218,12 @@ def run_e2e():
     prompt_len = len(prompt_token_ids)
     max_tokens = 8192 - prompt_len
 
-    gpt_sampling = SamplingParams(temperature=0.7, max_tokens=max_tokens, skip_special_tokens=False)
-    s2mel_sampling = SamplingParams(
-        temperature=1.0,
-        top_p=1.0,
-        top_k=-1,
-        repetition_penalty=2.0,
-        max_tokens=256,
-        detokenize=False,
+    gpt_sampling = SamplingParams(
+        temperature=0.7,
+        max_tokens=max_tokens,
+        skip_special_tokens=False,
     )
+    s2mel_sampling = SamplingParams(temperature=0.7, max_tokens=max_tokens, skip_special_tokens=False)
     sampling_params_list = [gpt_sampling, s2mel_sampling]
     outputs = list(omni.generate(inputs, sampling_params_list=sampling_params_list))
 

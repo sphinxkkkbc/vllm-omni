@@ -435,7 +435,7 @@ class ParaformerStreaming(Paraformer):
                 speech_lengths: (Batch, )
                 ind: int
         """
-        with autocast(device_type="cuda"):
+        with autocast(device_type="cuda", enabled=False):
             # Normalization for feature: e.g. Global-CMVN, Utterance-CMVN
             if self.normalize is not None:
                 speech, speech_lengths = self.normalize(speech, speech_lengths)

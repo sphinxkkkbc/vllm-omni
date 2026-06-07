@@ -83,8 +83,10 @@ class RelPositionMultiHeadedAttention(nn.Module):
         # # linear transformation for positional encoding
         # these two learnable bias are used in matrix c and matrix d
         # as described in https://arxiv.org/abs/1901.02860 Section 3.3
-        self.pos_bias_u = nn.Parameter(torch.randn(self.h, self.d_k)).to(device="cuda")
-        self.pos_bias_v = nn.Parameter(torch.randn(self.h, self.d_k)).to(device="cuda")
+        self.pos_bias_u = nn.Parameter(torch.empty(self.h, self.d_k))
+        self.pos_bias_v = nn.Parameter(torch.empty(self.h, self.d_k))
+        torch.nn.init.xavier_uniform_(self.pos_bias_u)
+        torch.nn.init.xavier_uniform_(self.pos_bias_v)
         # torch.nn.init.xavier_uniform_(self.pos_bias_u)
         # torch.nn.init.xavier_uniform_(self.pos_bias_v)
 
@@ -725,7 +727,7 @@ class Attention(torch.nn.Module):
             input_size=self.inner_dim,
             output_size=dim,
             params_dtype=dtype,
-            bias=False,
+            bias=True,
         )
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
@@ -1168,7 +1170,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
 
         mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
 
-        feat, _ = self.decoder.forward(
+        feat = self.decoder.forward(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask.unsqueeze(1),
             spks=embedding,
