@@ -48,7 +48,7 @@ class WavFrontendOnline(nn.Module):
         filter_length_max: int = -1,
         lfr_m: int = 1,
         lfr_n: int = 1,
-        dither: float = 1.0,
+        dither: float = 0.0,
         snip_edges: bool = True,
         upsacle_samples: bool = True,
         **kwargs,

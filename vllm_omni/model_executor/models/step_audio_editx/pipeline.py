@@ -31,10 +31,6 @@ STEP_AUDIO_EDITX_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
-            sampling_constraints={
-                # merged speech stop token (logsumexp of all 200 stop logits)
-                "stop_token_ids": [6562],
-            },
         ),
         StagePipelineConfig(
             stage_id=1,

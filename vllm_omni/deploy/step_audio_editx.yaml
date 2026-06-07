@@ -14,8 +14,7 @@ stages:
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       engine_output_type: latent
     default_sampling_params:
-      temperature: 0.9
-      top_k: 50
+      temperature: 0.7
       max_tokens: 2048
     gpu_memory_utilization: 0.4
 
