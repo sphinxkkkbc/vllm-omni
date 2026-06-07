@@ -76,7 +76,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
     def predict_noise_maybe_with_cfg(
         self,
         do_true_cfg: bool,
-        true_cfg_scale: float | dict[str, float],
+        true_cfg_scale: float,
         positive_kwargs: dict[str, Any],
         negative_kwargs: dict[str, Any] | None,
         cfg_normalize: bool = True,
@@ -129,21 +129,13 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 negative_noise_pred = tuple(g[1] for g in gathered)
 
                 # All ranks compute combine (deterministic, same result)
-                if kwargs is None:
-                    return self.combine_cfg_noise(
-                        positive_noise_pred,
-                        negative_noise_pred,
-                        true_cfg_scale,
-                        cfg_normalize,
-                    )
-                else:
-                    return self.combine_cfg_noise(
-                        positive_noise_pred,
-                        negative_noise_pred,
-                        true_cfg_scale,
-                        cfg_normalize,
-                        kwargs=kwargs,
-                    )
+                return self.combine_cfg_noise(
+                    positive_noise_pred,
+                    negative_noise_pred,
+                    true_cfg_scale,
+                    cfg_normalize,
+                    **({} if kwargs is None else {"kwargs": kwargs}),
+                )
             else:
                 # Sequential CFG: compute both positive and negative
                 positive_noise_pred = _wrap(self.predict_noise(**positive_kwargs))
@@ -153,21 +145,13 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     positive_noise_pred = _slice_pred(positive_noise_pred, output_slice)
                     negative_noise_pred = _slice_pred(negative_noise_pred, output_slice)
 
-                if kwargs is None:
-                    return self.combine_cfg_noise(
-                        positive_noise_pred,
-                        negative_noise_pred,
-                        true_cfg_scale,
-                        cfg_normalize,
-                    )
-                else:
-                    return self.combine_cfg_noise(
-                        positive_noise_pred,
-                        negative_noise_pred,
-                        true_cfg_scale,
-                        cfg_normalize,
-                        kwargs=kwargs,
-                    )
+                return self.combine_cfg_noise(
+                    positive_noise_pred,
+                    negative_noise_pred,
+                    true_cfg_scale,
+                    cfg_normalize,
+                    **({} if kwargs is None else {"kwargs": kwargs}),
+                )
         else:
             # No CFG: only compute positive/conditional prediction
             pred = self.predict_noise(**positive_kwargs)

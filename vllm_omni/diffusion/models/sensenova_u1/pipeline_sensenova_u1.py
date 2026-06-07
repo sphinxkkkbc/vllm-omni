@@ -1113,12 +1113,12 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             timesteps=timesteps,
         )
 
-    def _get_cfg_kwargs(self, caches: dict, image_embeds, t, z, ns, p, branch: str):
+    def _get_cfg_kwargs(self, caches: dict, image_embeds, t, z, ns, p, branch: str, cache_dit_skip: bool = False):
         required = (branch, f"idx_{branch}", f"mask_{branch}")
         missing = [key for key in required if key not in caches]
         if missing:
             raise KeyError(f"Missing {branch} CFG cache keys: {missing}")
-        return dict(
+        kwargs = dict(
             input_embeds=image_embeds,
             past_key_values=caches[branch],
             indexes_image=caches[f"idx_{branch}"],
@@ -1128,23 +1128,25 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             image_token_num=ns.token_h * ns.token_w,
             image_size=p.image_size,
         )
+        if cache_dit_skip:
+            kwargs["cache_dit_skip"] = True
+        return kwargs
 
-    def _denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i):
-        cond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, "cond")
-        is_it2i = "img_cond" in caches
+    def _denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i):
         if not is_it2i:
-            in_interval = t >= p.cfg_interval[0] and t <= p.cfg_interval[1]
-            uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, "uncond")
-            if in_interval and p.cfg_scale > 1:
-                do_true_cfg_t2i = True
-                true_cfg_scale = p.cfg_scale
-            else:
-                do_true_cfg_t2i = False
-                true_cfg_scale = 1.0
+            has_cached_partner = t >= p.cfg_interval[0] and t <= p.cfg_interval[1] and p.cfg_scale > 1
+            cond_kwargs = self._get_cfg_kwargs(
+                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not has_cached_partner
+            )
 
+            in_interval = t >= p.cfg_interval[0] and t <= p.cfg_interval[1]
+            if not (in_interval and p.cfg_scale > 1):
+                return self.predict_noise(**cond_kwargs)
+
+            uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="uncond")
             noise_pred = self.predict_noise_maybe_with_cfg(
-                do_true_cfg=do_true_cfg_t2i,
-                true_cfg_scale=true_cfg_scale,
+                do_true_cfg=True,
+                true_cfg_scale=p.cfg_scale,
                 positive_kwargs=cond_kwargs,
                 negative_kwargs=uncond_kwargs,
                 cfg_normalize=p.cfg_norm,
@@ -1154,17 +1156,19 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         else:
             use_cfg = (t > p.cfg_interval[0] and t < p.cfg_interval[1]) or p.cfg_interval[0] == 0
             needs_cfg = p.cfg_scale != 1 or p.img_cfg_scale != 1
+            has_cached_partner = use_cfg and needs_cfg
+            cond_kwargs = self._get_cfg_kwargs(
+                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not has_cached_partner
+            )
 
             if not use_cfg or not needs_cfg:
-                do_true_cfg_it2i = False
-                true_cfg_scale = 1.0
-            else:
-                do_true_cfg_it2i = True
+                return self.predict_noise(**cond_kwargs)
+
             cfg_norm = p.cfg_norm if (p.cfg_scale > 1 or p.img_cfg_scale > 1) else None
             if p.img_cfg_scale == 1:
-                image_cond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, "img_cond")
+                image_cond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="img_cond")
                 noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_true_cfg_it2i,
+                    do_true_cfg=True,
                     true_cfg_scale=p.cfg_scale,
                     positive_kwargs=cond_kwargs,
                     negative_kwargs=image_cond_kwargs,
@@ -1172,9 +1176,9 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
                     kwargs={"is_it2i": is_it2i},
                 )
             elif p.cfg_scale == p.img_cfg_scale:
-                uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, "uncond")
+                uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="uncond")
                 noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_true_cfg_it2i,
+                    do_true_cfg=True,
                     true_cfg_scale=p.cfg_scale,
                     positive_kwargs=cond_kwargs,
                     negative_kwargs=uncond_kwargs,
@@ -1182,10 +1186,12 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
                     kwargs={"is_it2i": is_it2i},
                 )
             else:
-                image_cond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, "img_cond")
-                uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, "uncond")
+                image_cond_kwargs = self._get_cfg_kwargs(
+                    caches, image_embeds, t, z, ns, p, branch="img_cond", cache_dit_skip=True
+                )
+                uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="uncond")
                 noise_pred = self.predict_noise_with_multi_branch_cfg(
-                    do_true_cfg=do_true_cfg_it2i,
+                    do_true_cfg=True,
                     true_cfg_scale={
                         "cfg_scale": p.cfg_scale,
                         "img_cfg_scale": p.img_cfg_scale,
@@ -1195,10 +1201,6 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
                     kwargs={"is_it2i": is_it2i},
                 )
             return noise_pred
-
-    def scheduler_step(self, noise_pred, t_next, t, latents):
-        latents = latents + (t_next - t) * noise_pred
-        return latents
 
     def predict_noise(self, **kwargs):
         return self._t2i_predict_v(**kwargs)
@@ -1226,6 +1228,8 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
                 out_cond * 0.0 if step_i <= 0 else (out_uncond * alpha + cfg_scale * (out_cond - out_uncond * alpha))
             )
         else:
+            if cfg_norm == "cfg_zero_star":
+                logger.warning("cfg_zero_star is T2I-only; please use 'global' or 'channel' instead.")
             # cfg_zero_star is T2I-only; _apply_cfg_norm treats it as a no-op for IT2I.
             v_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
             v_pred = self._apply_cfg_norm(v_pred, out_cond, cfg_norm)
@@ -1240,125 +1244,6 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
         v_pred = out_uncond + cfg_scale * (out_cond - out_img_cond) + img_cfg_scale * (out_img_cond - out_uncond)
         if cfg_scale > 1 or img_cfg_scale > 1:
             v_pred = self._apply_cfg_norm(v_pred, out_cond, cfg_normalize)
-        return v_pred
-
-    def _denoise_step(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i):
-        """Execute one denoising step with the appropriate CFG strategy."""
-        kv_cond = caches["cond"]
-        idx_cond = caches["idx_cond"]
-        mask_cond = caches["mask_cond"]
-        is_it2i = "img_cond" in caches
-        if is_it2i:
-            use_cfg = (t > p.cfg_interval[0] and t < p.cfg_interval[1]) or p.cfg_interval[0] == 0
-            needs_cfg = not (p.cfg_scale == 1 and p.img_cfg_scale == 1)
-            has_cached_partner = use_cfg and needs_cfg
-        else:
-            has_cached_partner = t >= p.cfg_interval[0] and t <= p.cfg_interval[1] and p.cfg_scale > 1
-
-        out_cond = self._t2i_predict_v(
-            image_embeds,
-            idx_cond,
-            mask_cond,
-            kv_cond,
-            t,
-            z,
-            image_token_num=ns.token_h * ns.token_w,
-            image_size=p.image_size,
-            cache_dit_skip=not has_cached_partner,
-        )
-
-        if is_it2i:
-            return self._denoise_step_it2i(out_cond, image_embeds, ns, t, z, caches, p, step_i)
-        return self._denoise_step_t2i(out_cond, image_embeds, ns, t, z, caches, p, step_i)
-
-    def _denoise_step_t2i(self, out_cond, image_embeds, ns, t, z, caches, p, step_i):
-        """T2I: two-way CFG (condition vs uncondition), supports cfg_zero_star."""
-        if t >= p.cfg_interval[0] and t <= p.cfg_interval[1] and p.cfg_scale > 1:
-            out_uncond = self._t2i_predict_v(
-                image_embeds,
-                caches["idx_uncond"],
-                caches["mask_uncond"],
-                caches["uncond"],
-                t,
-                z,
-                image_token_num=ns.token_h * ns.token_w,
-                image_size=p.image_size,
-            )
-            if p.cfg_norm == "cfg_zero_star":
-                pos_flat = out_cond.view(p.batch_size, -1)
-                neg_flat = out_uncond.view(p.batch_size, -1)
-                alpha = _optimized_scale(pos_flat, neg_flat)
-                alpha = alpha.view(p.batch_size, *([1] * (len(out_cond.shape) - 1))).to(pos_flat.dtype)
-                v_pred = (
-                    out_cond * 0.0
-                    if step_i <= 0
-                    else (out_uncond * alpha + p.cfg_scale * (out_cond - out_uncond * alpha))
-                )
-            else:
-                v_pred = out_uncond + p.cfg_scale * (out_cond - out_uncond)
-                v_pred = self._apply_cfg_norm(v_pred, out_cond, p.cfg_norm)
-        else:
-            v_pred = out_cond
-        return v_pred
-
-    def _denoise_step_it2i(self, out_cond, image_embeds, ns, t, z, caches, p, step_i):
-        """IT2I: dual CFG with ``cfg_scale`` (text) and ``img_cfg_scale`` (image)."""
-        use_cfg = (t > p.cfg_interval[0] and t < p.cfg_interval[1]) or p.cfg_interval[0] == 0
-        needs_cfg = not (p.cfg_scale == 1 and p.img_cfg_scale == 1)
-
-        if not use_cfg or not needs_cfg:
-            return out_cond
-
-        predict_kw = dict(image_token_num=ns.token_h * ns.token_w, image_size=p.image_size)
-
-        if p.img_cfg_scale == 1:
-            out_img_cond = self._t2i_predict_v(
-                image_embeds,
-                caches["idx_img_cond"],
-                caches["mask_img_cond"],
-                caches["img_cond"],
-                t,
-                z,
-                **predict_kw,
-            )
-            v_pred = out_img_cond + p.cfg_scale * (out_cond - out_img_cond)
-        elif p.cfg_scale == p.img_cfg_scale:
-            out_uncond = self._t2i_predict_v(
-                image_embeds,
-                caches["idx_uncond"],
-                caches["mask_uncond"],
-                caches["uncond"],
-                t,
-                z,
-                **predict_kw,
-            )
-            v_pred = out_uncond + p.cfg_scale * (out_cond - out_uncond)
-        else:
-            out_img_cond = self._t2i_predict_v(
-                image_embeds,
-                caches["idx_img_cond"],
-                caches["mask_img_cond"],
-                caches["img_cond"],
-                t,
-                z,
-                cache_dit_skip=True,
-                **predict_kw,
-            )
-            out_uncond = self._t2i_predict_v(
-                image_embeds,
-                caches["idx_uncond"],
-                caches["mask_uncond"],
-                caches["uncond"],
-                t,
-                z,
-                **predict_kw,
-            )
-            v_pred = (
-                out_uncond + p.cfg_scale * (out_cond - out_img_cond) + p.img_cfg_scale * (out_img_cond - out_uncond)
-            )
-
-        if p.cfg_scale > 1 or p.img_cfg_scale > 1:
-            v_pred = self._apply_cfg_norm(v_pred, out_cond, p.cfg_norm)
         return v_pred
 
     @staticmethod
@@ -1439,7 +1324,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             "idx_uncond": indexes_image_uncond,
             "mask_uncond": {"full_attention": None},
         }
-        return self._run_denoising_loop(ns, caches, p, think_text)
+        return self._run_denoising_loop(ns, caches, p, think_text, is_it2i=False)
 
     def _forward_it2i(self, p, input_images: list[Image.Image]) -> DiffusionOutput:
         """Image-to-image (editing) generation path with dual CFG."""
@@ -1555,9 +1440,9 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
             if key in caches and not isinstance(caches[key], dict):
                 self._expand_and_prepare_kv(caches[key], ns.token_h * ns.token_w, p.batch_size)
 
-        return self._run_denoising_loop(ns, caches, p, think_text)
+        return self._run_denoising_loop(ns, caches, p, think_text, is_it2i=True)
 
-    def _run_denoising_loop(self, ns, caches, p, think_text="") -> DiffusionOutput:
+    def _run_denoising_loop(self, ns, caches, p, think_text="", is_it2i: bool = False) -> DiffusionOutput:
         """Shared denoising loop for both T2I and IT2I."""
         merge_size = self.merge_size
         image_prediction = ns.image_prediction
@@ -1590,7 +1475,7 @@ class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipeli
                 timestep_embeddings = timestep_embeddings + ns_emb
             image_embeds = image_embeds + timestep_embeddings
 
-            v_pred = self._denoise(image_prediction, ns, t, z, image_embeds, caches, p, step_i)
+            v_pred = self._denoise(image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i)
             z = z + (t_next - t) * v_pred
             image_prediction = _unpatchify(z, self.patch_size * merge_size, p.image_size[1], p.image_size[0])
 
