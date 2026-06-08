@@ -1,8 +1,5 @@
-"""OpenAI-compatible client for Qwen3-TTS via /v1/audio/speech endpoint.
-
-This script demonstrates how to use the OpenAI-compatible speech API
-to generate audio from text using Qwen3-TTS models.
-
+"""
+Offline Inference for Step-Audio-Editx.
 Examples:
     # Voice Clone
     python3 step_audio_editx/offline_inference.py \

@@ -1,12 +1,12 @@
+import base64
 import io
 import logging
 import os
 import os.path
-import tempfile
 import threading
 import time
 from collections.abc import Iterable
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import onnxruntime
@@ -205,52 +205,94 @@ class StepAudioTokenizer:
         return token_ids
 
     @staticmethod
-    def _load_audio(prompt_wav, prompt_wav_sr: int | None = None):
+    def _load_audio(prompt_wav, prompt_wav_sr: int | list[int] | tuple[int, ...] | None = None):
+        # Single explicit pair: (audio, sr)
+        if isinstance(prompt_wav, tuple) and len(prompt_wav) == 2 and isinstance(prompt_wav[1], (int, np.integer)):
+            return StepAudioTokenizer._load_audio(prompt_wav[0], int(prompt_wav[1]))
+
+        # Batch input: [audio1, audio2, ...]
         if isinstance(prompt_wav, list):
-            prompt_wav = prompt_wav[0]
+            if prompt_wav_sr is None:
+                prompt_wav_sr_list = [None] * len(prompt_wav)
+            elif isinstance(prompt_wav_sr, (int, np.integer)):
+                prompt_wav_sr_list = [int(prompt_wav_sr)] * len(prompt_wav)
+            else:
+                if len(prompt_wav_sr) != len(prompt_wav):
+                    raise ValueError(
+                        "prompt_wav_sr length must match prompt_wav length "
+                        f"({len(prompt_wav_sr)} != {len(prompt_wav)})."
+                    )
+                prompt_wav_sr_list = list(prompt_wav_sr)
+
+            return [
+                StepAudioTokenizer._load_audio(item, item_sr) for item, item_sr in zip(prompt_wav, prompt_wav_sr_list)
+            ]
+
+        # Tuple that is not (audio, sr) is ambiguous.
+        if isinstance(prompt_wav, tuple):
+            raise TypeError("prompt_wav tuple must be (audio, sample_rate). Use a list for batched audio inputs.")
+
         if isinstance(prompt_wav, torch.Tensor):
             if prompt_wav_sr is None:
                 raise ValueError("Tensor audio requires prompt_wav_sr.")
-            return prompt_wav, int(prompt_wav_sr)
+            wav = prompt_wav.detach().to(dtype=torch.float32)
+            if wav.ndim == 1:
+                wav = wav.unsqueeze(0)
+            elif wav.ndim != 2:
+                raise ValueError(f"Tensor audio must be 1D or 2D, got {tuple(wav.shape)}")
+            return wav.contiguous(), int(prompt_wav_sr)
 
         if isinstance(prompt_wav, np.ndarray):
             if prompt_wav_sr is None:
                 raise ValueError("NumPy audio requires prompt_wav_sr.")
-            wav = torch.from_numpy(prompt_wav.astype(np.float32))
+            wav = torch.from_numpy(prompt_wav.astype(np.float32, copy=False))
             if wav.ndim == 1:
                 wav = wav.unsqueeze(0)
-            return wav, int(prompt_wav_sr)
+            elif wav.ndim == 2:
+                # NumPy audio from callers is often [T, C]; model wants [C, T].
+                if wav.shape[0] > wav.shape[1] and wav.shape[1] <= 8:
+                    wav = wav.transpose(0, 1)
+            else:
+                raise ValueError(f"NumPy audio must be 1D or 2D, got {prompt_wav.shape}")
+            return wav.contiguous(), int(prompt_wav_sr)
 
         if isinstance(prompt_wav, str):
-            if prompt_wav.startswith("data:audio"):
-                import base64
-                import io
+            audio = prompt_wav
+            parsed = urlparse(audio)
 
-                _, b64_data = prompt_wav.split(",", 1)
-                audio_bytes = base64.b64decode(b64_data)
+            if audio.startswith("data:"):
+                header, sep, payload = audio.partition(",")
+                if not sep:
+                    raise ValueError("Invalid audio data URL: missing comma separator.")
+                if not header.startswith("data:audio/"):
+                    raise ValueError(f"Unsupported data URL MIME type: {header}")
+                if ";base64" not in header:
+                    raise ValueError("Only base64 audio data URLs are supported.")
+                audio_bytes = base64.b64decode(payload)
                 data, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=False)
-                if data.ndim == 1:
-                    wav = torch.from_numpy(data).unsqueeze(0)  # [1, T]
-                else:
-                    wav = torch.from_numpy(data).transpose(0, 1)  # [C, T]
 
-            elif StepAudioTokenizer._is_url(prompt_wav):
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
-                    r = requests.get(prompt_wav, timeout=30)
-                    r.raise_for_status()
-                    f.write(r.content)
-                    f.flush()
-                    data, sr = sf.read(f.name, dtype="float32", always_2d=False)
-            else:
-                data, sr = sf.read(prompt_wav, dtype="float32", always_2d=False)
+            elif parsed.scheme in ("http", "https") and parsed.netloc:
+                response = requests.get(audio, timeout=30)
+                response.raise_for_status()
+                data, sr = sf.read(io.BytesIO(response.content), dtype="float32", always_2d=False)
 
-            # soundfile returns shape:
-            # mono: [T], multi-channel: [T, C]
-            if data.ndim == 1:
-                wav = torch.from_numpy(data).unsqueeze(0)  # [1, T]
+            elif parsed.scheme == "file":
+                data, sr = sf.read(unquote(parsed.path), dtype="float32", always_2d=False)
+
             else:
-                wav = torch.from_numpy(data).transpose(0, 1)  # [C, T]
-            return wav, int(sr)
+                if not os.path.exists(audio):
+                    raise FileNotFoundError(f"Audio file not found: {audio}")
+                data, sr = sf.read(audio, dtype="float32", always_2d=False)
+
+            wav = torch.from_numpy(data.astype(np.float32, copy=False))
+            # soundfile returns mono [T], multi-channel [T, C].
+            if wav.ndim == 1:
+                wav = wav.unsqueeze(0)
+            elif wav.ndim == 2:
+                wav = wav.transpose(0, 1)
+            else:
+                raise ValueError(f"Decoded audio must be 1D or 2D, got {data.shape}")
+            return wav.contiguous(), int(sr)
 
         raise TypeError(f"Unsupported prompt_wav type: {type(prompt_wav)}")
 
