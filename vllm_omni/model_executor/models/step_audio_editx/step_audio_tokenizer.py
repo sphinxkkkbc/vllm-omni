@@ -106,9 +106,8 @@ class StepAudioTokenizer:
         config_path,
         funasr_model_id="dengcunqin/speech_paraformer-large_asr_nat-zh-cantonese-en-16k-vocab8501-online",
     ):
-        tokenizer_path = tokenizer_path or os.getenv("STEP_AUDIO_TOKENIZER_PATH")
         if not tokenizer_path:
-            raise ValueError("STEP_AUDIO_TOKENIZER_PATH is not set")
+            raise ValueError("audio_tokenizer_path is not set")
         self.text_tokenizer = AutoTokenizer.from_pretrained(config_path, trust_remote_code=True)
         # logger.info(f"Successfully load tokenizer from {config_path}")
         self.funasr_tokenizer_path = os.path.join(tokenizer_path, funasr_model_id)
@@ -151,7 +150,7 @@ class StepAudioTokenizer:
         except Exception:
             return False
 
-    def encode(self, task_type, audio, prompt, sr):
+    def encode(self, edit_type, audio, prompt, sr):
         """
         edit mode: prompt = {
                             prompt_text: str,
@@ -163,7 +162,7 @@ class StepAudioTokenizer:
         """
         audio_tokens, vq0206_codes = self._audio_tokenize(audio, sr)
 
-        token_ids = self._text_tokenize(task_type, audio_tokens, prompt)
+        token_ids = self._text_tokenize(edit_type, audio_tokens, prompt)
         return token_ids, vq0206_codes
 
     def _audio_tokenize(self, audio, sr):
@@ -172,14 +171,8 @@ class StepAudioTokenizer:
         audio_tokens = self.merge_vq0206_to_token_str(vq02_codes_ori, vq06_codes_ori)
         return audio_tokens, vq0206_codes
 
-    def _text_tokenize(self, task_type: str, audio_tokens: str, prompt: dict | tuple):
-        if task_type == "edit":
-            prompt_text, edit_type, edit_info, target_text = prompt
-            instruct_prefix = self._build_audio_edit_instruction(prompt_text, edit_type, edit_info, target_text)
-
-            prompt = self._build_edit_prompt(self.edit_sys_prompt, instruct_prefix, audio_tokens)
-
-        if task_type == "clone":
+    def _text_tokenize(self, edit_type: str, audio_tokens: str, prompt: dict | tuple):
+        if edit_type == "clone":
             prompt_text, target_text = prompt
             prompt_speaker = "debug"
             prompt = self._build_clone_prompt(
@@ -188,7 +181,11 @@ class StepAudioTokenizer:
                 prompt_speaker,
                 audio_tokens,
             )
-        print("Final prompt for text tokenization repr:", repr(prompt), flush=True)
+        else:
+            prompt_text, edit_type, edit_info, target_text = prompt
+            instruct_prefix = self._build_audio_edit_instruction(prompt_text, edit_type, edit_info, target_text)
+
+            prompt = self._build_edit_prompt(self.edit_sys_prompt, instruct_prefix, audio_tokens)
         chat_text = self.text_tokenizer.apply_chat_template(
             prompt,
             tokenize=False,

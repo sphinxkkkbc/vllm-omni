@@ -12,7 +12,6 @@ Examples:
 
     # VoiceEdit Task With Edit Info
     python openai_speech_client.py
-        --task-type edit \
         --ref-audio /path/to/ref_audio.wav \
         --ref-text "This is the reference transcript" \
         --text "What Are you talking about" \
@@ -21,7 +20,6 @@ Examples:
 
     # VoiceEdit Task With Edit Info
     python openai_speech_client.py
-        --task-type edit \
         --ref-audio /path/to/ref_audio.wav \
         --ref-text "This is the reference transcript" \
         --text "[cough]What Are you talking about" \
@@ -73,10 +71,6 @@ def run_tts_generation(args) -> None:
         "response_format": args.response_format,
     }
 
-    # Add optional parameters
-    if args.task_type:
-        payload["task_type"] = args.task_type
-
     # Voice clone parameters (Base task)
     if args.ref_audio:
         if args.ref_audio.startswith(("http://", "https://")):
@@ -88,14 +82,17 @@ def run_tts_generation(args) -> None:
     if args.ref_text:
         payload["ref_text"] = args.ref_text
 
-    if args.task_type == "edit":
-        assert args.edit_type is not None, "edit_type and edit_info must be provided for edit task."
-        payload["edit_type"] = args.edit_type
-        if args.edit_info:
-            payload["edit_info"] = args.edit_info
+    payload["extra_params"] = {}
+    if args.edit_type is not None:
+        payload["extra_params"]["edit_type"] = args.edit_type
+    else:
+        payload["extra_params"]["edit_type"] = "clone"
+
+    if args.edit_info is not None:
+        payload["extra_params"]["edit_info"] = args.edit_info
 
     print(f"Model: {args.model}")
-    print(f"Task type: {args.task_type}")
+    print(f"Task type: {args.edit_type}")
     print(f"Text: {args.text}")
     print("Generating audio...")
 
@@ -167,12 +164,12 @@ def parse_args():
 
     # Task configuration
     parser.add_argument(
-        "--task-type",
-        choices=("clone", "edit"),
-        default=None,
-        help="Task type: clone or edit.",
+        "--edit-type",
+        choices=("clone", "emotion", "paralinguistic", "style", "denoise", "vad", "speed"),
+        default="clone",
+        help="Task type: clone, emotion, paralinguistic, style, denoise, vad, speed",
     )
-
+    parser.add_argument("--edit-info", type=str, default=None, help="Additional information for the edit.")
     # Input text
     parser.add_argument(
         "--text",
@@ -194,8 +191,6 @@ def parse_args():
         help="Reference audio transcript for voice cloning (Base task)",
     )
 
-    parser.add_argument("--edit-type", type=str, default=None, help="Type of edit to perform.")
-    parser.add_argument("--edit-info", type=str, default=None, help="Additional information for the edit. ")
     # Generation parameters
     parser.add_argument(
         "--max-new-tokens",

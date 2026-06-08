@@ -1,4 +1,5 @@
 import logging
+import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -21,8 +22,9 @@ class StepAudioAR(nn.Module):
         super().__init__()
         self.vllm_config = vllm_config
         self.model_path = vllm_config.model_config.model
-        extra = getattr(vllm_config.model_config, "additional_kwargs", None) or {}
-        self.tokenizer_path = extra.get("audio_tokenizer")
+        # extra = getattr(vllm_config.model_config, "additional_kwargs", None) or {}
+        # self.tokenizer_path = extra.get("audio_tokenizer", "stepfun-ai/Step-Audio-Tokenizer")
+        self.tokenizer_path = os.environ["STEP_AUDIO_TOKENIZER_PATH"]
         self.model = Step1ForCausalLM(vllm_config=vllm_config, prefix=prefix)
         self.have_multimodal_outputs = True
         self.has_preprocess = True
@@ -44,10 +46,10 @@ class StepAudioAR(nn.Module):
     def _build_prompt_embeds(
         self,
         *,
-        task_type: str,
+        edit_type: str,
         info_dict: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int | None, torch.Tensor | None]:
-        logger.info(f"Building prompt embeds for task_type: {task_type}, info_dict: {info_dict}")
+        logger.info(f"Building prompt embeds for edit_type: {edit_type}, info_dict: {info_dict}")
 
         def _first(x, default=None):
             if isinstance(x, list):
@@ -60,8 +62,8 @@ class StepAudioAR(nn.Module):
         logger.info(f"ref_audio: {ref_audio}, sr: {sr}")
         ref_text = _first(info_dict.get("ref_text"), "")
         text = _first(info_dict.get("text"), "")
-        task_type = _first(info_dict.get("task_type"), "clone")
-        if task_type == "clone":
+        edit_type = _first(info_dict.get("edit_type"), "clone")
+        if edit_type == "clone":
             prompt = (ref_text, text)
         else:
             edit_type = _first(info_dict.get("edit_type"), None)
@@ -69,7 +71,7 @@ class StepAudioAR(nn.Module):
             prompt = (ref_text, edit_type, edit_info, text)
 
         # logger.info(f"ref_audio: {ref_audio}, ref_text: {ref_text}, text: {text}, sr: {sr}")
-        prompt_token, codec_token = self.tokenizer.encode(task_type, audio=ref_audio, prompt=prompt, sr=sr)
+        prompt_token, codec_token = self.tokenizer.encode(edit_type, audio=ref_audio, prompt=prompt, sr=sr)
         logger.info(f"prompt_token: {prompt_token}, len(input_ids): {len(prompt_token.input_ids)}")
         input_ids = torch.tensor(prompt_token.input_ids)
         input_ids = input_ids.to(next(self.model.parameters()).device)
@@ -178,7 +180,7 @@ class StepAudioAR(nn.Module):
         if not isinstance(text_list, list) or not text_list or not text_list[0]:
             raise ValueError("Missing additional_information.text for StepAudioEditX AR talker.")
 
-        task_type = info_dict.get("task_type") or ["clone"]
+        edit_type = info_dict.get("edit_type") or ["clone"]
 
         prompt_embeds_cpu = embed.get("prefill")
         tts_pad_embed_buf = embed.get("tts_pad")
@@ -193,7 +195,7 @@ class StepAudioAR(nn.Module):
 
         if is_first_prefill:
             full_prompt_embeds, ref_code_len, ref_code, tts_pad_embed = self._build_prompt_embeds(
-                task_type=task_type,
+                edit_type=edit_type,
                 info_dict=info_dict,
             )
             prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu").contiguous()

@@ -13,7 +13,6 @@ Examples:
     python3 step_audio_editx/offline_inference.py \
         --model  /path/to/model \
         --audio-tokenizer /path/to/tokenizer \
-        --task-type edit \
         --ref-audio /path/to/ref_audio.wav \
         --ref-text "This is the reference transcript" \
         --text "What Are you talking about" \
@@ -77,20 +76,15 @@ def _estimate_prompt_len(
         ref_text = _first(additional_information.get("ref_text"), "")
         text = _first(additional_information.get("text"), "")
         sr = _first(additional_information.get("sr"), 16000)
-        task_type = _first(additional_information.get("task_type"))
-        if task_type == "edit":
+        edit_type = _first(additional_information.get("edit_type", "clone"))
+        if edit_type == "clone":
+            prompt = (ref_text, text)
+        else:
             edit_type = _first(additional_information.get("edit_type", None))
             edit_info = _first(additional_information.get("edit_info", None))
             prompt = (ref_text, edit_type, edit_info, text)
-            print(
-                f"Audio Edit with info: ref_audio: {ref_audio}, ref_text: {ref_text}, "
-                f"edit_type: {edit_type}, edit_info: {edit_info}, text: {text}"
-            )
-        else:
-            prompt = (ref_text, text)
-            print(f"Audio Clone with info: ref_audio: {ref_audio}, ref_text: {ref_text}, text: {text}")
         prompt_token, _ = speech_tok.encode(
-            task_type,
+            edit_type,
             audio=ref_audio,
             prompt=prompt,
             sr=sr,
@@ -125,16 +119,13 @@ def _build_inputs(args):
     else:
         syn_text_single = "Good one. Okay, fine, I'm just gonna leave this sock monkey here. Goodbye."
     additional_information = {
-        "task_type": args.task_type,
+        "edit_type": args.edit_type,
         "ref_audio": [ref_audio_single],
         "ref_text": [ref_text_single],
         "text": [syn_text_single],
     }
-    if args.task_type == "edit":
-        assert args.edit_type is not None, "edit_type must be provided for edit task."
-        additional_information.update({"edit_type": args.edit_type})
-        if args.edit_info is not None:
-            additional_information.update({"edit_info": args.edit_info})
+    if args.edit_info is not None:
+        additional_information.update({"edit_info": args.edit_info})
     input_length = _estimate_prompt_len(additional_information, args.model, args.audio_tokenizer)
     inputs = {
         "prompt_token_ids": [0] * input_length,
@@ -166,11 +157,12 @@ def run_e2e():
         "vllm_omni/deploy/step_audio_editx.yaml based on the HF model_type.",
     )
     parser.add_argument(
-        "--task-type",
-        choices=("clone", "edit"),
+        "--edit-type",
+        choices=("clone", "emotion", "paralinguistic", "style", "denoise", "vad", "speed"),
         default="clone",
-        help="Task type: clone or edit.",
+        help="Task type: clone, emotion, paralinguistic, style, denoise, vad, speed",
     )
+    parser.add_argument("--edit-info", type=str, default=None, help="Additional information for the edit. ")
     parser.add_argument("--text", type=str, default=None)
     parser.add_argument(
         "--ref-text",
@@ -178,8 +170,6 @@ def run_e2e():
         default=None,
     )
     parser.add_argument("--ref-audio", type=str, default=None, help="Path to reference audio for voice cloning.")
-    parser.add_argument("--edit-type", type=str, default=None, help="Type of edit to perform.")
-    parser.add_argument("--edit-info", type=str, default=None, help="Additional information for the edit. ")
     parser.add_argument("--output", type=str, default=None, help="Output audio path.")
     nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
@@ -203,7 +193,7 @@ def run_e2e():
 
     inputs = _build_inputs(args)
 
-    print(f"Audio {args.task_type} for prompt: {args.text}")
+    print(f"Audio {args.edit_type} for prompt: {args.text}")
 
     # Start profiling (requires VLLM_TORCH_PROFILER_DIR env var)
     if os.environ.get("VLLM_TORCH_PROFILER_DIR"):

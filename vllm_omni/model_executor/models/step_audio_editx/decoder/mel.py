@@ -11,20 +11,20 @@ def load_wav(full_path):
     return data, sampling_rate
 
 
-def dynamic_range_compression(x, C=1, clip_val=1e-5):
-    return np.log(np.clip(x, a_min=clip_val, a_max=None) * C)
+def dynamic_range_compression(x, c=1, clip_val=1e-5):
+    return np.log(np.clip(x, a_min=clip_val, a_max=None) * c)
 
 
-def dynamic_range_decompression(x, C=1):
-    return np.exp(x) / C
+def dynamic_range_decompression(x, c=1):
+    return np.exp(x) / c
 
 
-def dynamic_range_compression_torch(x, C=1, clip_val=1e-5):
-    return torch.log(torch.clamp(x, min=clip_val) * C)
+def dynamic_range_compression_torch(x, c=1, clip_val=1e-5):
+    return torch.log(torch.clamp(x, min=clip_val) * c)
 
 
-def dynamic_range_decompression_torch(x, C=1):
-    return torch.exp(x) / C
+def dynamic_range_decompression_torch(x, c=1):
+    return torch.exp(x) / c
 
 
 def spectral_normalize_torch(magnitudes):

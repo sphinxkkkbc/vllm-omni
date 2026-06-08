@@ -3044,14 +3044,29 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request: OpenAICreateSpeechRequest,
     ) -> dict[str, Any]:
         from vllm_omni.inputs.data import token_inputs_omni
+        from vllm_omni.model_executor.models.step_audio_editx.end2end import _estimate_prompt_len
+
+        extra_params = dict(request.extra_params or {})
+
+        edit_type = extra_params.pop("edit_type", "clone")
+        edit_info = extra_params.pop("edit_info", None)
 
         ref_audio = request.ref_audio
         additional_information = {
             "text": [request.input],
             "ref_text": [request.ref_text],
             "ref_audio": [ref_audio],
+            "edit_type": edit_type,
+            "edit_info": edit_info,
         }
-        prompt_len = 512
+        tokenizer_path = os.environ.get("STEP_AUDIO_TOKENIZER_PATH")
+        if not tokenizer_path:
+            raise RuntimeError("STEP_AUDIO_TOKENIZER_PATH must be set for StepAudioEditX.")
+        prompt_len = _estimate_prompt_len(
+            additional_information,
+            model_path=self.engine_client.model_config.model,
+            tokenizer_path=tokenizer_path,
+        )
         prompt = token_inputs_omni(
             prompt_token_ids=[0] * prompt_len,
             additional_information=additional_information,
@@ -3333,7 +3348,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.instructions:
                 prompt["instruct"] = request.instructions
         elif self._tts_model_type == "step_audio_editx":
+            import copy
+
             prompt = self._build_step_audio_editx_prompt(request)
+
+            if sampling_params_list:
+                sampling_params_list = copy.deepcopy(sampling_params_list)
+
+                prompt_len = len(prompt.get("prompt_token_ids", []))
+                sampling_params_list[0].max_tokens = max(1, 8192 - prompt_len)
+                sampling_params_list[0].temperature = 0.7
+
             tts_params = {}
         elif self._tts_model_type == "covo_audio":
             prompt = self._build_covo_audio_prompt(request)
@@ -3681,7 +3706,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if sampling_params_list[0].extra_args is None:
                     sampling_params_list[0].extra_args = {}
                 sampling_params_list[0].extra_args["qwen3_tts_request_seed"] = request.seed
-        logger.info("StepAudioEditX prompt type=%s prompt=%r", type(prompt), prompt)
         generator = self.engine_client.generate(
             prompt=prompt,
             request_id=request_id,
