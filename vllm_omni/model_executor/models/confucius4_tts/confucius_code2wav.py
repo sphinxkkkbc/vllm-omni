@@ -11,7 +11,7 @@ from .decoder.flow import MaskedDiffWithXvec, MaskedDiffWithXvecConfig
 from .utils import cross_fade_concat
 
 
-class Conficius4TTS_Code2Wav(nn.Module):
+class Conficius4TTSCode2Wav(nn.Module):
     def __init__(
         self, config_path: str = "config/inference_config.yaml", t2s_checkpoint: str | None = None, device: str = "cuda"
     ):

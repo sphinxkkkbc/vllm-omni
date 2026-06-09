@@ -153,4 +153,8 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.dynin_omni.pipeline",
         "DYNIN_OMNI_PIPELINE",
     ),
+    "confucius4_tts": (
+        "vllm_omni.model_executor.models.confucius4_tts.pipeline",
+        "CONFUCIUS4_TTS_PIPELINE",
+    ),
 }

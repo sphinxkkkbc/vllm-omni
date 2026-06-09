@@ -285,6 +285,8 @@ _OMNI_MODELS = {
         "minicpmo_4_5_omni_tts",
         "MiniCPMO45OmniTTSForConditionalGeneration",
     ),
+    "Confucius4TTS_AR": ("confucius4_tts", "confucius_ar", "Confucius4TTS_AR"),
+    "Confucius4TTSCode2Wav": ("confucius4_tts", "confucius_code2wav", "Conficius4TTSCode2Wav"),
 }
 
 
