@@ -452,6 +452,28 @@ class Upsample1D(nn.Module):
         return outputs, input_lengths, new_cache
 
 
+class StepPreLookaheadLayer(PreLookaheadLayer):
+    def forward_chunk(self, inputs: torch.Tensor, cache: torch.Tensor = None):
+        """
+        Args:
+            inputs(torch.Tensor): shape (b, t, c)
+            cache(torch.Tensor): shape (b, c, cache_t=2), c = channels
+        """
+        outputs = inputs.transpose(1, 2).contiguous()
+        outputs = F.leaky_relu(self.conv1(outputs))
+        # the length of outputs is input length - pre_lookahead_len
+        if cache is None:
+            cache = outputs.new_zeros(outputs.shape[0], outputs.shape[1], 2)
+        # NOTE
+        new_cache = outputs[..., -2:]
+        outputs = torch.cat([cache, outputs], dim=2)
+        outputs = self.conv2(outputs)
+        outputs = outputs.transpose(1, 2).contiguous()
+        # residual connection
+        outputs = outputs + inputs[:, : -self.pre_lookahead_len]
+        return outputs, new_cache
+
+
 class UpsampleConformerEncoderV2(torch.nn.Module):
     def __init__(
         self,
@@ -493,7 +515,7 @@ class UpsampleConformerEncoderV2(torch.nn.Module):
             linear_units,
             activation,
         )
-        self.pre_lookahead_layer = PreLookaheadLayer(
+        self.pre_lookahead_layer = StepPreLookaheadLayer(
             in_channels=output_size, channels=output_size, pre_lookahead_len=pre_lookahead_len
         )
         self.encoders = torch.nn.ModuleList(
@@ -1152,8 +1174,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         conds = conds.transpose(1, 2).contiguous()
 
         mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
-
-        feat = self.decoder.forward(
+        feat, _ = self.decoder.forward(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask.unsqueeze(1),
             spks=embedding,

@@ -1,77 +1,48 @@
+from types import SimpleNamespace
+
 import torch
+
+from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalConditionalCFM
 
 from .flow import DiT
 
 
-class CausalConditionalCFM(torch.nn.Module):
-    def __init__(self, estimator: DiT, inference_cfg_rate: float = 0.7):
-        super().__init__()
-        self.estimator = estimator
-        self.inference_cfg_rate = inference_cfg_rate
+class StepCausalConditionalCFM(CausalConditionalCFM):
+    def __init__(
+        self,
+        estimator: DiT,
+        cfm_params,
+        in_channels: int = 80,
+        n_spks: int = 1,
+        spk_emb_dim: int = 192,
+    ):
+        if isinstance(cfm_params, dict):
+            cfm_params = SimpleNamespace(**cfm_params)
+
+        super().__init__(
+            in_channels=in_channels,
+            cfm_params=cfm_params,
+            n_spks=n_spks,
+            spk_emb_dim=spk_emb_dim,
+            estimator=estimator,
+        )
+
         self.out_channels = estimator.out_channels
-        # a maximum of 600s
-        self.register_buffer("rand_noise", torch.randn([1, self.out_channels, 50 * 600]), persistent=False)
-
-        self.register_buffer("cnn_cache_buffer", torch.zeros(16, 16, 2, 1024, 2), persistent=False)
-        self.register_buffer("att_cache_buffer", torch.zeros(16, 16, 2, 8, 1000, 128), persistent=False)
-
-    def scatter_cuda_graph(self, enable_cuda_graph: bool):
-        if enable_cuda_graph:
-            self.estimator._init_cuda_graph_all()
-
-    def solve_euler(self, x, t_span, mu, mask, spks, cond):
-        """
-        Fixed euler solver for ODEs.
-        Args:
-            x (torch.Tensor): random noise
-            t_span (torch.Tensor): n_timesteps interpolated
-                shape: (n_timesteps + 1,)
-            mu (torch.Tensor): output of encoder
-                shape: (batch_size, n_feats, mel_timesteps)
-            mask (torch.Tensor): output_mask
-                shape: (batch_size, 1, mel_timesteps)
-            spks (torch.Tensor, optional): speaker ids. Defaults to None.
-                shape: (batch_size, spk_emb_dim)
-            cond: Not used but kept for future purposes
-        """
-        t, _, dt = t_span[0], t_span[-1], t_span[1] - t_span[0]
-        t = t.unsqueeze(dim=0)
-        assert self.inference_cfg_rate > 0, "inference_cfg_rate better > 0"
-
-        # constant during denoising
-        mask_in = torch.cat([mask, mask], dim=0)
-        mu_in = torch.cat([mu, torch.zeros_like(mu)], dim=0)
-        spks_in = torch.cat([spks, torch.zeros_like(spks)], dim=0)
-        cond_in = torch.cat([cond, torch.zeros_like(cond)], dim=0)
-
-        for step in range(1, len(t_span)):
-            x_in = torch.cat([x, x], dim=0)
-            t_in = torch.cat([t, t], dim=0)
-
-            dphi_dt = self.estimator.forward(
-                x_in,
-                mask_in,
-                mu_in,
-                t_in,
-                spks_in,
-                cond_in,
-            )
-            dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-            dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
-            x = x + dt * dphi_dt
-            t = t + dt
-            if step < len(t_span) - 1:
-                dt = t_span[step + 1] - t
-
-        return x
-
-    @torch.inference_mode()
-    def forward(self, mu, mask, spks, cond, n_timesteps=10, temperature=1.0):
-        z = self.rand_noise[:, :, : mu.size(2)] * temperature
-        t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
-        # cosine scheduling
-        t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
-        return self.solve_euler(z, t_span, mu, mask, spks, cond)
+        self.register_buffer(
+            "rand_noise",
+            torch.randn([1, self.out_channels, 50 * 600]),
+            persistent=False,
+        )
+        self.register_buffer(
+            "cnn_cache_buffer",
+            torch.zeros(16, 16, 2, 1024, 2),
+            persistent=False,
+        )
+        self.register_buffer(
+            "att_cache_buffer",
+            torch.zeros(16, 16, 2, 8, 1000, 128),
+            persistent=False,
+        )
 
     def solve_euler_chunk(
         self,
@@ -121,8 +92,6 @@ class CausalConditionalCFM(torch.nn.Module):
         spks_in = torch.cat([spks, torch.zeros_like(spks)], dim=0)
         cond_in = torch.cat([cond, torch.zeros_like(cond)], dim=0)
         for step in range(1, len(t_span)):
-            # torch.cuda.memory._record_memory_history(max_entries=100000)
-            # torch.cuda.memory._record_memory_history(max_entries=100000)
             this_att_cache = att_cache[step - 1]
             this_cnn_cache = cnn_cache[step - 1]
 

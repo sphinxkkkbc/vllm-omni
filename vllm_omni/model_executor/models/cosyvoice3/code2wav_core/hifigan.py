@@ -359,8 +359,7 @@ class SourceModuleHnNSF(torch.nn.Module):
         # source for harmonic branch
         with torch.no_grad():
             sine_wavs, uv, _ = self.l_sin_gen(x)
-        if sine_wavs.dtype != torch.bfloat16:
-            sine_wavs = sine_wavs.to(torch.bfloat16)
+            sine_wavs = sine_wavs.to(x.dtype)
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
 
         # source for noise branch, in the same shape as uv
@@ -538,8 +537,9 @@ class HiFTGenerator(nn.Module):
         magnitude = torch.exp(x[:, : self.istft_params["n_fft"] // 2 + 1, :])
         phase = torch.sin(x[:, self.istft_params["n_fft"] // 2 + 1 :, :])  # actually, sin is redundancy
 
-        phase = phase.to(torch.float16)
-        x = self._istft(magnitude, phase)
+        magnitude = magnitude.to(torch.float32)
+        phase = phase.to(torch.float32)
+        x = self._istft(magnitude, phase).to(x.dtype)
         x = torch.clamp(x, -self.audio_limit, self.audio_limit)
         return x
 

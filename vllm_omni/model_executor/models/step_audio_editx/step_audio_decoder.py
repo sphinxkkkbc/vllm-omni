@@ -4,6 +4,7 @@ import threading
 from collections import defaultdict
 from collections.abc import Iterable
 from functools import cached_property, reduce
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -30,7 +31,7 @@ from vllm_omni.model_executor.models.step_audio_editx.decoder.flow import (
 )
 from vllm_omni.model_executor.models.step_audio_editx.decoder.hift import StepAudioCausalConvRNNF0Predictor
 
-from .decoder.cfm import CausalConditionalCFM
+from .decoder.cfm import StepCausalConditionalCFM as CausalConditionalCFM
 from .decoder.mel import mel_spectrogram
 from .step_audio_tokenizer import StepAudioTokenizer
 
@@ -90,11 +91,18 @@ class CosyVoice(nn.Module):
 
         flow_cfg = configs["flow"]
         decoder_cfg = flow_cfg["decoder"]
-
+        cfm_params = SimpleNamespace(**decoder_cfg["cfm_params"])
         self.flow = CausalMaskedDiffWithXvec(
             input_embedding=DualCodebookEmbedding(**flow_cfg["input_embedding"]),
             encoder=UpsampleConformerEncoderV2(**flow_cfg["encoder"]),
-            decoder=CausalConditionalCFM(estimator=DiT(**decoder_cfg["estimator"])),
+            decoder=CausalConditionalCFM(
+                in_channels=decoder_cfg["in_channels"],
+                n_spks=decoder_cfg["n_spks"],
+                spk_emb_dim=decoder_cfg["spk_emb_dim"],
+                cfm_params=cfm_params,
+                estimator=DiT(**decoder_cfg["estimator"]),
+            ),
+            # decoder=CausalConditionalCFM(estimator=DiT(**decoder_cfg["estimator"])),
             input_size=flow_cfg["input_size"],
             output_size=flow_cfg["output_size"],
             spk_embed_dim=flow_cfg["spk_embed_dim"],
@@ -127,6 +135,8 @@ class CosyVoice(nn.Module):
         self.estimator_prompt_length_dict = {}
         self.spk_embedding_cache_dict = {}
         self.setup_lock = threading.Lock()
+        self.emitted_tail_dict = {}
+        self.chunk_debug_idx = {}
 
     def _feature_extract(self, input_wav: torch.Tensor, sr: int):
         if input_wav.shape[0] > 1:
@@ -141,13 +151,19 @@ class CosyVoice(nn.Module):
 
     @staticmethod
     def fade_in_out(fade_in_mel: torch.Tensor, fade_out_mel: torch.Tensor, window: torch.Tensor):
-        mel_overlap_len = int(window.shape[0] / 2)
+        overlap = int(window.shape[0] / 2)
         fade_in_mel = fade_in_mel.clone()
-        fade_in_mel[..., :mel_overlap_len] = (
-            fade_in_mel[..., :mel_overlap_len] * window[:mel_overlap_len]
-            + fade_out_mel[..., -mel_overlap_len:] * window[mel_overlap_len:]
-        )
-        return fade_in_mel
+
+        fade_in = window[:overlap].to(device=fade_in_mel.device, dtype=fade_in_mel.dtype)
+        fade_out = window[overlap:].to(device=fade_in_mel.device, dtype=fade_in_mel.dtype)
+        norm = (fade_in + fade_out).clamp_min(1e-6)
+
+        fade_in_mel[..., :overlap] = (
+            fade_in_mel[..., :overlap] * fade_in
+            + fade_out_mel[..., -overlap:].to(device=fade_in_mel.device, dtype=fade_in_mel.dtype) * fade_out
+        ) / norm
+
+        return fade_in_mel.clamp(-0.99, 0.99)
 
     def forward(
         self, token: torch.Tensor, prompt_token: torch.Tensor, speech_feat: torch.Tensor, speech_embedding: torch.Tensor
@@ -165,6 +181,9 @@ class CosyVoice(nn.Module):
             lambda ts: ts.to(self.device),
             (token, prompt_token, speech_feat, speech_embedding),
         )
+        logger.info(
+            f"token: {token}, prompt_token: {prompt_token}, speech_feat: {speech_feat}, speech_embedding: {speech_embedding}"
+        )
         mel = self.flow.inference(
             token,
             _make_len(token),
@@ -175,10 +194,13 @@ class CosyVoice(nn.Module):
             speech_embedding.to(self.dtype),
             self.n_timesteps,
         )
+        logger.info(f"mel: {mel}")
         hift_dtype = next(self.hift.parameters()).dtype
         mel = mel.to(self.device, hift_dtype)
         speech, _ = self.hift.inference(mel)
-        return speech
+        logger.info(f"speech: {speech}")
+
+        return speech.cpu().to(torch.float32)
 
     def forward_chunk(
         self,
@@ -268,11 +290,65 @@ class CosyVoice(nn.Module):
             )
 
         self.chunk_cache_dict[session_id] = {k: v.clone().detach() for k, v in new_cache.items()}
-        hift_cache_mel = self.hift_cache_dict[session_id]["mel"]
-        hift_cache_source = self.hift_cache_dict[session_id]["source"]
-        hift_cache_speech = self.hift_cache_dict[session_id]["speech"]
+        hift_dtype = next(self.hift.parameters()).dtype
+        hift_device = next(self.hift.parameters()).device
+
+        mel = mel.to(device=hift_device, dtype=hift_dtype)
+        hift_cache_mel = self.hift_cache_dict[session_id]["mel"].to(device=hift_device, dtype=hift_dtype)
+        hift_cache_source = self.hift_cache_dict[session_id]["source"].to(device=hift_device)
+        hift_cache_speech = self.hift_cache_dict[session_id]["speech"].to(device=hift_device)
+
         mel = torch.concat([hift_cache_mel, mel], dim=2)
+
+        mel_f = mel.float()
+        logger.info(
+            "[ASYNC_MEL_DEBUG] session=%s last=%s mel_shape=%s mel_min=%.6f mel_max=%.6f "
+            "mel_mean=%.6f mel_std=%.6f mel_abs_max=%.6f",
+            session_id,
+            last_chunk,
+            tuple(mel.shape),
+            float(mel_f.min().item()),
+            float(mel_f.max().item()),
+            float(mel_f.mean().item()),
+            float(mel_f.std().item()),
+            float(mel_f.abs().max().item()),
+        )
+
         speech, source = self.hift.inference(mel, hift_cache_source)
+
+        raw_speech = speech
+        raw_diff = raw_speech.float().diff(dim=-1).abs()
+        logger.info(
+            "[ASYNC_RAW_SPEECH] session=%s last=%s raw_samples=%d raw_max_abs=%.6f "
+            "raw_max_delta=%.6f raw_max_abs_idx=%d raw_max_delta_idx=%d "
+            "mel_shape=%s source_shape=%s source_max_abs=%.6f",
+            session_id,
+            last_chunk,
+            int(raw_speech.shape[-1]),
+            float(raw_speech.abs().max().item()),
+            float(raw_diff.max().item()) if raw_diff.numel() > 0 else 0.0,
+            int(raw_speech.abs().reshape(-1).argmax().item()) if raw_speech.numel() > 0 else -1,
+            int(raw_diff.reshape(-1).argmax().item()) if raw_diff.numel() > 0 else -1,
+            tuple(mel.shape),
+            tuple(source.shape),
+            float(source.abs().max().item()) if source.numel() > 0 else 0.0,
+        )
+
+        if raw_diff.numel() > 0 and float(raw_diff.max().item()) > 1.5:
+            torch.save(
+                {
+                    "mel": mel.detach().cpu(),
+                    "speech": raw_speech.detach().cpu(),
+                    "source": source.detach().cpu(),
+                    "token": token.detach().cpu(),
+                    "last_chunk": last_chunk,
+                },
+                f"/tmp/step_audio_spike_{session_id}_{last_chunk}.pt",
+            )
+
+        speech = speech.to(self.device)
+        hift_cache_speech = hift_cache_speech.to(self.device)
+        self.speech_window = self.speech_window.to(self.device)
         if hift_cache_speech.shape[-1] > 0:
             speech = self.fade_in_out(speech, hift_cache_speech, self.speech_window)
         self.hift_cache_dict[session_id] = dict(
@@ -282,6 +358,43 @@ class CosyVoice(nn.Module):
         )
         if not last_chunk:
             speech = speech[:, : -self.source_cache_len]
+
+        post_diff = speech.float().diff(dim=-1).abs()
+        logger.info(
+            "[ASYNC_POST_FADE] session=%s last=%s post_samples=%d post_max_abs=%.6f "
+            "post_max_delta=%.6f post_max_abs_idx=%d post_max_delta_idx=%d",
+            session_id,
+            last_chunk,
+            int(speech.shape[-1]),
+            float(speech.abs().max().item()),
+            float(post_diff.max().item()) if post_diff.numel() > 0 else 0.0,
+            int(speech.abs().reshape(-1).argmax().item()) if speech.numel() > 0 else -1,
+            int(post_diff.reshape(-1).argmax().item()) if post_diff.numel() > 0 else -1,
+        )
+
+        chunk_idx = int(self.chunk_debug_idx.get(session_id, 0))
+        self.chunk_debug_idx[session_id] = chunk_idx + 1
+        prev_tail = self.emitted_tail_dict.get(session_id)
+        if speech.numel() > 0:
+            head_len = min(400, int(speech.shape[-1]))
+            tail_len = min(400, int(speech.shape[-1]))
+            boundary_jump = None
+            if isinstance(prev_tail, torch.Tensor) and prev_tail.numel() > 0:
+                boundary_jump = float((speech[:, 0] - prev_tail[:, -1]).abs().max().item())
+            logger.info(
+                "[ASYNC_AUDIO_BOUNDARY] session=%s chunk=%d last=%s samples=%d "
+                "max_abs=%.6f head_rms=%.6f tail_rms=%.6f boundary_jump=%s",
+                session_id,
+                chunk_idx,
+                last_chunk,
+                int(speech.shape[-1]),
+                float(speech.abs().max().item()),
+                float(speech[:, :head_len].float().pow(2).mean().sqrt().item()),
+                float(speech[:, -tail_len:].float().pow(2).mean().sqrt().item()),
+                "None" if boundary_jump is None else f"{boundary_jump:.6f}",
+            )
+            self.emitted_tail_dict[session_id] = speech[:, -tail_len:].detach().clone()
+
         return speech.cpu().to(torch.float32)
 
     def _setup_cache(
@@ -303,10 +416,13 @@ class CosyVoice(nn.Module):
             self.estimator_prompt_length_dict[session_id] = prompt_feat.shape[1]
             self.b_first_chunk_dict[session_id] = True
             self.spk_embedding_cache_dict[session_id] = embedding.to(self.device, self.dtype).clone()
+            hift_dtype = next(self.hift.parameters()).dtype
+            hift_device = next(self.hift.parameters()).device
+
             self.hift_cache_dict[session_id] = dict(
-                mel=torch.zeros(1, prompt_feat.shape[2], 0, device=self.device, dtype=self.dtype),
-                source=torch.zeros(1, 1, 0, device=self.device, dtype=self.dtype),
-                speech=torch.zeros(1, 0, device=self.device, dtype=self.dtype),
+                mel=torch.zeros(1, prompt_feat.shape[2], 0, device=hift_device, dtype=hift_dtype),
+                source=torch.zeros(1, 1, 0, device=hift_device, dtype=hift_dtype),
+                speech=torch.zeros(1, 0, device=hift_device, dtype=hift_dtype),
             )
 
     def clean_up(self, session_id: str):
@@ -317,6 +433,8 @@ class CosyVoice(nn.Module):
         self.chunk_cache_dict.pop(session_id, None)
         self.estimator_prompt_length_dict.pop(session_id, None)
         self.spk_embedding_cache_dict.pop(session_id, None)
+        self.emitted_tail_dict.pop(session_id, None)
+        self.chunk_debug_idx.pop(session_id, None)
 
     @cached_property
     def device(self):
@@ -393,8 +511,17 @@ class StepAudioCode2wav(nn.Module):
             and runtime_additional_information
             and isinstance(runtime_additional_information[0], dict)
         ):
-            ref = runtime_additional_information[0].get("codes", {}).get("audio")
-            ref_audio, sr = StepAudioTokenizer._load_audio(ref, kwargs.get("sample_rate"))
+            ref = runtime_additional_information[0].get("latent", {})
+            loaded = StepAudioTokenizer._load_audio(ref, kwargs.get("sample_rate"))
+            if isinstance(loaded, list):
+                if len(loaded) != 1:
+                    raise ValueError(
+                        "StepAudioCode2wav currently expects one reference audio per forward; "
+                        f"got {len(loaded)}. Batched audio needs per-request decoding."
+                    )
+                ref_audio, sr = loaded[0]
+            else:
+                ref_audio, sr = loaded
             return ref_audio, sr
         return kwargs.get("input_wav"), kwargs.get("sample_rate")
 
@@ -420,12 +547,14 @@ class StepAudioCode2wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
+        logger.info(f"input_ids: {input_ids}")
+        logger.info(f"runtime_additional_information: {runtime_additional_information}, kwargs: {kwargs}")
         if input_ids is None:
             raise ValueError("StepAudioCode2wav requires input_ids from the previous stage.")
         token = input_ids.reshape(-1)
         prompt_token = self._extract_prompt_token(runtime_additional_information, kwargs)
         input_wav, sample_rate = self._extract_runtime_inputs(runtime_additional_information, kwargs)
-        logger.info(f"input_wav:{input_wav}, sample_rate:{sample_rate}")
+        # logger.info(f"input_wav:{input_wav}, sample_rate:{sample_rate}")
         if input_wav is not None:
             input_wav, sample_rate = self.preprocess_wav(input_wav, sample_rate)
         if prompt_token is None:
@@ -444,8 +573,18 @@ class StepAudioCode2wav(nn.Module):
 
         async_chunk = self.vllm_config.model_config.async_chunk
         if async_chunk:
-            session_id = runtime_additional_information[0]["session_id"]
-            last_chunk = runtime_additional_information[0]["last_chunk"]
+            if runtime_additional_information is not None:
+                meta = runtime_additional_information[0].get("meta", {})
+                session_id = meta.get("req_id")
+                last_chunk = meta.get("stream_finished", False)
+                if hasattr(last_chunk, "item"):
+                    last_chunk = bool(last_chunk.item())
+                else:
+                    last_chunk = bool(last_chunk)
+                logger.info(f"session_id: {session_id}, last_chunk: {last_chunk}")
+            else:
+                session_id = None
+                last_chunk = False
             audio = self.core.forward_chunk(token, prompt_token, speech_feat, speech_embedding, session_id, last_chunk)
             return OmniOutput(
                 text_hidden_states=None,
@@ -453,7 +592,8 @@ class StepAudioCode2wav(nn.Module):
                     "audio": audio,
                 },
             )
-        audio = self.core.forward(token, prompt_token)
+        # logger.info(f"token: {token}, prompt_token: {prompt_token}")
+        audio = self.core.forward(token, prompt_token, speech_feat, speech_embedding)
         return OmniOutput(
             text_hidden_states=None,
             multimodal_outputs={

@@ -167,7 +167,7 @@ class StepAudioTokenizer:
 
     def _audio_tokenize(self, audio, sr):
         vq0206_codes, vq02_codes_ori, vq06_codes_ori = self.wav2token(audio, sr)
-        print(f"vq02_codes_ori: {vq02_codes_ori}, vq06_codes_ori: {vq06_codes_ori}")
+        # print(f"vq02_codes_ori: {vq02_codes_ori}, vq06_codes_ori: {vq06_codes_ori}")
         audio_tokens = self.merge_vq0206_to_token_str(vq02_codes_ori, vq06_codes_ori)
         return audio_tokens, vq0206_codes
 

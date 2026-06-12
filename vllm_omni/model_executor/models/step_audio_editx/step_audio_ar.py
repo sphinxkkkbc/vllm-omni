@@ -95,19 +95,14 @@ class StepAudioAR(nn.Module):
         ref_code_len_list: list[torch.Tensor] = []
         ref_code_tensor: torch.Tensor | None = None
         codec_streaming_list: list[torch.Tensor] = []
+        sampling_metadata = kwargs.get("sampling_metadata")
+        output_token_ids = getattr(sampling_metadata, "output_token_ids", None)
+        ac = output_token_ids[0] if output_token_ids else []
         for info in info_dicts:
             if not isinstance(info, dict):
                 continue
             codes = info.get("codes", {})
             meta = info.get("meta", {})
-            ac = codes.get("audio")
-            if isinstance(ac, torch.Tensor):
-                audio_codes_list.append(ac)
-                cs = meta.get("codec_streaming")
-                if isinstance(cs, bool):
-                    codec_streaming_list.append(
-                        torch.full((int(ac.shape[0]),), int(cs), dtype=torch.int8, device=ac.device)
-                    )
             ref_code = codes.get("ref")
             if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
                 ref_code_tensor = ref_code
@@ -208,7 +203,6 @@ class StepAudioAR(nn.Module):
                 take = torch.cat([take, pad_rows], dim=0)
 
             prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
-
             info_update: OmniPayload = {
                 "embed": {
                     "prefill": prompt_embeds_cpu,
@@ -289,12 +283,13 @@ class StepAudioAR(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor:
-        return self.model(
+        out = self.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
+        return out
 
     def compute_logits(
         self,

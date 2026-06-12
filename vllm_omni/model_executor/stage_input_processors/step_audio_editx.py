@@ -57,10 +57,12 @@ def ar2decoder(source_outputs: list[Any], prompt: Any = None, _requires_multimod
             ref_code = ref_code[0] if ref_code else None
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
             ref_code = ref_code.to(torch.long).cpu().contiguous()
+
         additional_information = to_dict(
             OmniPayloadStruct(
                 meta=MetaStruct(left_context_size=ref_code_len) if ref_code_len > 0 else None,
-                codes=CodesStruct(ref=ref_code, audio=ref_audio),
+                codes=CodesStruct(ref=ref_code),
+                latent=ref_audio,
             )
         )
         code2wav_inputs.append(
@@ -80,29 +82,60 @@ def talker2code2wav_async_chunk(
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
-    logger.info(f"transfer_manager: {transfer_manager}")
     logger.info(f"pooling_output: {pooling_output}")
-    logger.info(f"request: {request}")
-    logger.info(f"is_finished: {is_finished}")
+    additional_information = getattr(request, "additional_information", None)
+    logger.info(f"additional_information: {additional_information}")
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
     request_payload = getattr(transfer_manager, "request_payload", None)
+
     if request_payload is None:
         request_payload = {}
         transfer_manager.request_payload = request_payload
 
+    ref_audio = additional_information.entries.get("ref_audio").list_data if additional_information else None
+    ref_code = pooling_output.get("codes", {}).get("ref")
+
+    if isinstance(ref_code, list):
+        ref_code = [i - 65536 for i in ref_code]
+    else:
+        ref_code = ref_code - 65536
+
+    ref_code_len = int(ref_code.numel())
+    state = transfer_manager.request_payload.setdefault(request_id, {})
+    seen_len = int(state.get("seen_len", 0))
+
+    output_token_ids = list(getattr(request, "output_token_ids", []) or [])
+    new_tokens = output_token_ids[seen_len:]
+    state["seen_len"] = len(output_token_ids)
+
+    for tok in new_tokens:
+        tok = int(tok)
+        if tok >= 65536:
+            transfer_manager.code_prompt_token_ids[request_id].append([tok - 65536])
+
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
-    chunk_size = int(cfg.get("codec_chunk_frames", 25))
-    left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
-    configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
-    ref_code_context_frames = int(cfg.get("ref_code_context_frames") or left_context_size_config)
+    # logger.info(f"cfg: {cfg}")
+    chunk_size = int(cfg.get("codec_chunk_frames", 15))
+    lookahead_size = int(cfg.get("codec_left_context_frames", 0))
+    initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
 
-    # Per-request override takes priority over dynamic IC.
-    fixed_initial_chunk_size = configured_initial_chunk_size > 0
-    initial_chunk_size = configured_initial_chunk_size
-    additional_information = getattr(request, "additional_information", None)
+    sent_audio_len = int(state.get("sent_audio_len", 0))
+    audio_tokens = transfer_manager.code_prompt_token_ids[request_id]
+
+    available = len(audio_tokens) - sent_audio_len
+    need = chunk_size + lookahead_size
+
+    if not finished and available < need:
+        return None
+
+    take = available if finished else need
+    chunk_frames = audio_tokens[sent_audio_len : sent_audio_len + take]
+
+    advance = available if finished else chunk_size
+    state["sent_audio_len"] = sent_audio_len + advance
 
     if (
         additional_information is not None
@@ -112,20 +145,11 @@ def talker2code2wav_async_chunk(
         entry = additional_information.entries["initial_codec_chunk_frames"]
         if entry.list_data is not None and len(entry.list_data) == 1:
             initial_chunk_size = int(entry.list_data[0])
-            fixed_initial_chunk_size = True
 
-    if (
-        chunk_size <= 0
-        or left_context_size_config < 0
-        or configured_initial_chunk_size < 0
-        or initial_chunk_size < 0
-        or ref_code_context_frames < 0
-    ):
+    if chunk_size <= 0 or initial_chunk_size < 0:
         raise ValueError(
             f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "
-            f"codec_left_context_frames={left_context_size_config}, "
             f"initial_codec_chunk_frames={initial_chunk_size}, "
-            f"ref_code_context_frames={ref_code_context_frames}"
         )
 
     if initial_chunk_size > chunk_size:
@@ -135,6 +159,7 @@ def talker2code2wav_async_chunk(
             chunk_size,
         )
         initial_chunk_size = chunk_size
+
     length = len(transfer_manager.code_prompt_token_ids[request_id])
 
     if length <= 0:
@@ -150,51 +175,18 @@ def talker2code2wav_async_chunk(
     if use_first_chunk and length <= initial_chunk_size:
         if not finished and length < initial_chunk_size:
             return None
-        context_length = length if finished and length < initial_chunk_size else initial_chunk_size
-    else:
-        # The initial chunk is only for TTFA. After that, return to the normal
-        # codec chunk size so Code2Wav is not flooded by repeated tiny windows.
-        initial_coverage = initial_chunk_size if use_first_chunk else 0
-        adjusted = length - initial_coverage
-        if not finished and adjusted % chunk_size != 0:
-            return None
-        chunk_length = adjusted % chunk_size
-        context_length = chunk_length if chunk_length != 0 else chunk_size
 
-    end_index = min(length, left_context_size_config + context_length)
-    left_context_size = max(0, end_index - context_length)
-    window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
-
-    # Prepend a bounded ref_code tail as decoder context for every chunk so the
-    # vocoder keeps voice-clone speaker identity without making Stage1 shapes
-    # depend on full reference-audio length. The decoder is causal with sliding
-    # attention, so frames older than this context window cannot affect the
-    # emitted chunk. Use `.get()` (not `.pop()`) to keep ref_code for later chunks.
-    ref_code = request_payload.get(request_id)
-    if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-        ref_context = ref_code
-        if ref_code_context_frames > 0 and int(ref_context.shape[0]) > ref_code_context_frames:
-            logger.info_once(
-                "Qwen3-TTS async chunk uses the last %d/%d ref_code frames as bounded Code2Wav context.",
-                ref_code_context_frames,
-                int(ref_context.shape[0]),
-            )
-            ref_context = ref_context[-ref_code_context_frames:]
-        ref_frames = ref_context.tolist()
-        window_frames = ref_frames + window_frames
-        left_context_size += len(ref_frames)
-
-    num_quantizers = len(window_frames[0])
-    num_frames = len(window_frames)
     code_predictor_codes = torch.tensor(
-        [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)],
+        [frame[0] for frame in chunk_frames],
         dtype=torch.long,
     )
-
     return OmniPayloadStruct(
-        codes=CodesStruct(audio=code_predictor_codes),
+        codes=CodesStruct(audio=code_predictor_codes, ref=ref_code),
         meta=MetaStruct(
-            left_context_size=left_context_size,
             finished=torch.tensor(finished, dtype=torch.bool),
+            stream_finished=finished,
+            ref_code_len=ref_code_len,
+            req_id=request_id,
         ),
+        latent=ref_audio,
     )
