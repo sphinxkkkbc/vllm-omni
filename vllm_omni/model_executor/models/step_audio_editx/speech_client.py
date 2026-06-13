@@ -70,6 +70,10 @@ def run_tts_generation(args) -> None:
         "input": args.text,
         "response_format": args.response_format,
     }
+    if args.max_new_tokens is not None:
+        payload["max_new_tokens"] = args.max_new_tokens
+    if args.seed is not None:
+        payload["seed"] = args.seed
 
     # Voice clone parameters (Base task)
     if args.ref_audio:
@@ -94,6 +98,9 @@ def run_tts_generation(args) -> None:
     print(f"Model: {args.model}")
     print(f"Task type: {args.edit_type}")
     print(f"Text: {args.text}")
+    print("ref_audio prefix:", payload.get("ref_audio", "")[:80])
+    print("ref_text:", payload.get("ref_text"))
+    print("payload extra_params:", payload.get("extra_params"))
     print("Generating audio...")
 
     # Make the API call
@@ -197,6 +204,12 @@ def parse_args():
         type=int,
         default=None,
         help="Maximum new tokens to generate",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducible generation",
     )
 
     # Output

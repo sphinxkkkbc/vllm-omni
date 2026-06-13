@@ -44,6 +44,27 @@ class StepCausalConditionalCFM(CausalConditionalCFM):
             persistent=False,
         )
 
+    @torch.inference_mode()
+    def forward(
+        self,
+        mu: torch.Tensor,
+        mask: torch.Tensor,
+        n_timesteps: int,
+        temperature: float = 1.0,
+        spks: torch.Tensor | None = None,
+        cond: torch.Tensor | None = None,
+        streaming: bool = False,
+    ):
+        z = self.rand_noise[:, :, : mu.size(2)].to(device=mu.device, dtype=mu.dtype) * temperature
+        if z.size(0) != mu.size(0):
+            z = z.expand(mu.size(0), -1, -1).contiguous()
+
+        t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
+        if self.t_scheduler == "cosine":
+            t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
+
+        return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), None
+
     def solve_euler_chunk(
         self,
         x: torch.Tensor,

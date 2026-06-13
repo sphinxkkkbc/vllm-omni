@@ -41,6 +41,10 @@ class FunASRModel:
         assert "model" in kwargs
         kwargs["init_param"] = os.path.join(model_path, "model.pt")
         kwargs["frontend_conf"]["cmvn_file"] = os.path.join(model_path, "am.mvn")
+        # Match the official Step-Audio-EditX tokenizer. A nonzero Kaldi
+        # dither changes VQ02 codes for the same waveform, which changes the
+        # AR prompt token ids and makes generation nondeterministic.
+        kwargs["frontend_conf"]["dither"] = 0.0
 
         device = kwargs.get("device", "cuda")
         if not torch.cuda.is_available() or kwargs.get("ngpu", 1) == 0:

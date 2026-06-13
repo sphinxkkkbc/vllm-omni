@@ -193,8 +193,6 @@ def run_e2e():
 
     inputs = _build_inputs(args)
 
-    print(f"Audio {args.edit_type} for prompt: {args.text}")
-
     # Start profiling (requires VLLM_TORCH_PROFILER_DIR env var)
     if os.environ.get("VLLM_TORCH_PROFILER_DIR"):
         print("Starting profiler...")
@@ -212,6 +210,10 @@ def run_e2e():
     )
     s2mel_sampling = SamplingParams(temperature=0.7, max_tokens=max_tokens, skip_special_tokens=False)
     sampling_params_list = [gpt_sampling, s2mel_sampling]
+    logger.info(
+        f"Task is {'edit: ' + args.edit_type if args.edit_type != 'clone' else 'clone'} for prompt: {args.text}"
+    )
+    logger.info(f"omni inputs: {inputs}")
     outputs = list(omni.generate(inputs, sampling_params_list=sampling_params_list))
 
     if os.environ.get("VLLM_TORCH_PROFILER_DIR"):
@@ -240,7 +242,7 @@ def run_e2e():
                     audio_out = mm["audio"]
                     print(f"Generated Audio Shape: {audio_out.shape}")
                     out_path = args.output if args.output else f"output_{i}.wav"
-                    sf.write(out_path, audio_out.cpu().numpy().squeeze(), 22050)
+                    sf.write(out_path, audio_out.cpu().numpy().squeeze(), 24000)
                     print(f"Saved audio to {out_path}")
             else:
                 print("No multimodal output found.")

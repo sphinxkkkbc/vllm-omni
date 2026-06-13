@@ -36,10 +36,15 @@ def ar2decoder(source_outputs: list[Any], prompt: Any = None, _requires_multimod
         output = talker_output.outputs[0]
         mm = output.multimodal_output
         token_ids = output.token_ids
+
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.detach().cpu().tolist()
 
         codec_codes = [int(tid) - 65536 for tid in token_ids if int(tid) >= 65536]
+        if len(codec_codes) < 5:
+            raise RuntimeError(
+                f"StepAudio AR generated too few codec tokens: {len(codec_codes)}; tail={token_ids[-30:]}"
+            )
         mm_codes = mm.get("codes", {})
         ref_code = mm_codes.get("ref")
         if isinstance(ref_code, list):

@@ -151,19 +151,13 @@ class CosyVoice(nn.Module):
 
     @staticmethod
     def fade_in_out(fade_in_mel: torch.Tensor, fade_out_mel: torch.Tensor, window: torch.Tensor):
-        overlap = int(window.shape[0] / 2)
+        mel_overlap_len = int(window.shape[0] / 2)
         fade_in_mel = fade_in_mel.clone()
-
-        fade_in = window[:overlap].to(device=fade_in_mel.device, dtype=fade_in_mel.dtype)
-        fade_out = window[overlap:].to(device=fade_in_mel.device, dtype=fade_in_mel.dtype)
-        norm = (fade_in + fade_out).clamp_min(1e-6)
-
-        fade_in_mel[..., :overlap] = (
-            fade_in_mel[..., :overlap] * fade_in
-            + fade_out_mel[..., -overlap:].to(device=fade_in_mel.device, dtype=fade_in_mel.dtype) * fade_out
-        ) / norm
-
-        return fade_in_mel.clamp(-0.99, 0.99)
+        fade_in_mel[..., :mel_overlap_len] = (
+            fade_in_mel[..., :mel_overlap_len] * window[:mel_overlap_len]
+            + fade_out_mel[..., -mel_overlap_len:] * window[mel_overlap_len:]
+        )
+        return fade_in_mel
 
     def forward(
         self, token: torch.Tensor, prompt_token: torch.Tensor, speech_feat: torch.Tensor, speech_embedding: torch.Tensor
@@ -181,9 +175,7 @@ class CosyVoice(nn.Module):
             lambda ts: ts.to(self.device),
             (token, prompt_token, speech_feat, speech_embedding),
         )
-        logger.info(
-            f"token: {token}, prompt_token: {prompt_token}, speech_feat: {speech_feat}, speech_embedding: {speech_embedding}"
-        )
+        # logger.info(f"token: {token}, prompt_token: {prompt_token}, speech_feat: {speech_feat}, speech_embedding: {speech_embedding}")
         mel = self.flow.inference(
             token,
             _make_len(token),
@@ -547,8 +539,8 @@ class StepAudioCode2wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
-        logger.info(f"input_ids: {input_ids}")
-        logger.info(f"runtime_additional_information: {runtime_additional_information}, kwargs: {kwargs}")
+        # logger.info(f"input_ids: {input_ids}")
+        # logger.info(f"runtime_additional_information: {runtime_additional_information}, kwargs: {kwargs}")
         if input_ids is None:
             raise ValueError("StepAudioCode2wav requires input_ids from the previous stage.")
         token = input_ids.reshape(-1)
@@ -592,7 +584,7 @@ class StepAudioCode2wav(nn.Module):
                     "audio": audio,
                 },
             )
-        # logger.info(f"token: {token}, prompt_token: {prompt_token}")
+        logger.info(f"token: {token}, prompt_token: {prompt_token}")
         audio = self.core.forward(token, prompt_token, speech_feat, speech_embedding)
         return OmniOutput(
             text_hidden_states=None,
