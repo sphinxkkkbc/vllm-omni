@@ -35,6 +35,8 @@ from .decoder.cfm import StepCausalConditionalCFM as CausalConditionalCFM
 from .decoder.mel import mel_spectrogram
 from .step_audio_tokenizer import StepAudioTokenizer
 
+torch.backends.cudnn.enabled = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -121,6 +123,8 @@ class CosyVoice(nn.Module):
             configs["mel_conf"],
             campplus_model=f"{model_dir}/CosyVoice-300M-25Hz/campplus.onnx",
         )
+        self.flow = self.flow.to(device=self.device, dtype=torch.float32)
+        self.hift = self.hift.to(device=self.device, dtype=torch.float32)
         self.n_timesteps = n_timesteps
         self.token_lookahead = self.flow.pre_lookahead_len
         self.mel_cache_len = mel_cache_len
@@ -162,6 +166,23 @@ class CosyVoice(nn.Module):
     def forward(
         self, token: torch.Tensor, prompt_token: torch.Tensor, speech_feat: torch.Tensor, speech_embedding: torch.Tensor
     ):
+        flow_device = next(self.flow.parameters()).device
+        flow_dtype = next(self.flow.parameters()).dtype
+
+        token = token.to(flow_device)
+        prompt_token = prompt_token.to(flow_device)
+        speech_feat = speech_feat.to(flow_device, flow_dtype)
+        speech_embedding = speech_embedding.to(flow_device, flow_dtype)
+
+        logger.error(
+            "FLOW_DTYPE_DEBUG flow=%s token=%s prompt=%s feat=%s emb=%s",
+            flow_dtype,
+            token.dtype,
+            prompt_token.dtype,
+            speech_feat.dtype,
+            speech_embedding.dtype,
+        )
+
         def _make_len(ts: torch.Tensor):
             return torch.tensor([ts.shape[1]], dtype=torch.long, device=ts.device)
 
@@ -175,21 +196,22 @@ class CosyVoice(nn.Module):
             lambda ts: ts.to(self.device),
             (token, prompt_token, speech_feat, speech_embedding),
         )
-        # logger.info(f"token: {token}, prompt_token: {prompt_token}, speech_feat: {speech_feat}, speech_embedding: {speech_embedding}")
         mel = self.flow.inference(
             token,
             _make_len(token),
             prompt_token,
             _make_len(prompt_token),
-            speech_feat.to(self.dtype),
+            speech_feat.to(flow_dtype),
             _make_len(speech_feat),
-            speech_embedding.to(self.dtype),
+            speech_embedding.to(flow_dtype),
             self.n_timesteps,
         )
         logger.info(f"mel: {mel}")
-        hift_dtype = next(self.hift.parameters()).dtype
-        mel = mel.to(self.device, hift_dtype)
+        # hift_dtype = next(self.hift.parameters()).dtype
+        mel = mel.to(self.device, torch.float32)
         speech, _ = self.hift.inference(mel)
+        # mel = mel.to(self.device, hift_dtype)
+        # speech, _ = self.hift.inference(mel)
         logger.info(f"speech: {speech}")
 
         return speech.cpu().to(torch.float32)
@@ -203,6 +225,15 @@ class CosyVoice(nn.Module):
         session_id: str,
         last_chunk: bool,
     ):
+        logger.error(
+            "FORWARD_CHUNK token=%s prompt=%s feat=%s emb=%s session=%s last=%s",
+            tuple(token.shape),
+            tuple(prompt_token.shape),
+            tuple(prompt_feat.shape),
+            tuple(prompt_embedding.shape),
+            session_id,
+            last_chunk,
+        )
         from copy import deepcopy
 
         def _mixed_len(length: int):
@@ -504,6 +535,7 @@ class StepAudioCode2wav(nn.Module):
             and isinstance(runtime_additional_information[0], dict)
         ):
             ref = runtime_additional_information[0].get("latent", {})
+            # logger.info(f"ref: {ref}")
             loaded = StepAudioTokenizer._load_audio(ref, kwargs.get("sample_rate"))
             if isinstance(loaded, list):
                 if len(loaded) != 1:
@@ -524,9 +556,26 @@ class StepAudioCode2wav(nn.Module):
             and intermediate_tensors
             and isinstance(intermediate_tensors[0], dict)
         ):
-            ref = intermediate_tensors[0].get("codes", {}).get("ref")
+            info = intermediate_tensors[0]
+
+            ref = info.get("codes", {}).get("ref")
+            if isinstance(ref, list):
+                ref = torch.tensor(ref, dtype=torch.long)
             if isinstance(ref, torch.Tensor):
-                return ref[0]
+                ref = ref.to(torch.long)
+                if ref.ndim > 1:
+                    ref = ref[0]
+                return ref.reshape(-1)
+
+            ref = info.get("ids", {}).get("prompt")
+            if isinstance(ref, list):
+                ref = torch.tensor(ref, dtype=torch.long)
+            if isinstance(ref, torch.Tensor):
+                ref = ref.to(torch.long)
+                if ref.ndim > 1:
+                    ref = ref[0]
+                return ref.reshape(-1)
+
         return kwargs.get("prompt_token")
 
     @torch.no_grad()
@@ -545,6 +594,7 @@ class StepAudioCode2wav(nn.Module):
             raise ValueError("StepAudioCode2wav requires input_ids from the previous stage.")
         token = input_ids.reshape(-1)
         prompt_token = self._extract_prompt_token(runtime_additional_information, kwargs)
+        # logger.info(f"prompt_token: {prompt_token}")
         input_wav, sample_rate = self._extract_runtime_inputs(runtime_additional_information, kwargs)
         # logger.info(f"input_wav:{input_wav}, sample_rate:{sample_rate}")
         if input_wav is not None:
@@ -577,6 +627,28 @@ class StepAudioCode2wav(nn.Module):
             else:
                 session_id = None
                 last_chunk = False
+            logger.error(
+                "ASYNC_CODE2WAV input_ids_shape=%s token_shape=%s token_numel=%d "
+                "prompt_token_shape=%s prompt_token_numel=%d session_id=%s last_chunk=%s",
+                tuple(input_ids.shape) if input_ids is not None else None,
+                tuple(token.shape),
+                token.numel(),
+                tuple(prompt_token.shape) if isinstance(prompt_token, torch.Tensor) else None,
+                prompt_token.numel() if isinstance(prompt_token, torch.Tensor) else -1,
+                session_id,
+                last_chunk,
+            )
+            logger.error(
+                "ASYNC_CODE2WAV token min=%s max=%s prompt min=%s max=%s",
+                int(token.min().item()) if token.numel() else None,
+                int(token.max().item()) if token.numel() else None,
+                int(prompt_token.min().item())
+                if isinstance(prompt_token, torch.Tensor) and prompt_token.numel()
+                else None,
+                int(prompt_token.max().item())
+                if isinstance(prompt_token, torch.Tensor) and prompt_token.numel()
+                else None,
+            )
             audio = self.core.forward_chunk(token, prompt_token, speech_feat, speech_embedding, session_id, last_chunk)
             return OmniOutput(
                 text_hidden_states=None,
@@ -584,7 +656,15 @@ class StepAudioCode2wav(nn.Module):
                     "audio": audio,
                 },
             )
-        logger.info(f"token: {token}, prompt_token: {prompt_token}")
+        logger.error(
+            "CODE2WAV_SYNC_CODES token_len=%d head=%s tail=%s prompt_len=%d ref_len=%s",
+            int(token.numel()),
+            token[:20].detach().cpu().tolist(),
+            token[-20:].detach().cpu().tolist(),
+            int(prompt_token.numel()) if isinstance(prompt_token, torch.Tensor) else -1,
+            ...,
+        )
+        # logger.info(f"speech_feat: {speech_feat}, speech_embedding: {speech_embedding}")
         audio = self.core.forward(token, prompt_token, speech_feat, speech_embedding)
         return OmniOutput(
             text_hidden_states=None,

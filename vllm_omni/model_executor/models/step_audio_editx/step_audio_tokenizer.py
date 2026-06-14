@@ -190,20 +190,12 @@ class StepAudioTokenizer:
             instruct_prefix = self._build_audio_edit_instruction(prompt_text, edit_type, edit_info, target_text)
 
             prompt = self._build_edit_prompt(self.edit_sys_prompt, instruct_prefix, audio_tokens)
-        chat_text = self.text_tokenizer.apply_chat_template(
-            prompt,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        print("Final chat text repr:", repr(chat_text), flush=True)
 
-        token_ids = self.text_tokenizer.apply_chat_template(
+        return self.text_tokenizer.apply_chat_template(
             prompt,
             tokenize=True,
             add_generation_prompt=True,
         )
-
-        return token_ids
 
     @staticmethod
     def _load_audio(prompt_wav, prompt_wav_sr: int | list[int] | tuple[int, ...] | None = None):

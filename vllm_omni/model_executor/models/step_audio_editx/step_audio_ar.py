@@ -48,8 +48,8 @@ class StepAudioAR(nn.Module):
         *,
         edit_type: str,
         info_dict: dict[str, Any],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int | None, torch.Tensor | None]:
-        logger.info(f"Building prompt embeds for edit_type: {edit_type}, info_dict: {info_dict}")
+    ) -> tuple[torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # logger.info(f"Building prompt embeds for edit_type: {edit_type}, info_dict: {info_dict}")
 
         def _first(x, default=None):
             if isinstance(x, list):
@@ -59,7 +59,7 @@ class StepAudioAR(nn.Module):
         audio = _first(info_dict.get("ref_audio"), None)
         sample_rate = _first(info_dict.get("sr"), 16000)
         ref_audio, sr = self.tokenizer._load_audio(audio, sample_rate)
-        logger.info(f"ref_audio: {ref_audio}, sr: {sr}")
+        # logger.info(f"ref_audio: {ref_audio}, sr: {sr}")
         ref_text = _first(info_dict.get("ref_text"), "")
         text = _first(info_dict.get("text"), "")
         edit_type = _first(info_dict.get("edit_type"), "clone")
@@ -72,14 +72,14 @@ class StepAudioAR(nn.Module):
 
         # logger.info(f"ref_audio: {ref_audio}, ref_text: {ref_text}, text: {text}, sr: {sr}")
         prompt_token, codec_token = self.tokenizer.encode(edit_type, audio=ref_audio, prompt=prompt, sr=sr)
-        logger.info(f"prompt_token: {prompt_token}, len(input_ids): {len(prompt_token.input_ids)}")
-        input_ids = torch.tensor(prompt_token.input_ids)
-        input_ids = input_ids.to(next(self.model.parameters()).device)
+        # logger.info(f"prompt_token: {prompt_token}, len(input_ids): {len(prompt_token.input_ids)}")
+        prompt_token_ids = torch.tensor(prompt_token.input_ids, dtype=torch.long)
+        input_ids = prompt_token_ids.to(next(self.model.parameters()).device)
         logger.info(f"input_ids shape: {input_ids.shape}, codec_token shape: {codec_token.shape}")
         input_ids = self.embed_input_ids(input_ids)
         tts_pad_id = self.tokenizer.text_tokenizer.pad_token_id
         tts_pad_embed = self.embed_input_ids(torch.tensor([tts_pad_id]).to(input_ids.device))
-        return input_ids, codec_token.shape[1], codec_token, tts_pad_embed
+        return input_ids, codec_token.shape[1], codec_token, tts_pad_embed, prompt_token_ids
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
@@ -91,23 +91,35 @@ class StepAudioAR(nn.Module):
             info_dicts = kwargs.get("runtime_additional_information") or []
         if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
             logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
-        audio_codes_list: list[torch.Tensor] = []
+        ref_code_list: list[torch.Tensor] = []
         ref_code_len_list: list[torch.Tensor] = []
-        ref_code_tensor: torch.Tensor | None = None
+        audio_codes_list: list[torch.Tensor] = []
         codec_streaming_list: list[torch.Tensor] = []
-        sampling_metadata = kwargs.get("sampling_metadata")
-        output_token_ids = getattr(sampling_metadata, "output_token_ids", None)
-        ac = output_token_ids[0] if output_token_ids else []
+        has_ref_code = False
         for info in info_dicts:
             if not isinstance(info, dict):
+                ref_code_list.append(torch.empty(0, dtype=torch.long))
+                ref_code_len_list.append(torch.empty(0, dtype=torch.int32))
                 continue
             codes = info.get("codes", {})
             meta = info.get("meta", {})
+            ac = codes.get("audio")
+            if isinstance(ac, torch.Tensor):
+                audio_codes_list.append(ac)
+                cs = meta.get("codec_streaming")
+                if isinstance(cs, bool):
+                    codec_streaming_list.append(
+                        torch.full((int(ac.shape[0]),), int(cs), dtype=torch.int8, device=ac.device)
+                    )
             ref_code = codes.get("ref")
             if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-                ref_code_tensor = ref_code
+                ref_code_list.append(ref_code)
+                has_ref_code = True
+            else:
+                ref_code_list.append(torch.empty(0, dtype=torch.long))
             ref_len = meta.get("ref_code_len")
             if ref_len is None:
+                ref_code_len_list.append(torch.empty(0, dtype=torch.int32))
                 continue
             if isinstance(ref_len, torch.Tensor):
                 if ref_len.numel() == 0:
@@ -119,30 +131,18 @@ class StepAudioAR(nn.Module):
                 ref_len_val = int(ref_len[0])
             else:
                 ref_len_val = int(ref_len)
-            if isinstance(ac, torch.Tensor):
-                # Emit ref_code_len per-token span for runner slicing (consumer takes the last value).
-                ref_code_len_list.append(
-                    torch.full((int(ac.shape[0]),), ref_len_val, dtype=torch.int32, device=ac.device)
-                )
+            ref_code_len_list.append(torch.tensor([ref_len_val], dtype=torch.int32))
 
-        if not audio_codes_list and ref_code_tensor is None:
+        if not has_ref_code:
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
 
         mm: OmniPayload = {"codes": {}}
-
-        if audio_codes_list:
-            audio_codes = torch.cat(audio_codes_list, dim=0)
-            span_len = int(audio_codes.shape[0])
-            mm["codes"]["audio"] = audio_codes
-
-            if ref_code_len_list:
-                mm.setdefault("meta", {})["ref_code_len"] = torch.cat(ref_code_len_list, dim=0)[:span_len]
-            if codec_streaming_list:
-                mm.setdefault("meta", {})["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)[:span_len]
-
-        if ref_code_tensor is not None:
-            mm["codes"]["ref"] = [ref_code_tensor]
-
+        # Batch-aligned passthrough data. The runner selects each request's
+        # entry before serializing the multimodal payload.
+        mm["codes"]["ref"] = ref_code_list
+        mm.setdefault("meta", {})["ref_code_len"] = ref_code_len_list
+        if codec_streaming_list:
+            mm.setdefault("meta", {})["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
 
     def preprocess(
@@ -171,29 +171,54 @@ class StepAudioAR(nn.Module):
                 embeds = self.embed_input_ids(input_ids.to(torch.long))
             return input_ids, embeds, {}
 
-        text_list = info_dict.get("text")
-        if not isinstance(text_list, list) or not text_list or not text_list[0]:
-            raise ValueError("Missing additional_information.text for StepAudioEditX AR talker.")
-
         edit_type = info_dict.get("edit_type") or ["clone"]
 
         prompt_embeds_cpu = embed.get("prefill")
+        prompt_token_ids_cpu = embed.get("prompt_token_ids")
         tts_pad_embed_buf = embed.get("tts_pad")
+        # def _brief_value(x):
+        #     if isinstance(x, list):
+        #         return f"list(len={len(x)}, first={_brief_value(x[0]) if x else None})"
+        #     if isinstance(x, tuple):
+        #         return f"tuple(len={len(x)}, first={_brief_value(x[0]) if x else None})"
+        #     if isinstance(x, dict):
+        #         return f"dict(keys={list(x.keys())[:8]})"
+        #     if isinstance(x, torch.Tensor):
+        #         return f"Tensor(shape={tuple(x.shape)}, dtype={x.dtype}, device={x.device})"
+        #     if isinstance(x, np.ndarray):
+        #         return f"ndarray(shape={x.shape}, dtype={x.dtype})"
+        #     if isinstance(x, str):
+        #         return f"str(len={len(x)}, base={os.path.basename(x)})"
+        #     return f"{type(x).__name__}({x!r})"
+
+        # logger.error(
+        #     "AR_PREPROCESS_STATE req=%s add_info_id=%s embed_keys=%s meta=%s "
+        #     "prefill_shape=%s input_len=%d ref_audio=%s text=%s",
+        #     info_dict.get("request_id") or info_dict.get("req_id") or info_dict.get("request_id_str"),
+        #     id(additional_information) if isinstance(additional_information, dict) else None,
+        #     list(embed.keys()) if isinstance(embed, dict) else None,
+        #     meta,
+        #     tuple(prompt_embeds_cpu.shape) if isinstance(prompt_embeds_cpu, torch.Tensor) else None,
+        #     int(input_ids.shape[0]),
+        #     _brief_value(info_dict.get("ref_audio")),
+        #     _brief_value(info_dict.get("text")),
+        # )
         tts_pad_embed = None
         if isinstance(tts_pad_embed_buf, torch.Tensor) and tts_pad_embed_buf.numel() > 0:
             tts_pad_embed = tts_pad_embed_buf.to(
                 device=input_ids.device,
-                dtype=torch.bfloat16,
+                dtype=next(self.model.parameters()).dtype,
             ).reshape(1, -1)
 
         is_first_prefill = not isinstance(prompt_embeds_cpu, torch.Tensor) or prompt_embeds_cpu.ndim != 2
 
         if is_first_prefill:
-            full_prompt_embeds, ref_code_len, ref_code, tts_pad_embed = self._build_prompt_embeds(
+            full_prompt_embeds, ref_code_len, ref_code, tts_pad_embed, prompt_token_ids_cpu = self._build_prompt_embeds(
                 edit_type=edit_type,
                 info_dict=info_dict,
             )
             prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu").contiguous()
+            prompt_token_ids_cpu = prompt_token_ids_cpu.detach().to("cpu").contiguous()
             total_prefill_len = int(prompt_embeds_cpu.shape[0])
 
             take = prompt_embeds_cpu[:span_len]
@@ -202,10 +227,14 @@ class StepAudioAR(nn.Module):
                 pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
                 take = torch.cat([take, pad_rows], dim=0)
 
-            prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
+            prompt_embeds = take.to(
+                device=input_ids.device,
+                dtype=next(self.model.parameters()).dtype,
+            )
             info_update: OmniPayload = {
                 "embed": {
                     "prefill": prompt_embeds_cpu,
+                    "prompt_token_ids": prompt_token_ids_cpu,
                     "tts_pad": tts_pad_embed.detach(),
                 },
                 "meta": {
@@ -243,16 +272,17 @@ class StepAudioAR(nn.Module):
                 pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
                 take = torch.cat([take, pad_rows], dim=0)
 
-            prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
-
-            input_ids_out = input_ids.clone()
-            input_ids_out[:] = 0
-
+            prompt_embeds = take.to(
+                device=input_ids.device,
+                dtype=next(self.model.parameters()).dtype,
+            )
             info_update: OmniPayload = {
                 "meta": {
                     "talker_prefill_offset": min(offset + span_len, total_prefill_len),
                 }
             }
+            input_ids_out = input_ids.clone()
+            input_ids_out[:] = 0
             return input_ids_out, prompt_embeds, info_update
 
         # Decode stage.
@@ -260,7 +290,7 @@ class StepAudioAR(nn.Module):
         input_ids_out = input_ids.to(torch.long)
         prompt_embeds = self.embed_input_ids(input_ids_out).to(
             device=input_ids.device,
-            dtype=torch.bfloat16,
+            dtype=next(self.model.parameters()).dtype,
         )
         return input_ids_out, prompt_embeds, {}
 

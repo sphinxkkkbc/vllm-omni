@@ -37,7 +37,6 @@ from typing import Any
 import soundfile as sf
 from vllm import SamplingParams
 
-from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 
 logger = logging.getLogger(__name__)
@@ -117,7 +116,7 @@ def _build_inputs(args):
     if args.text is not None:
         syn_text_single = args.text
     else:
-        syn_text_single = "Good one. Okay, fine, I'm just gonna leave this sock monkey here. Goodbye."
+        syn_text_single = ""
     additional_information = {
         "edit_type": args.edit_type,
         "ref_audio": [ref_audio_single],
@@ -171,7 +170,6 @@ def run_e2e():
     )
     parser.add_argument("--ref-audio", type=str, default=None, help="Path to reference audio for voice cloning.")
     parser.add_argument("--output", type=str, default=None, help="Output audio path.")
-    nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
     # Ensure tokenizer directory exists
     if not os.path.exists(args.audio_tokenizer):
@@ -242,6 +240,7 @@ def run_e2e():
                     audio_out = mm["audio"]
                     print(f"Generated Audio Shape: {audio_out.shape}")
                     out_path = args.output if args.output else f"output_{i}.wav"
+                    os.makedirs(os.path.dirname(out_path), exist_ok=True)
                     sf.write(out_path, audio_out.cpu().numpy().squeeze(), 24000)
                     print(f"Saved audio to {out_path}")
             else:

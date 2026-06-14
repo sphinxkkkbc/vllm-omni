@@ -129,6 +129,7 @@ def run_tts_generation(args) -> None:
 
     # Save audio response
     output_path = args.output or "tts_output.wav"
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "wb") as f:
         f.write(response.content)
     print(f"Audio saved to: {output_path}")
