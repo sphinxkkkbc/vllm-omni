@@ -11,7 +11,6 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.model_executor.models.step_audio_editx.utils import load_audio_text_image_video, to_device
 
-# 这里的Encoder可能用非流式的SinusoidalPositionEncoder
 from .transformer_utils import (
     LayerNorm,
     MultiHeadedAttentionSANMwithMask,
