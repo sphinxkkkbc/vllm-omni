@@ -316,7 +316,6 @@ class Paraformer(torch.nn.Module):
     def __init__(
         self,
         normalize: str = None,
-        encoder: str = None,
         encoder_conf: dict | None = None,
         input_size: int = 80,
         vocab_size: int = -1,
@@ -329,7 +328,6 @@ class Paraformer(torch.nn.Module):
         **kwargs,
     ):
         super().__init__()
-        print(encoder_conf)
         self.encoder = SANMEncoderChunkOpt(input_size=input_size, **encoder_conf)
 
         self.blank_id = blank_id

@@ -14,7 +14,6 @@ Examples:
     python openai_speech_client.py
         --ref-audio /path/to/ref_audio.wav \
         --ref-text "This is the reference transcript" \
-        --text "What Are you talking about" \
         --edit-type "emotion" \
         --edit-info "angry" \
 

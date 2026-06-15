@@ -18,7 +18,6 @@ import yaml
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-# from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.cfm import CausalConditionalCFM
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
 
 # from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
@@ -74,6 +73,11 @@ class CosyVoiceFrontEnd:
         return torch.tensor([embedding])
 
 
+class CosyVoiceConfig:
+    encoder: dict
+    decoder: dict
+
+
 class CosyVoice(nn.Module):
     def __init__(
         self,
@@ -82,18 +86,21 @@ class CosyVoice(nn.Module):
         mel_cache_len: int = 8,
         n_timesteps: int = 10,
         dtype=torch.float32,
-        yaml_path=None,
+        config_path=None,
     ):
         super().__init__()
         self.model_dir = model_dir
-        self._target_dtype = dtype
-        config_path = yaml_path or f"{model_dir}/cosyvoice.yaml"
-        with open(config_path) as f:
-            configs = yaml.safe_load(f)
-
+        self.dtype = dtype
+        if config_path is None:
+            config_path = os.path.join(f"{model_dir}/CosyVoice-300M-25Hz/cosyvoice.yaml")
+        configs = self.resolve_cosyvoice_configs(config_path)
         flow_cfg = configs["flow"]
         decoder_cfg = flow_cfg["decoder"]
         cfm_params = SimpleNamespace(**decoder_cfg["cfm_params"])
+        self.frontend = CosyVoiceFrontEnd(
+            configs["mel_conf"],
+            campplus_model=f"{model_dir}/CosyVoice-300M-25Hz/campplus.onnx",
+        )
         self.flow = CausalMaskedDiffWithXvec(
             input_embedding=DualCodebookEmbedding(**flow_cfg["input_embedding"]),
             encoder=UpsampleConformerEncoderV2(**flow_cfg["encoder"]),
@@ -104,7 +111,6 @@ class CosyVoice(nn.Module):
                 cfm_params=cfm_params,
                 estimator=DiT(**decoder_cfg["estimator"]),
             ),
-            # decoder=CausalConditionalCFM(estimator=DiT(**decoder_cfg["estimator"])),
             input_size=flow_cfg["input_size"],
             output_size=flow_cfg["output_size"],
             spk_embed_dim=flow_cfg["spk_embed_dim"],
@@ -113,16 +119,11 @@ class CosyVoice(nn.Module):
         )
 
         hift_cfg = configs["hift"]
-        f0_predictor = StepAudioCausalConvRNNF0Predictor(**hift_cfg["f0_predictor"])
         self.hift = HiFTGenerator(
             **{k: v for k, v in hift_cfg.items() if k != "f0_predictor"},
-            f0_predictor=f0_predictor,
+            f0_predictor=StepAudioCausalConvRNNF0Predictor(**hift_cfg["f0_predictor"]),
         )
 
-        self.frontend = CosyVoiceFrontEnd(
-            configs["mel_conf"],
-            campplus_model=f"{model_dir}/CosyVoice-300M-25Hz/campplus.onnx",
-        )
         self.flow = self.flow.to(device=self.device, dtype=torch.float32)
         self.hift = self.hift.to(device=self.device, dtype=torch.float32)
         self.n_timesteps = n_timesteps
@@ -139,8 +140,52 @@ class CosyVoice(nn.Module):
         self.estimator_prompt_length_dict = {}
         self.spk_embedding_cache_dict = {}
         self.setup_lock = threading.Lock()
-        self.emitted_tail_dict = {}
-        self.chunk_debug_idx = {}
+
+    def resolve_cosyvoice_configs(self, yaml_path=None) -> CosyVoiceConfig:
+        if yaml_path is None:
+            yaml_path = f"{self.model_dir}/cosyvoice.yaml"
+        with open(yaml_path) as f:
+            configs = yaml.load(f, Loader=self._cosyvoice_config_loader())
+        return self._resolve_cosyvoice_configs(configs)
+
+    @staticmethod
+    def _cosyvoice_config_loader():
+        """Load official ``!new:...`` YAML nodes as plain config mappings."""
+
+        class Loader(yaml.SafeLoader):
+            pass
+
+        def construct_new(loader, tag_suffix, node):
+            if not isinstance(node, yaml.MappingNode):
+                raise ValueError(f"Unsupported CosyVoice config node for !new:{tag_suffix}")
+            return loader.construct_mapping(node, deep=True)
+
+        Loader.add_multi_constructor("!new:", construct_new)
+        return Loader
+
+    @staticmethod
+    def _resolve_cosyvoice_configs(configs: dict[str, Any]) -> dict[str, Any]:
+        """Resolve official CosyVoice YAML into the local plain config schema."""
+        if not isinstance(configs, dict):
+            raise ValueError("CosyVoice config must be a YAML mapping")
+        flow_cfg = configs["flow"]
+        decoder_cfg = flow_cfg["decoder"]
+
+        decoder_cfg.setdefault("in_channels", flow_cfg.get("output_size", 80))
+        decoder_cfg.setdefault("n_spks", 1)
+        decoder_cfg.setdefault("spk_emb_dim", flow_cfg.get("spk_embed_dim", 192))
+        if "cfm_params" not in decoder_cfg:
+            inference_cfg_rate = decoder_cfg.pop("inference_cfg_rate", 0.7)
+            decoder_cfg["cfm_params"] = {
+                "sigma_min": 1.0e-6,
+                "solver": "euler",
+                "t_scheduler": "cosine",
+                "training_cfg_rate": 0.2,
+                "inference_cfg_rate": inference_cfg_rate,
+                "reg_loss_type": "l1",
+            }
+
+        return configs
 
     def _feature_extract(self, input_wav: torch.Tensor, sr: int):
         if input_wav.shape[0] > 1:
@@ -174,15 +219,6 @@ class CosyVoice(nn.Module):
         speech_feat = speech_feat.to(flow_device, flow_dtype)
         speech_embedding = speech_embedding.to(flow_device, flow_dtype)
 
-        logger.error(
-            "FLOW_DTYPE_DEBUG flow=%s token=%s prompt=%s feat=%s emb=%s",
-            flow_dtype,
-            token.dtype,
-            prompt_token.dtype,
-            speech_feat.dtype,
-            speech_embedding.dtype,
-        )
-
         def _make_len(ts: torch.Tensor):
             return torch.tensor([ts.shape[1]], dtype=torch.long, device=ts.device)
 
@@ -206,13 +242,8 @@ class CosyVoice(nn.Module):
             speech_embedding.to(flow_dtype),
             self.n_timesteps,
         )
-        logger.info(f"mel: {mel}")
-        # hift_dtype = next(self.hift.parameters()).dtype
         mel = mel.to(self.device, torch.float32)
         speech, _ = self.hift.inference(mel)
-        # mel = mel.to(self.device, hift_dtype)
-        # speech, _ = self.hift.inference(mel)
-        logger.info(f"speech: {speech}")
 
         return speech.cpu().to(torch.float32)
 
@@ -225,15 +256,6 @@ class CosyVoice(nn.Module):
         session_id: str,
         last_chunk: bool,
     ):
-        logger.error(
-            "FORWARD_CHUNK token=%s prompt=%s feat=%s emb=%s session=%s last=%s",
-            tuple(token.shape),
-            tuple(prompt_token.shape),
-            tuple(prompt_feat.shape),
-            tuple(prompt_embedding.shape),
-            session_id,
-            last_chunk,
-        )
         from copy import deepcopy
 
         def _mixed_len(length: int):
@@ -322,53 +344,7 @@ class CosyVoice(nn.Module):
         hift_cache_speech = self.hift_cache_dict[session_id]["speech"].to(device=hift_device)
 
         mel = torch.concat([hift_cache_mel, mel], dim=2)
-
-        mel_f = mel.float()
-        logger.info(
-            "[ASYNC_MEL_DEBUG] session=%s last=%s mel_shape=%s mel_min=%.6f mel_max=%.6f "
-            "mel_mean=%.6f mel_std=%.6f mel_abs_max=%.6f",
-            session_id,
-            last_chunk,
-            tuple(mel.shape),
-            float(mel_f.min().item()),
-            float(mel_f.max().item()),
-            float(mel_f.mean().item()),
-            float(mel_f.std().item()),
-            float(mel_f.abs().max().item()),
-        )
-
         speech, source = self.hift.inference(mel, hift_cache_source)
-
-        raw_speech = speech
-        raw_diff = raw_speech.float().diff(dim=-1).abs()
-        logger.info(
-            "[ASYNC_RAW_SPEECH] session=%s last=%s raw_samples=%d raw_max_abs=%.6f "
-            "raw_max_delta=%.6f raw_max_abs_idx=%d raw_max_delta_idx=%d "
-            "mel_shape=%s source_shape=%s source_max_abs=%.6f",
-            session_id,
-            last_chunk,
-            int(raw_speech.shape[-1]),
-            float(raw_speech.abs().max().item()),
-            float(raw_diff.max().item()) if raw_diff.numel() > 0 else 0.0,
-            int(raw_speech.abs().reshape(-1).argmax().item()) if raw_speech.numel() > 0 else -1,
-            int(raw_diff.reshape(-1).argmax().item()) if raw_diff.numel() > 0 else -1,
-            tuple(mel.shape),
-            tuple(source.shape),
-            float(source.abs().max().item()) if source.numel() > 0 else 0.0,
-        )
-
-        if raw_diff.numel() > 0 and float(raw_diff.max().item()) > 1.5:
-            torch.save(
-                {
-                    "mel": mel.detach().cpu(),
-                    "speech": raw_speech.detach().cpu(),
-                    "source": source.detach().cpu(),
-                    "token": token.detach().cpu(),
-                    "last_chunk": last_chunk,
-                },
-                f"/tmp/step_audio_spike_{session_id}_{last_chunk}.pt",
-            )
-
         speech = speech.to(self.device)
         hift_cache_speech = hift_cache_speech.to(self.device)
         self.speech_window = self.speech_window.to(self.device)
@@ -381,42 +357,6 @@ class CosyVoice(nn.Module):
         )
         if not last_chunk:
             speech = speech[:, : -self.source_cache_len]
-
-        post_diff = speech.float().diff(dim=-1).abs()
-        logger.info(
-            "[ASYNC_POST_FADE] session=%s last=%s post_samples=%d post_max_abs=%.6f "
-            "post_max_delta=%.6f post_max_abs_idx=%d post_max_delta_idx=%d",
-            session_id,
-            last_chunk,
-            int(speech.shape[-1]),
-            float(speech.abs().max().item()),
-            float(post_diff.max().item()) if post_diff.numel() > 0 else 0.0,
-            int(speech.abs().reshape(-1).argmax().item()) if speech.numel() > 0 else -1,
-            int(post_diff.reshape(-1).argmax().item()) if post_diff.numel() > 0 else -1,
-        )
-
-        chunk_idx = int(self.chunk_debug_idx.get(session_id, 0))
-        self.chunk_debug_idx[session_id] = chunk_idx + 1
-        prev_tail = self.emitted_tail_dict.get(session_id)
-        if speech.numel() > 0:
-            head_len = min(400, int(speech.shape[-1]))
-            tail_len = min(400, int(speech.shape[-1]))
-            boundary_jump = None
-            if isinstance(prev_tail, torch.Tensor) and prev_tail.numel() > 0:
-                boundary_jump = float((speech[:, 0] - prev_tail[:, -1]).abs().max().item())
-            logger.info(
-                "[ASYNC_AUDIO_BOUNDARY] session=%s chunk=%d last=%s samples=%d "
-                "max_abs=%.6f head_rms=%.6f tail_rms=%.6f boundary_jump=%s",
-                session_id,
-                chunk_idx,
-                last_chunk,
-                int(speech.shape[-1]),
-                float(speech.abs().max().item()),
-                float(speech[:, :head_len].float().pow(2).mean().sqrt().item()),
-                float(speech[:, -tail_len:].float().pow(2).mean().sqrt().item()),
-                "None" if boundary_jump is None else f"{boundary_jump:.6f}",
-            )
-            self.emitted_tail_dict[session_id] = speech[:, -tail_len:].detach().clone()
 
         return speech.cpu().to(torch.float32)
 
@@ -500,10 +440,8 @@ class StepAudioCode2wav(nn.Module):
         self.enable_update_additional_information = True
         self.requires_raw_input_tokens = True
 
-        self.core = CosyVoice(
-            model_dir=self.model_path,
-            yaml_path="/root/autodl-tmp/vllm-omni/vllm_omni/model_executor/models/step_audio_editx/decoder/cosyvoice.yaml",
-        )
+        self.core = CosyVoice(model_dir=self.model_path)
+        # config_path="/root/autodl-tmp/vllm-omni/vllm_omni/model_executor/models/step_audio_editx/decoder/cosyvoice.yaml",
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         if input_ids.numel() == 0:
@@ -535,7 +473,6 @@ class StepAudioCode2wav(nn.Module):
             and isinstance(runtime_additional_information[0], dict)
         ):
             ref = runtime_additional_information[0].get("latent", {})
-            # logger.info(f"ref: {ref}")
             loaded = StepAudioTokenizer._load_audio(ref, kwargs.get("sample_rate"))
             if isinstance(loaded, list):
                 if len(loaded) != 1:
@@ -588,15 +525,11 @@ class StepAudioCode2wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
-        # logger.info(f"input_ids: {input_ids}")
-        # logger.info(f"runtime_additional_information: {runtime_additional_information}, kwargs: {kwargs}")
         if input_ids is None:
             raise ValueError("StepAudioCode2wav requires input_ids from the previous stage.")
         token = input_ids.reshape(-1)
         prompt_token = self._extract_prompt_token(runtime_additional_information, kwargs)
-        # logger.info(f"prompt_token: {prompt_token}")
         input_wav, sample_rate = self._extract_runtime_inputs(runtime_additional_information, kwargs)
-        # logger.info(f"input_wav:{input_wav}, sample_rate:{sample_rate}")
         if input_wav is not None:
             input_wav, sample_rate = self.preprocess_wav(input_wav, sample_rate)
         if prompt_token is None:
@@ -623,32 +556,9 @@ class StepAudioCode2wav(nn.Module):
                     last_chunk = bool(last_chunk.item())
                 else:
                     last_chunk = bool(last_chunk)
-                logger.info(f"session_id: {session_id}, last_chunk: {last_chunk}")
             else:
                 session_id = None
                 last_chunk = False
-            logger.error(
-                "ASYNC_CODE2WAV input_ids_shape=%s token_shape=%s token_numel=%d "
-                "prompt_token_shape=%s prompt_token_numel=%d session_id=%s last_chunk=%s",
-                tuple(input_ids.shape) if input_ids is not None else None,
-                tuple(token.shape),
-                token.numel(),
-                tuple(prompt_token.shape) if isinstance(prompt_token, torch.Tensor) else None,
-                prompt_token.numel() if isinstance(prompt_token, torch.Tensor) else -1,
-                session_id,
-                last_chunk,
-            )
-            logger.error(
-                "ASYNC_CODE2WAV token min=%s max=%s prompt min=%s max=%s",
-                int(token.min().item()) if token.numel() else None,
-                int(token.max().item()) if token.numel() else None,
-                int(prompt_token.min().item())
-                if isinstance(prompt_token, torch.Tensor) and prompt_token.numel()
-                else None,
-                int(prompt_token.max().item())
-                if isinstance(prompt_token, torch.Tensor) and prompt_token.numel()
-                else None,
-            )
             audio = self.core.forward_chunk(token, prompt_token, speech_feat, speech_embedding, session_id, last_chunk)
             return OmniOutput(
                 text_hidden_states=None,
@@ -656,15 +566,6 @@ class StepAudioCode2wav(nn.Module):
                     "audio": audio,
                 },
             )
-        logger.error(
-            "CODE2WAV_SYNC_CODES token_len=%d head=%s tail=%s prompt_len=%d ref_len=%s",
-            int(token.numel()),
-            token[:20].detach().cpu().tolist(),
-            token[-20:].detach().cpu().tolist(),
-            int(prompt_token.numel()) if isinstance(prompt_token, torch.Tensor) else -1,
-            ...,
-        )
-        # logger.info(f"speech_feat: {speech_feat}, speech_embedding: {speech_embedding}")
         audio = self.core.forward(token, prompt_token, speech_feat, speech_embedding)
         return OmniOutput(
             text_hidden_states=None,

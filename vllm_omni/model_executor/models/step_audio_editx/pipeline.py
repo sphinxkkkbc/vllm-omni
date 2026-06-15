@@ -21,6 +21,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.step_audio_editx"
 
 STEP_AUDIO_EDITX_PIPELINE = PipelineConfig(
     model_type="step_audio_editx",
+    hf_architectures=("Step1ForCausalLM",),
     stages=(
         StagePipelineConfig(
             stage_id=0,

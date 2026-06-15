@@ -1,3 +1,4 @@
+pipeline: step_audio_editx
 async_chunk: true
 
 stages:
@@ -11,7 +12,7 @@ stages:
       devices: "0"
     engine_args:
       worker_type: ar
-      model_stage: ar_stage
+      model_stage: ar_codec
       max_num_seqs: 16
       model_arch: StepAudioAR
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler

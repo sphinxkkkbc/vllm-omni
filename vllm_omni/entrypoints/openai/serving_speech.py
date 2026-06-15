@@ -2939,8 +2939,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request: OpenAICreateSpeechRequest,
         request_id: str,
     ) -> dict[str, Any]:
+        from examples.offline_inference.text_to_speech.step_audio_editx.end2end import _estimate_prompt_len
         from vllm_omni.inputs.data import token_inputs_omni
-        from vllm_omni.model_executor.models.step_audio_editx.end2end import _estimate_prompt_len
 
         extra_params = dict(request.extra_params or {})
         edit_type = extra_params.pop("edit_type", "clone")

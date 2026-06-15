@@ -15,7 +15,6 @@ Examples:
         --audio-tokenizer /path/to/tokenizer \
         --ref-audio /path/to/ref_audio.wav \
         --ref-text "This is the reference transcript" \
-        --text "What Are you talking about" \
         --edit-type "emotion" \
         --edit-info "angry" \
 
@@ -211,7 +210,6 @@ def run_e2e():
     logger.info(
         f"Task is {'edit: ' + args.edit_type if args.edit_type != 'clone' else 'clone'} for prompt: {args.text}"
     )
-    logger.info(f"omni inputs: {inputs}")
     outputs = list(omni.generate(inputs, sampling_params_list=sampling_params_list))
 
     if os.environ.get("VLLM_TORCH_PROFILER_DIR"):
@@ -219,7 +217,6 @@ def run_e2e():
         profile_results = omni.stop_profile()
         print(f"Profile traces saved to: {profile_results}")
 
-    print(outputs)
     # Verify outputs
     print(f"Received {len(outputs)} outputs.")
     for i, output in enumerate(outputs):

@@ -32,49 +32,93 @@ logger = logging.getLogger(__name__)
 
 
 class FunASRModel:
-    def __init__(self, model_path, config_path):
-        config_path = (
-            "/root/autodl-tmp/vllm-omni/vllm_omni/model_executor/models/step_audio_editx/audio_tokenizer/tokenizer.yaml"
-        )
-        with open(config_path, encoding="utf-8") as f:
-            kwargs = yaml.safe_load(f)
-        assert "model" in kwargs
-        kwargs["init_param"] = os.path.join(model_path, "model.pt")
-        kwargs["frontend_conf"]["cmvn_file"] = os.path.join(model_path, "am.mvn")
-        # Match the official Step-Audio-EditX tokenizer. A nonzero Kaldi
-        # dither changes VQ02 codes for the same waveform, which changes the
-        # AR prompt token ids and makes generation nondeterministic.
-        kwargs["frontend_conf"]["dither"] = 0.0
-
-        device = kwargs.get("device", "cuda")
-        if not torch.cuda.is_available() or kwargs.get("ngpu", 1) == 0:
-            device = "cpu"
-            kwargs["batch_size"] = 1
-        kwargs["device"] = device
-
-        if kwargs.get("ncpu", None):
-            torch.set_num_threads(kwargs.get("ncpu"))
-        vocab_size = -1
-        self.frontend = WavFrontendOnline(**kwargs["frontend_conf"])
+    def __init__(self, model_path):
+        self.config_path = os.path.join(model_path, "config.yaml")
+        kwargs = self.resolve_config(self.config_path)
+        self.frontend = WavFrontendOnline(cmvn_file=os.path.join(model_path, "am.mvn"), **kwargs["frontend_conf"])
         kwargs["frontend"] = self.frontend
-        kwargs["input_size"] = self.frontend.output_size()
         self.model = ParaformerStreaming(
             **kwargs["model_conf"],
-            vocab_size=vocab_size,
             encoder_conf=kwargs["encoder_conf"],
-            input_size=kwargs["input_size"],
+            input_size=self.frontend.output_size(),
         )
-        state = torch.load(kwargs["init_param"], map_location="cpu")
+        state = torch.load(os.path.join(model_path, "model.pt"), map_location="cpu")
 
         if isinstance(state, dict):
             state = state.get("state_dict", state.get("model", state))
 
         self.model.load_weights(state.items())
-        self.model.to(device).eval()
-        init_param = kwargs.get("init_param", None)
-        if init_param is None:
-            raise ValueError("init_param is required but was not provided or is None")
+        self.model.to("cuda").eval()
         self.kwargs = kwargs
+
+    def resolve_config(self, config_path):
+        with open(config_path, encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        return self._resolve_config(config)
+
+    @staticmethod
+    def _resolve_config(config):
+        """Resolve the official FunASR config to the local runtime schema."""
+        if not isinstance(config, dict):
+            raise ValueError("FunASR config must be a YAML mapping")
+
+        model_conf_src = config.get("model_conf") or {}
+        encoder_conf_src = config.get("encoder_conf") or {}
+        frontend_conf_src = config.get("frontend_conf") or {}
+
+        model_keys = {
+            "ctc_weight",
+            "lsm_weight",
+            "length_normalized_loss",
+            "predictor_weight",
+            "predictor_bias",
+            "sampling_ratio",
+        }
+        model_conf = {key: model_conf_src[key] for key in model_keys if key in model_conf_src}
+        frontend_keys = {
+            "fs",
+            "window",
+            "n_mels",
+            "frame_length",
+            "frame_shift",
+            "filter_length_min",
+            "filter_length_max",
+            "lfr_m",
+            "lfr_n",
+            "dither",
+            "snip_edges",
+            "upsacle_samples",
+        }
+        frontend_conf = {key: frontend_conf_src[key] for key in frontend_keys if key in frontend_conf_src}
+
+        encoder_conf = {
+            "output_size": encoder_conf_src.get("output_size", 256),
+            "attention_heads": encoder_conf_src.get("attention_heads", 4),
+            "linear_units": encoder_conf_src.get("linear_units", 2048),
+            "num_blocks": encoder_conf_src.get("num_blocks", 6),
+            "normalize_before": encoder_conf_src.get("normalize_before", True),
+            "kernel_size": encoder_conf_src.get("kernel_size", 11),
+            "sanm_shift": encoder_conf_src.get("sanm_shift", encoder_conf_src.get("sanm_shift", 0)),
+        }
+
+        device = "cuda"
+        if not torch.cuda.is_available():
+            device = "cpu"
+
+        return {
+            "model": config.get("model", "ParaformerStreaming"),
+            "model_conf": model_conf,
+            "encoder": config.get("encoder", "SANMEncoderChunkOpt"),
+            "encoder_conf": encoder_conf,
+            "frontend": config.get("frontend", "WavFrontendOnline"),
+            "frontend_conf": frontend_conf,
+            "device": device,
+            "batch_size": 1,
+            "data_type": "sound",
+            "chunk_size": [0, 4, 5],
+            "encoder_chunk_look_back": 4,
+            "decoder_chunk_look_back": 1,
+        }
 
     @torch.inference_mode()
     def infer_encoder(self, input, input_len=None, kwargs=None, key=None, **cfg):
@@ -113,9 +157,8 @@ class StepAudioTokenizer:
         if not tokenizer_path:
             raise ValueError("audio_tokenizer_path is not set")
         self.text_tokenizer = AutoTokenizer.from_pretrained(config_path, trust_remote_code=True)
-        # logger.info(f"Successfully load tokenizer from {config_path}")
         self.funasr_tokenizer_path = os.path.join(tokenizer_path, funasr_model_id)
-        self.funasr_model = FunASRModel(model_path=self.funasr_tokenizer_path, config_path=self.funasr_tokenizer_path)
+        self.funasr_model = FunASRModel(model_path=self.funasr_tokenizer_path)
         self.kms_path = os.path.join(tokenizer_path, "linguistic_tokenizer.npy")
         self.cosy_tokenizer_path = os.path.join(tokenizer_path, "speech_tokenizer_v1.onnx")
         self.kms = torch.tensor(np.load(self.kms_path))
@@ -171,7 +214,6 @@ class StepAudioTokenizer:
 
     def _audio_tokenize(self, audio, sr):
         vq0206_codes, vq02_codes_ori, vq06_codes_ori = self.wav2token(audio, sr)
-        # print(f"vq02_codes_ori: {vq02_codes_ori}, vq06_codes_ori: {vq06_codes_ori}")
         audio_tokens = self.merge_vq0206_to_token_str(vq02_codes_ori, vq06_codes_ori)
         return audio_tokens, vq0206_codes
 

@@ -101,7 +101,6 @@ def ar2decoder(source_outputs: list[Any], prompt: Any = None, _requires_multimod
     from vllm_omni.inputs.data import OmniTokensPrompt
 
     talker_outputs = source_outputs
-    logger.info(f"talker_outputs: {talker_outputs}")
     additional_information = prompt.get("additional_information") or {}
     ref_audio = _extract_ref_audio(additional_information)
     code2wav_inputs: list[OmniTokensPrompt] = []
@@ -152,7 +151,6 @@ def talker2code2wav_token_only(
         if not talker_output.finished:
             continue
         output = talker_output.outputs[0]
-        # logger.info(f"output: {output}")
         mm = output.multimodal_output if hasattr(output, "multimodal_output") else None
         audio_codes = output.token_ids if output.token_ids is not None else []
         if isinstance(audio_codes, torch.Tensor):
@@ -161,7 +159,6 @@ def talker2code2wav_token_only(
         audio_codes = torch.tensor([int(t) - 65536 for t in audio_codes if int(t) >= 65536])
         if isinstance(audio_codes, list):
             audio_codes = torch.tensor(audio_codes, dtype=torch.long)
-        # logger.info(f"audio_codes: {audio_codes}")
         mm = mm if isinstance(mm, dict) else {}
         mm_codes = mm.get("codes", {}) if isinstance(mm, dict) else {}
         ref_code = mm_codes.get("ref", None) if isinstance(mm_codes, dict) else None
@@ -169,9 +166,7 @@ def talker2code2wav_token_only(
             ref_code = ref_code.to(torch.long)
             ref_code = ref_code - 65536
         ref_code_len = mm["meta"].get("ref_code_len")[0] if isinstance(mm, dict) else 0
-        logger.info(f"ref_code_len: {ref_code_len}")
         audio = prompt["additional_information"].get("ref_audio") if isinstance(prompt, dict) else None
-        # logger.info(f"audio: {audio}")
 
         additional_information = to_dict(
             OmniPayloadStruct(
@@ -197,7 +192,6 @@ def talker2code2wav_full_payload(
     pooling_output,
     request,
 ):
-    logger.info(f"pooling_output: {pooling_output}, request: {request}")
     """Producer-side payload builder.
 
     Reads accumulated codec from `pooling_output["codes.audio"]` (CONCAT
@@ -274,9 +268,7 @@ def talker2code2wav_async_chunk(
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
-    # logger.info(f"pooling_output: {pooling_output}")
     additional_information = getattr(request, "additional_information", None)
-    # logger.info(f"additional_information: {additional_information}")
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
     request_payload = getattr(transfer_manager, "request_payload", None)
@@ -302,7 +294,6 @@ def talker2code2wav_async_chunk(
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
-    # logger.info(f"cfg: {cfg}")
     chunk_size = int(cfg.get("codec_chunk_frames", 15))
     lookahead_size = int(cfg.get("codec_left_context_frames", 0))
     initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)

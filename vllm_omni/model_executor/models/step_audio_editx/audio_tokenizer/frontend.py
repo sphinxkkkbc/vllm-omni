@@ -240,8 +240,6 @@ class WavFrontendOnline(nn.Module):
                     cache["reserve_waveforms"] = torch.empty(0)
                 else:
                     reserve_frame_idx = lfr_splice_frame_idxs[0] - minus_frame
-                    # print('reserve_frame_idx:  ' + str(reserve_frame_idx))
-                    # print('frame_frame:  ' + str(frame_from_waveforms))
                     cache["reserve_waveforms"] = cache["waveforms"][
                         :,
                         reserve_frame_idx * self.frame_shift_sample_length : frame_from_waveforms
