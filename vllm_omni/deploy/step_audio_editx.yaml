@@ -1,4 +1,3 @@
-pipeline: step_audio_editx
 async_chunk: true
 
 stages:

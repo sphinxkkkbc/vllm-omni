@@ -2939,8 +2939,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request: OpenAICreateSpeechRequest,
         request_id: str,
     ) -> dict[str, Any]:
-        from examples.offline_inference.text_to_speech.step_audio_editx.end2end import _estimate_prompt_len
         from vllm_omni.inputs.data import token_inputs_omni
+        from vllm_omni.model_executor.models.step_audio_editx.prompt_utils import (
+            estimate_step_audio_editx_prompt_len,
+        )
 
         extra_params = dict(request.extra_params or {})
         edit_type = extra_params.pop("edit_type", "clone")
@@ -2956,7 +2958,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         tokenizer_path = os.environ.get("STEP_AUDIO_TOKENIZER_PATH")
         if not tokenizer_path:
             raise RuntimeError("STEP_AUDIO_TOKENIZER_PATH must be set for StepAudioEditX.")
-        prompt_len = _estimate_prompt_len(
+        prompt_len = estimate_step_audio_editx_prompt_len(
             additional_information,
             model_path=self.engine_client.model_config.model,
             tokenizer_path=tokenizer_path,

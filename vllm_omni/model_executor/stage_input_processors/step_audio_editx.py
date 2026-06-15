@@ -6,6 +6,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import CodesStruct, IdsStruct, MetaStruct, OmniPayload, OmniPayloadStruct, to_dict
+from vllm_omni.engine.mm_outputs import MultimodalPayload
 
 logger = init_logger(__name__)
 
@@ -49,7 +50,7 @@ def _extract_ref_audio(additional_information: Any) -> Any:
     return None
 
 
-def _extract_ref_payload(mm: Any) -> tuple[torch.Tensor, int]:
+def _extract_ref_payload(mm: OmniPayload) -> tuple[torch.Tensor, int]:
     mm_codes = _payload_get(mm, "codes", {})
     mm_meta = _payload_get(mm, "meta", {})
     ref_code = _payload_get(mm_codes, "ref")
@@ -81,60 +82,6 @@ def _extract_ref_payload(mm: Any) -> tuple[torch.Tensor, int]:
     return ref_code, ref_code_len
 
 
-def _build_code2wav_additional_information(
-    ref_code: torch.Tensor,
-    ref_code_len: int,
-    ref_audio: Any,
-) -> dict[str, Any]:
-    additional_information = to_dict(
-        OmniPayloadStruct(
-            meta=MetaStruct(left_context_size=ref_code_len) if ref_code_len > 0 else None,
-            codes=CodesStruct(ref=ref_code),
-        )
-    )
-    if ref_audio is not None:
-        additional_information["latent"] = ref_audio
-    return additional_information
-
-
-def ar2decoder(source_outputs: list[Any], prompt: Any = None, _requires_multimodal_data: bool = False):
-    from vllm_omni.inputs.data import OmniTokensPrompt
-
-    talker_outputs = source_outputs
-    additional_information = prompt.get("additional_information") or {}
-    ref_audio = _extract_ref_audio(additional_information)
-    code2wav_inputs: list[OmniTokensPrompt] = []
-    for i, talker_output in enumerate(talker_outputs):
-        if not talker_output.finished:
-            # Non-async decode should only run once, after talker has
-            # accumulated the final code sequence.
-            continue
-        output = talker_output.outputs[0]
-        mm = getattr(output, "multimodal_output", None) or getattr(talker_output, "multimodal_output", None)
-        token_ids = output.token_ids
-
-        if isinstance(token_ids, torch.Tensor):
-            token_ids = token_ids.detach().cpu().tolist()
-
-        codec_codes = [int(tid) - 65536 for tid in token_ids if int(tid) >= 65536]
-        if len(codec_codes) < 5:
-            raise RuntimeError(
-                f"StepAudio AR generated too few codec tokens: {len(codec_codes)}; tail={token_ids[-30:]}"
-            )
-        ref_code, ref_code_len = _extract_ref_payload(mm)
-
-        additional_information = _build_code2wav_additional_information(ref_code, ref_code_len, ref_audio)
-        code2wav_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=codec_codes,
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
-                additional_information=additional_information if additional_information else None,
-            )
-        )
-    return code2wav_inputs
-
-
 def talker2code2wav_token_only(
     source_outputs: list,
     prompt=None,
@@ -146,6 +93,8 @@ def talker2code2wav_token_only(
     """
     from vllm_omni.inputs.data import OmniTokensPrompt
 
+    additional_information = prompt.get("additional_information", None)
+    ref_audio = _extract_ref_audio(additional_information)
     code2wav_inputs: list = []
     for i, talker_output in enumerate(source_outputs):
         if not talker_output.finished:
@@ -159,22 +108,24 @@ def talker2code2wav_token_only(
         audio_codes = torch.tensor([int(t) - 65536 for t in audio_codes if int(t) >= 65536])
         if isinstance(audio_codes, list):
             audio_codes = torch.tensor(audio_codes, dtype=torch.long)
-        mm = mm if isinstance(mm, dict) else {}
-        mm_codes = mm.get("codes", {}) if isinstance(mm, dict) else {}
-        ref_code = mm_codes.get("ref", None) if isinstance(mm_codes, dict) else None
-        if isinstance(ref_code, torch.Tensor):
-            ref_code = ref_code.to(torch.long)
-            ref_code = ref_code - 65536
-        ref_code_len = mm["meta"].get("ref_code_len")[0] if isinstance(mm, dict) else 0
-        audio = prompt["additional_information"].get("ref_audio") if isinstance(prompt, dict) else None
+        if isinstance(mm, MultimodalPayload):
+            metadata = mm.metadata
+            mm_codes = metadata.get("codes", {})
+            meta = metadata.get("meta", {})
+            ref_code = mm_codes.get("ref", None) if isinstance(mm_codes, dict) else None
+            if isinstance(ref_code, torch.Tensor):
+                ref_code = ref_code.to(torch.long)
+                ref_code = ref_code - 65536
+            ref_code_len = meta.get("ref_code_len")[0] if isinstance(meta, dict) else 0
 
         additional_information = to_dict(
             OmniPayloadStruct(
                 meta=MetaStruct(left_context_size=ref_code_len) if ref_code_len > 0 else None,
                 codes=CodesStruct(ref=ref_code),
-                latent=audio,
             )
         )
+        if ref_audio is not None:
+            additional_information["ref_audio"] = ref_audio
         code2wav_inputs.append(
             OmniTokensPrompt(
                 # prompt_token_ids=[0] * len(audio_codes),
@@ -264,7 +215,7 @@ def talker2code2wav_full_payload(
 
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: OmniPayload | None,
+    multimodal_output: OmniPayload | None,
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
@@ -278,7 +229,7 @@ def talker2code2wav_async_chunk(
         transfer_manager.request_payload = request_payload
 
     ref_audio = additional_information.entries.get("ref_audio").list_data if additional_information else None
-    ref_code, ref_code_len = _extract_ref_payload(pooling_output)
+    ref_code, ref_code_len = _extract_ref_payload(multimodal_output)
     state = transfer_manager.request_payload.setdefault(request_id, {})
     seen_len = int(state.get("seen_len", 0))
 

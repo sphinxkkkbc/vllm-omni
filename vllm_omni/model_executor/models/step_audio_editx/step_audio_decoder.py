@@ -396,8 +396,6 @@ class CosyVoice(nn.Module):
         self.chunk_cache_dict.pop(session_id, None)
         self.estimator_prompt_length_dict.pop(session_id, None)
         self.spk_embedding_cache_dict.pop(session_id, None)
-        self.emitted_tail_dict.pop(session_id, None)
-        self.chunk_debug_idx.pop(session_id, None)
 
     @cached_property
     def device(self):
@@ -472,7 +470,9 @@ class StepAudioCode2wav(nn.Module):
             and runtime_additional_information
             and isinstance(runtime_additional_information[0], dict)
         ):
-            ref = runtime_additional_information[0].get("latent", {})
+            ref = runtime_additional_information[0].get("ref_audio")
+            if ref is None:
+                ref = runtime_additional_information[0].get("latent", {})
             loaded = StepAudioTokenizer._load_audio(ref, kwargs.get("sample_rate"))
             if isinstance(loaded, list):
                 if len(loaded) != 1:
@@ -560,6 +560,8 @@ class StepAudioCode2wav(nn.Module):
                 session_id = None
                 last_chunk = False
             audio = self.core.forward_chunk(token, prompt_token, speech_feat, speech_embedding, session_id, last_chunk)
+            if audio is None:
+                return OmniOutput(text_hidden_states=None, multimodal_outputs={})
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
