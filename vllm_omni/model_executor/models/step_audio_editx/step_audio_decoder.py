@@ -19,8 +19,7 @@ from vllm.config import VllmConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
-
-# from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
+from vllm_omni.model_executor.models.cosyvoice3.utils import mel_spectrogram
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.step_audio_editx.decoder.flow import (
     CausalMaskedDiffWithXvec,
@@ -31,7 +30,6 @@ from vllm_omni.model_executor.models.step_audio_editx.decoder.flow import (
 from vllm_omni.model_executor.models.step_audio_editx.decoder.hift import StepAudioCausalConvRNNF0Predictor
 
 from .decoder.cfm import StepCausalConditionalCFM as CausalConditionalCFM
-from .decoder.mel import mel_spectrogram
 from .step_audio_tokenizer import StepAudioTokenizer
 
 torch.backends.cudnn.enabled = False
@@ -439,7 +437,6 @@ class StepAudioCode2wav(nn.Module):
         self.requires_raw_input_tokens = True
 
         self.core = CosyVoice(model_dir=self.model_path)
-        # config_path="/root/autodl-tmp/vllm-omni/vllm_omni/model_executor/models/step_audio_editx/decoder/cosyvoice.yaml",
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         if input_ids.numel() == 0:

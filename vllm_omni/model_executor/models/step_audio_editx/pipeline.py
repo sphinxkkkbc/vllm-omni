@@ -25,7 +25,7 @@ STEP_AUDIO_EDITX_PIPELINE = PipelineConfig(
     stages=(
         StagePipelineConfig(
             stage_id=0,
-            model_stage="ar_codec",
+            model_stage="step_audio_editx_ar",
             model_arch="StepAudioAR",
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
@@ -36,7 +36,7 @@ STEP_AUDIO_EDITX_PIPELINE = PipelineConfig(
         ),
         StagePipelineConfig(
             stage_id=1,
-            model_stage="code2wav",
+            model_stage="step_audio_editx_code2wav",
             model_arch="StepAudioCode2wav",
             execution_type=StageExecutionType.LLM_GENERATION,
             input_sources=(0,),

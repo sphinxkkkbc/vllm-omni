@@ -36,7 +36,7 @@ import soundfile as sf
 from vllm import SamplingParams
 
 from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.model_executor.models.step_audio_editx.prompt_utils import (
+from vllm_omni.model_executor.models.step_audio_editx.step_audio_tokenizer import (
     estimate_step_audio_editx_prompt_len,
 )
 
@@ -72,7 +72,7 @@ def _build_inputs(args):
     }
     if args.edit_info is not None:
         additional_information.update({"edit_info": args.edit_info})
-    input_length = estimate_step_audio_editx_prompt_len(additional_information, args.model, args.audio_tokenizer)
+    input_length = estimate_step_audio_editx_prompt_len(additional_information, args.model)
     inputs = {
         "prompt_token_ids": [0] * input_length,
         "additional_information": additional_information,

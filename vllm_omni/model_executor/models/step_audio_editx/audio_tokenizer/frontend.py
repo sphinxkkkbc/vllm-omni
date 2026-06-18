@@ -130,17 +130,19 @@ class WavFrontendOnline(nn.Module):
 
     def forward_fbank(
         self,
-        input: torch.Tensor,
+        input_tensor: torch.Tensor,
         input_lengths: torch.Tensor,
         cache: dict = {},
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size = input.size(0)
+        batch_size = input_tensor.size(0)
         assert batch_size == 1
-        input = torch.cat((cache["input_cache"], input), dim=1)
-        frame_num = self.compute_frame_num(input.shape[-1], self.frame_sample_length, self.frame_shift_sample_length)
+        input_tensor = torch.cat((cache["input_cache"], input_tensor), dim=1)
+        frame_num = self.compute_frame_num(
+            input_tensor.shape[-1], self.frame_sample_length, self.frame_shift_sample_length
+        )
         # update self.in_cache
-        cache["input_cache"] = input[:, -(input.shape[-1] - frame_num * self.frame_shift_sample_length) :]
+        cache["input_cache"] = input_tensor[:, -(input_tensor.shape[-1] - frame_num * self.frame_shift_sample_length) :]
         waveforms = torch.empty(0)
         feats_pad = torch.empty(0)
         feats_lens = torch.empty(0)
@@ -149,7 +151,7 @@ class WavFrontendOnline(nn.Module):
             feats = []
             feats_lens = []
             for i in range(batch_size):
-                waveform = input[i].cuda()
+                waveform = input_tensor[i].cuda()
                 # we need accurate wave samples that used for fbank extracting
                 waveforms.append(
                     waveform[: ((frame_num - 1) * self.frame_shift_sample_length + self.frame_sample_length)]
@@ -180,17 +182,17 @@ class WavFrontendOnline(nn.Module):
 
     def forward_lfr_cmvn(
         self,
-        input: torch.Tensor,
+        input_tensor: torch.Tensor,
         input_lengths: torch.Tensor,
         is_final: bool = False,
         cache: dict = {},
     ):
-        batch_size = input.size(0)
+        batch_size = input_tensor.size(0)
         feats = []
         feats_lens = []
         lfr_splice_frame_idxs = []
         for i in range(batch_size):
-            mat = input[i, : input_lengths[i], :]
+            mat = input_tensor[i, : input_lengths[i], :]
             if self.lfr_m != 1 or self.lfr_n != 1:
                 mat, cache["lfr_splice_cache"][i], lfr_splice_frame_idx = self.apply_lfr(
                     mat, self.lfr_m, self.lfr_n, is_final
@@ -206,23 +208,25 @@ class WavFrontendOnline(nn.Module):
         lfr_splice_frame_idxs = torch.as_tensor(lfr_splice_frame_idxs)
         return feats_pad, feats_lens, lfr_splice_frame_idxs
 
-    def forward(self, input: torch.Tensor, input_lengths: torch.Tensor, **kwargs):
+    def forward(self, input_tensor: torch.Tensor, input_lengths: torch.Tensor, **kwargs):
         is_final = kwargs.get("is_final", False)
         cache = kwargs.get("cache", {})
         if len(cache) == 0:
             self.init_cache(cache)
 
-        batch_size = input.shape[0]
+        batch_size = input_tensor.shape[0]
         assert batch_size == 1, "we support to extract feature online only when the batch size is equal to 1 now"
-
-        waveforms, feats, feats_lengths = self.forward_fbank(input, input_lengths, cache=cache)  # input shape: B T D
-
+        waveforms, feats, feats_lengths = self.forward_fbank(
+            input_tensor, input_lengths, cache=cache
+        )  # input shape: B T D
         if feats.shape[0]:
             cache["waveforms"] = torch.cat((cache["reserve_waveforms"], waveforms.cpu()), dim=1)
 
-            if not cache["lfr_splice_cache"]:  # 初始化splice_cache
+            if not cache["lfr_splice_cache"]:  # init lfr_splice_cache
                 for i in range(batch_size):
-                    cache["lfr_splice_cache"].append(feats[i][0, :].unsqueeze(dim=0).repeat((self.lfr_m - 1) // 2, 1))
+                    cache["lfr_splice_cache"].append(
+                        feats[i][0, :].unsqueeze(dim=0).repeat((self.lfr_m - 1) // 2, 1)
+                    )  # 3
             # need the number of the input frames + self.lfr_splice_cache[0].shape[0] is greater than self.lfr_m
             if feats_lengths[0] + cache["lfr_splice_cache"][0].shape[0] >= self.lfr_m:
                 lfr_splice_cache_tensor = torch.stack(cache["lfr_splice_cache"])  # B T D

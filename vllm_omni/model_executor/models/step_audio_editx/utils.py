@@ -9,7 +9,7 @@ import string
 import tempfile
 from urllib.parse import urlparse
 
-import librosa
+import librosa  # noqa: TID251
 import numpy as np
 import requests
 import torch
@@ -32,13 +32,17 @@ speaker audio tokens:
 [speaker_end]
 """
 
-AUDIO_EDIT_SYSTEM_PROMPT = """As a highly skilled audio editing and tuning specialist, you excel in interpreting user instructions and applying precise adjustments to meet their needs. Your expertise spans a wide range of enhancement capabilities, including but not limited to:
-# Emotional Enhancement
-# Speaking Style Transfer
-# Non-linguistic Adjustments
-# Audio Tuning & Editing
-Note: You will receive instructions in natural language and are expected to accurately interpret and execute the most suitable audio edits and enhancements.
-"""
+AUDIO_EDIT_SYSTEM_PROMPT = (
+    "As a highly skilled audio editing and tuning specialist, you excel in interpreting user instructions and applying "
+    "precise adjustments to meet their needs. Your expertise spans a wide range of enhancement capabilities, including "
+    "but not limited to:\n"
+    "# Emotional Enhancement\n"
+    "# Speaking Style Transfer\n"
+    "# Non-linguistic Adjustments\n"
+    "# Audio Tuning & Editing\n"
+    "Note: You will receive instructions in natural language and are expected to accurately interpret and execute the "
+    "most suitable audio edits and enhancements.\n"
+)
 
 
 def resample_audio(wav, original_sample_rate, target_sample_rate):

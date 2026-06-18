@@ -1,11 +1,13 @@
 import base64
 import io
 import logging
+import math
 import os
 import os.path
 import threading
 import time
 from collections.abc import Iterable
+from typing import Any
 from urllib.parse import unquote, urlparse
 
 import numpy as np
@@ -29,6 +31,114 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def estimate_vq02_len(num_samples: int) -> int:
+    frame_len = 400
+    frame_shift = 160
+    chunk_stride = 4 * 960  # 3840
+    lfr_m = 7
+    lfr_n = 6
+    left_ctx = (lfr_m - 1) // 2  # 3
+
+    if num_samples <= 0:
+        return 0
+
+    full_chunks = num_samples // chunk_stride
+    tail_samples = num_samples % chunk_stride
+
+    # In the default StepAudioEditX streaming frontend, each complete 3840-sample
+    # chunk contributes four LFR frames. The first chunk gets a 3-frame left
+    # context; subsequent full chunks reuse the 1-frame LFR splice cache.
+    total = full_chunks * 4
+
+    if tail_samples == 0:
+        return total
+
+    # The final partial chunk is processed with the steady-state caches left by
+    # previous complete chunks: 320 waveform samples for fbank and 1 LFR frame.
+    input_cache_len = 320 if full_chunks > 0 else 0
+    lfr_cache_len = 1 if full_chunks > 0 else left_ctx
+
+    effective_len = input_cache_len + tail_samples
+    if effective_len < frame_len:
+        return total
+
+    tail_fbank_len = int((effective_len - frame_len) / frame_shift + 1)
+    if tail_fbank_len < 1:
+        return total
+
+    tail_lfr_input_len = lfr_cache_len + tail_fbank_len
+
+    if tail_lfr_input_len < lfr_m:
+        return total
+
+    tail_lfr_len = max(0, math.ceil((tail_lfr_input_len - left_ctx) / lfr_n))
+
+    return total + tail_lfr_len
+
+
+def estimate_step_audio_editx_prompt_len(
+    additional_information: dict[str, Any],
+    model_path: str,
+) -> int:
+    from .step_audio_tokenizer import StepAudioTokenizer
+
+    config_path = os.path.dirname(model_path) if model_path.endswith("tokenizer_config.json") else model_path
+    text_tokenizer = AutoTokenizer.from_pretrained(config_path, trust_remote_code=True)
+
+    try:
+
+        def _first(x, default=None):
+            if isinstance(x, list):
+                return x[0] if x else default
+            return x if x is not None else default
+
+        ref_audio = _first(additional_information.get("ref_audio"), None)
+        ref_text = _first(additional_information.get("ref_text"), "")
+        text = _first(additional_information.get("text"), "")
+        sr = _first(additional_information.get("sr"), 16000)
+        edit_type = _first(additional_information.get("edit_type", "clone"))
+
+        ref_audio = StepAudioTokenizer.preprocess_wav(ref_audio, sr)
+        ref_audio = ref_audio.squeeze(0)
+
+        audio_chunks = StepAudioTokenizer.split_audio(ref_audio, chunk_duration=30 * 16000)
+        vq06_len = 0
+        for chunks in audio_chunks:
+            duration = round(chunks.shape[0] / 16000, 2)
+            vq06_len += math.ceil(duration * 25)
+
+        vq02_len = estimate_vq02_len(len(ref_audio))
+        estimated_audio_token_len = min(vq02_len // 2, vq06_len // 3) * 5
+
+        dummy_audio_len = 1
+        dummy_audio = "".join(f"<audio_{i}>" for i in range(dummy_audio_len))
+
+        if edit_type == "clone":
+            prompt_speaker = "debug"
+            prompt = StepAudioTokenizer._build_clone_prompt(
+                text,
+                ref_text,
+                prompt_speaker,
+                dummy_audio,
+            )
+        else:
+            edit_info = _first(additional_information.get("edit_info", None))
+            instruct_prefix = StepAudioTokenizer._build_audio_edit_instruction(ref_text, edit_type, edit_info, text)
+            prompt = StepAudioTokenizer._build_edit_prompt(instruct_prefix, dummy_audio)
+
+        dummy_token_ids = text_tokenizer.apply_chat_template(
+            prompt,
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        token_ids = dummy_token_ids.get("input_ids")
+        prompt_len = len(token_ids) - dummy_audio_len + estimated_audio_token_len
+        return max(2, prompt_len)
+    except Exception as exc:
+        logger.warning("Failed to estimate prompt length, using fallback 2048: %s", exc)
+        return 2048
 
 
 class FunASRModel:
@@ -178,9 +288,6 @@ class StepAudioTokenizer:
         self.vq02_lock = threading.Lock()
         self.vq06_lock = threading.Lock()
 
-        self.edit_clone_sys_prompt_tpl = AUDIO_EDIT_CLONE_SYSTEM_PROMPT_TPL
-        self.edit_sys_prompt = AUDIO_EDIT_SYSTEM_PROMPT
-
     def _is_probably_base64(self, s: str) -> bool:
         if s.startswith("data:audio"):
             return True
@@ -214,6 +321,7 @@ class StepAudioTokenizer:
 
     def _audio_tokenize(self, audio, sr):
         vq0206_codes, vq02_codes_ori, vq06_codes_ori = self.wav2token(audio, sr)
+        logger.info(f"vq02_codes_ori: {len(vq02_codes_ori)}, vq06_codes_ori: {len(vq06_codes_ori)}")
         audio_tokens = self.merge_vq0206_to_token_str(vq02_codes_ori, vq06_codes_ori)
         return audio_tokens, vq0206_codes
 
@@ -231,7 +339,7 @@ class StepAudioTokenizer:
             prompt_text, edit_type, edit_info, target_text = prompt
             instruct_prefix = self._build_audio_edit_instruction(prompt_text, edit_type, edit_info, target_text)
 
-            prompt = self._build_edit_prompt(self.edit_sys_prompt, instruct_prefix, audio_tokens)
+            prompt = self._build_edit_prompt(instruct_prefix, audio_tokens)
 
         return self.text_tokenizer.apply_chat_template(
             prompt,
@@ -331,8 +439,9 @@ class StepAudioTokenizer:
 
         raise TypeError(f"Unsupported prompt_wav type: {type(prompt_wav)}")
 
-    def preprocess_wav(self, audio, sample_rate, enable_trim=True, energy_norm=True):
-        audio, sample_rate = self._load_audio(audio, sample_rate)
+    @staticmethod
+    def preprocess_wav(audio, sample_rate, enable_trim=True, energy_norm=True):
+        audio, sample_rate = StepAudioTokenizer._load_audio(audio, sample_rate)
 
         if audio.shape[0] > 1:
             audio = audio.mean(dim=0, keepdim=True)
@@ -415,23 +524,24 @@ class StepAudioTokenizer:
 
             return c_list
 
-    def get_vq06_code(self, audio):
-        def split_audio(audio, chunk_duration=480000):
-            start = 0
-            chunks = []
-            while start < len(audio):
-                end = min(start + chunk_duration, len(audio))
-                chunk = audio[start:end]
-                if len(chunk) < 480:
-                    pass
-                else:
-                    chunks.append(chunk)
-                start = end
-            return chunks
+    @staticmethod
+    def split_audio(audio, chunk_duration=480000):
+        start = 0
+        chunks = []
+        while start < len(audio):
+            end = min(start + chunk_duration, len(audio))
+            chunk = audio[start:end]
+            if len(chunk) < 480:
+                pass
+            else:
+                chunks.append(chunk)
+            start = end
+        return chunks
 
+    def get_vq06_code(self, audio):
         with self.vq06_lock:
             audio = audio.squeeze(0)
-            chunk_audios = split_audio(audio, chunk_duration=30 * 16000)  # Maximum support 30s
+            chunk_audios = StepAudioTokenizer.split_audio(audio, chunk_duration=30 * 16000)  # Maximum support 30s
             speech_tokens = []
             for chunk in chunk_audios:
                 duration = round(chunk.shape[0] / 16000, 2)
@@ -491,7 +601,9 @@ class StepAudioTokenizer:
             j += 3
         return "".join([f"<audio_{x}>" for x in result])
 
-    def _build_edit_prompt(self, sys_prompt: str, instruct_prefix: str, audio_token_str: str) -> list[int]:
+    @staticmethod
+    def _build_edit_prompt(instruct_prefix: str, audio_token_str: str) -> list[int]:
+        sys_prompt = AUDIO_EDIT_SYSTEM_PROMPT
         """Encode audio edit prompt to token sequence"""
         messages = [
             {"role": "system", "content": sys_prompt},
@@ -500,16 +612,18 @@ class StepAudioTokenizer:
 
         return messages
 
-    def _build_clone_prompt(self, text: str, prompt_text: str, prompt_speaker: str, prompt_wav_tokens: str):
-        sys_prompt = self.edit_clone_sys_prompt_tpl.format(
+    @staticmethod
+    def _build_clone_prompt(text: str, prompt_text: str, prompt_speaker: str, prompt_wav_tokens: str):
+        sys_prompt = AUDIO_EDIT_CLONE_SYSTEM_PROMPT_TPL.format(
             speaker=prompt_speaker, prompt_text=prompt_text, prompt_wav_tokens=prompt_wav_tokens
         )
         messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": f"{text}"}]
 
         return messages
 
+    @staticmethod
     def _build_audio_edit_instruction(
-        self, audio_text: str, edit_type: str, edit_info: str | None = None, text: str | None = None
+        audio_text: str, edit_type: str, edit_info: str | None = None, text: str | None = None
     ) -> str:
         """Build audio editing instruction based on request"""
         audio_text = audio_text.strip() if audio_text else ""

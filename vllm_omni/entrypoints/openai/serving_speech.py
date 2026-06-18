@@ -85,7 +85,7 @@ _HIGGS_AUDIO_V2_TTS_MODEL_STAGES = {"higgs_audio_v2"}
 _HIGGS_V3_TTS_MODEL_STAGES = {"higgs_audio_v3"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
 _STEP_AUDIO2_TTS_MODEL_STAGES = {"step_audio2_thinker"}
-_STEP_AUDIO_EDITX_MODEL_STAGES = {"ar_codec"}
+_STEP_AUDIO_EDITX_MODEL_STAGES = {"step_audio_editx_ar"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -1419,6 +1419,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_moss_tts_request(request)
         if self._tts_model_type == "glm_tts":
             return self._validate_glm_tts_request(request)
+        if self._tts_model_type == "step_audio_editx":
+            return self._validate_step_audio_editx_request(request)
         return self._validate_qwen_tts_request(request)
 
     def _validate_voxcpm2_request(self, request: OpenAICreateSpeechRequest) -> str | None:
@@ -2322,6 +2324,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return None
 
+    def _validate_step_audio_editx_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        if request.ref_audio is None:
+            return "step_audio_editx requests require 'ref_audio'"
+        if request.ref_text is None:
+            return "step_audio_editx requests require 'ref_text'"
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
+            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
+                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+        return None
+
     async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int]:
         """Resolve ref_audio to (wav_samples, sample_rate).
 
@@ -2937,10 +2951,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _build_step_audio_editx_prompt(
         self,
         request: OpenAICreateSpeechRequest,
-        request_id: str,
     ) -> dict[str, Any]:
         from vllm_omni.inputs.data import token_inputs_omni
-        from vllm_omni.model_executor.models.step_audio_editx.prompt_utils import (
+        from vllm_omni.model_executor.models.step_audio_editx.step_audio_tokenizer import (
             estimate_step_audio_editx_prompt_len,
         )
 
@@ -2955,13 +2968,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "edit_type": edit_type,
             "edit_info": edit_info,
         }
-        tokenizer_path = os.environ.get("STEP_AUDIO_TOKENIZER_PATH")
-        if not tokenizer_path:
-            raise RuntimeError("STEP_AUDIO_TOKENIZER_PATH must be set for StepAudioEditX.")
         prompt_len = estimate_step_audio_editx_prompt_len(
             additional_information,
-            model_path=self.engine_client.model_config.model,
-            tokenizer_path=tokenizer_path,
+            self.engine_client.model_config.model,
         )
         return token_inputs_omni(
             prompt_token_ids=[0] * prompt_len,
@@ -3353,20 +3362,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # in place. The builders need to know whether the caller supplied audio
         # inline vs. via an uploaded voice.
         has_inline_ref_audio = request.ref_audio is not None
-        if self._tts_model_type == "step_audio_editx":
-            if not request.input or not request.input.strip():
-                raise ValueError("Input text cannot be empty")
-            import copy
-
-            prompt = self._build_step_audio_editx_prompt(request, request_id)
-            tts_params = {}
-            qwen3_ref_audio_warmup_artifact_key = None
-            if sampling_params_list:
-                sampling_params_list = copy.deepcopy(sampling_params_list)
-                prompt_len = len(prompt.get("prompt_token_ids", []))
-                sampling_params_list[0].max_tokens = max(1, 8192 - prompt_len)
-                sampling_params_list[0].temperature = 0.7
-        elif self._tts_model_type == "ming_flash_omni_tts":
+        if self._tts_model_type == "ming_flash_omni_tts":
             # ming_flash_omni is intentionally NOT migrated onto the adapter
             # framework in this PR (it has no registered adapter); keep it on the
             # legacy inline dispatch so serving still works.
