@@ -82,11 +82,8 @@ def estimate_step_audio_editx_prompt_len(
     additional_information: dict[str, Any],
     model_path: str,
 ) -> int:
-    from .step_audio_tokenizer import StepAudioTokenizer
-
     config_path = os.path.dirname(model_path) if model_path.endswith("tokenizer_config.json") else model_path
     text_tokenizer = AutoTokenizer.from_pretrained(config_path, trust_remote_code=True)
-
     try:
 
         def _first(x, default=None):
@@ -321,7 +318,6 @@ class StepAudioTokenizer:
 
     def _audio_tokenize(self, audio, sr):
         vq0206_codes, vq02_codes_ori, vq06_codes_ori = self.wav2token(audio, sr)
-        logger.info(f"vq02_codes_ori: {len(vq02_codes_ori)}, vq06_codes_ori: {len(vq06_codes_ori)}")
         audio_tokens = self.merge_vq0206_to_token_str(vq02_codes_ori, vq06_codes_ori)
         return audio_tokens, vq0206_codes
 
@@ -580,7 +576,7 @@ class StepAudioTokenizer:
             end_len = start_len + sample_len
             x_sel[:, start_len:end_len] = sample
             start_len = end_len
-        dense_x = x_sel.squeeze(0)
+        dense_x = x_sel.squeeze(0).to(mean.device)
         indices = self.kmean_cluster(dense_x, mean)
         indices_list = []
         start_len = 0

@@ -32,8 +32,6 @@ from vllm_omni.model_executor.models.step_audio_editx.decoder.hift import StepAu
 from .decoder.cfm import StepCausalConditionalCFM as CausalConditionalCFM
 from .step_audio_tokenizer import StepAudioTokenizer
 
-torch.backends.cudnn.enabled = False
-
 logger = logging.getLogger(__name__)
 
 
@@ -69,11 +67,6 @@ class CosyVoiceFrontEnd:
         onnx_in = {self.campplus_session.get_inputs()[0].name: feat.unsqueeze(dim=0).cpu().numpy()}
         embedding = self.campplus_session.run(None, onnx_in)[0].flatten().tolist()
         return torch.tensor([embedding])
-
-
-class CosyVoiceConfig:
-    encoder: dict
-    decoder: dict
 
 
 class CosyVoice(nn.Module):
@@ -139,7 +132,7 @@ class CosyVoice(nn.Module):
         self.spk_embedding_cache_dict = {}
         self.setup_lock = threading.Lock()
 
-    def resolve_cosyvoice_configs(self, yaml_path=None) -> CosyVoiceConfig:
+    def resolve_cosyvoice_configs(self, yaml_path=None):
         if yaml_path is None:
             yaml_path = f"{self.model_dir}/cosyvoice.yaml"
         with open(yaml_path) as f:
@@ -437,6 +430,7 @@ class StepAudioCode2wav(nn.Module):
         self.requires_raw_input_tokens = True
 
         self.core = CosyVoice(model_dir=self.model_path)
+        self.prompt_feature_cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         if input_ids.numel() == 0:
@@ -469,7 +463,7 @@ class StepAudioCode2wav(nn.Module):
         ):
             ref = runtime_additional_information[0].get("ref_audio")
             if ref is None:
-                ref = runtime_additional_information[0].get("latent", {})
+                ref = runtime_additional_information[0].get("latent", None)
             loaded = StepAudioTokenizer._load_audio(ref, kwargs.get("sample_rate"))
             if isinstance(loaded, list):
                 if len(loaded) != 1:
@@ -501,15 +495,6 @@ class StepAudioCode2wav(nn.Module):
                     ref = ref[0]
                 return ref.reshape(-1)
 
-            ref = info.get("ids", {}).get("prompt")
-            if isinstance(ref, list):
-                ref = torch.tensor(ref, dtype=torch.long)
-            if isinstance(ref, torch.Tensor):
-                ref = ref.to(torch.long)
-                if ref.ndim > 1:
-                    ref = ref[0]
-                return ref.reshape(-1)
-
         return kwargs.get("prompt_token")
 
     @torch.no_grad()
@@ -525,8 +510,54 @@ class StepAudioCode2wav(nn.Module):
         if input_ids is None:
             raise ValueError("StepAudioCode2wav requires input_ids from the previous stage.")
         token = input_ids.reshape(-1)
-        prompt_token = self._extract_prompt_token(runtime_additional_information, kwargs)
+        async_chunk = self.vllm_config.model_config.async_chunk
+        if async_chunk:
+            if runtime_additional_information is not None:
+                meta = runtime_additional_information[0].get("meta", {})
+                session_id = meta.get("req_id")
+                last_chunk = meta.get("stream_finished", False)
+                if hasattr(last_chunk, "item"):
+                    last_chunk = bool(last_chunk.item())
+                else:
+                    last_chunk = bool(last_chunk)
+            else:
+                session_id = None
+                last_chunk = False
+            if session_id in self.prompt_feature_cache:
+                prompt_token, speech_feat, speech_embedding = self.prompt_feature_cache[session_id]
+            else:
+                input_wav, sample_rate = self._extract_runtime_inputs(runtime_additional_information, kwargs)
+                prompt_token = self._extract_prompt_token(runtime_additional_information, kwargs)
+
+                if input_wav is not None:
+                    input_wav, sample_rate = self.preprocess_wav(input_wav, sample_rate)
+                if prompt_token is None:
+                    prompt_token = torch.zeros((5,), dtype=torch.long, device=token.device)
+
+                if input_wav is None or sample_rate is None:
+                    sample_rate = 16000
+                    input_wav = torch.zeros((1, sample_rate), dtype=torch.float32, device=token.device)
+
+                speech_feat, speech_embedding = self.core._feature_extract(input_wav, sample_rate)
+                flow_dtype = next(self.core.flow.parameters()).dtype
+                flow_device = next(self.core.flow.parameters()).device
+
+                speech_feat = speech_feat.to(flow_device, flow_dtype)
+                speech_embedding = speech_embedding.to(flow_device, flow_dtype)
+                self.prompt_feature_cache[session_id] = (prompt_token, speech_feat, speech_embedding)
+            audio = self.core.forward_chunk(token, prompt_token, speech_feat, speech_embedding, session_id, last_chunk)
+            if last_chunk:
+                self.prompt_feature_cache.pop(session_id, None)
+            if audio is None:
+                return OmniOutput(text_hidden_states=None, multimodal_outputs={})
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={
+                    "audio": audio,
+                },
+            )
         input_wav, sample_rate = self._extract_runtime_inputs(runtime_additional_information, kwargs)
+        prompt_token = self._extract_prompt_token(runtime_additional_information, kwargs)
         if input_wav is not None:
             input_wav, sample_rate = self.preprocess_wav(input_wav, sample_rate)
         if prompt_token is None:
@@ -542,29 +573,6 @@ class StepAudioCode2wav(nn.Module):
 
         speech_feat = speech_feat.to(flow_device, flow_dtype)
         speech_embedding = speech_embedding.to(flow_device, flow_dtype)
-
-        async_chunk = self.vllm_config.model_config.async_chunk
-        if async_chunk:
-            if runtime_additional_information is not None:
-                meta = runtime_additional_information[0].get("meta", {})
-                session_id = meta.get("req_id")
-                last_chunk = meta.get("stream_finished", False)
-                if hasattr(last_chunk, "item"):
-                    last_chunk = bool(last_chunk.item())
-                else:
-                    last_chunk = bool(last_chunk)
-            else:
-                session_id = None
-                last_chunk = False
-            audio = self.core.forward_chunk(token, prompt_token, speech_feat, speech_embedding, session_id, last_chunk)
-            if audio is None:
-                return OmniOutput(text_hidden_states=None, multimodal_outputs={})
-            return OmniOutput(
-                text_hidden_states=None,
-                multimodal_outputs={
-                    "audio": audio,
-                },
-            )
         audio = self.core.forward(token, prompt_token, speech_feat, speech_embedding)
         return OmniOutput(
             text_hidden_states=None,

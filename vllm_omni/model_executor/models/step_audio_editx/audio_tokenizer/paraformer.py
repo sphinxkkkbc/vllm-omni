@@ -147,6 +147,7 @@ class EncoderLayerSANM(nn.Module):
         return x, mask, cache, mask_shift_chunk, mask_att_chunk_encoder
 
     def forward_chunk(self, x, cache=None, chunk_size=None, look_back=0):
+        x = x.to(torch.bfloat16)
         residual = x
         if self.normalize_before:
             x = self.norm1(x)

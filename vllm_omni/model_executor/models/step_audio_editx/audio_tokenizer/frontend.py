@@ -84,10 +84,10 @@ class WavFrontendOnline(nn.Module):
         dtype = inputs.dtype
         frame, dim = inputs.shape
 
-        means = np.tile(cmvn[0:1, :dim], (frame, 1))
-        vars = np.tile(cmvn[1:2, :dim], (frame, 1))
-        inputs += torch.from_numpy(means).type(dtype).to(device)
-        inputs *= torch.from_numpy(vars).type(dtype).to(device)
+        means = torch.tile(cmvn[0:1, :dim], (frame, 1))
+        variances = torch.tile(cmvn[1:2, :dim], (frame, 1))
+        inputs += means.type(dtype).to(device)
+        inputs *= variances.type(dtype).to(device)
 
         return inputs.type(torch.float32)
 

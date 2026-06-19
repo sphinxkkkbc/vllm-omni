@@ -134,6 +134,10 @@ def run_e2e():
         deploy_config=args.deploy_config,
         log_stats=True,
         trust_remote_code=True,
+        profiler_config={
+            "profiler": "torch",
+            "torch_profiler_dir": "./perf",
+        },
     )
 
     inputs = _build_inputs(args)

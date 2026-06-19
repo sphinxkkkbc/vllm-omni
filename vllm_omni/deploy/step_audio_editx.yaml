@@ -1,8 +1,8 @@
-async_chunk: true
+async_chunk: false
 
 stages:
   - stage_id: 0
-    enforce_eager: true
+    enforce_eager: false
     stage_type: llm
     enable_chunked_prefill: false
     enable_prefix_caching:  false
