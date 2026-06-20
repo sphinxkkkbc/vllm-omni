@@ -1,4 +1,5 @@
 async_chunk: false
+trust_remote_code: true
 
 stages:
   - stage_id: 0

@@ -9,7 +9,6 @@ import string
 import tempfile
 from urllib.parse import urlparse
 
-import librosa  # noqa: TID251
 import numpy as np
 import requests
 import torch
@@ -64,8 +63,41 @@ def energy_norm_fn(wav):
     return wav
 
 
+def _trim_silence_indices(audio: np.ndarray, top_db: float, frame_length: int, hop_length: int) -> tuple[int, int]:
+    """Return librosa-like non-silent sample bounds for mono audio."""
+    if audio.ndim != 1:
+        audio = np.asarray(audio).reshape(-1)
+    if audio.size == 0:
+        return 0, 0
+
+    audio = np.asarray(audio, dtype=np.float32)
+    pad = frame_length // 2
+    padded = np.pad(audio, (pad, pad), mode="constant")
+    if padded.size < frame_length:
+        padded = np.pad(padded, (0, frame_length - padded.size), mode="constant")
+
+    frame_count = 1 + max(0, (padded.size - frame_length) // hop_length)
+    shape = (frame_count, frame_length)
+    strides = (padded.strides[0] * hop_length, padded.strides[0])
+    frames = np.lib.stride_tricks.as_strided(padded, shape=shape, strides=strides)
+    rms = np.sqrt(np.mean(frames * frames, axis=1))
+
+    ref = float(np.max(rms))
+    if ref <= 0.0:
+        return 0, audio.size
+
+    db = 20.0 * np.log10(np.maximum(rms, 1e-10) / ref)
+    non_silent = np.flatnonzero(db > -top_db)
+    if non_silent.size == 0:
+        return 0, audio.size
+
+    start = max(0, int(non_silent[0] * hop_length))
+    end = min(audio.size, int((non_silent[-1] + 1) * hop_length))
+    return start, end
+
+
 def trim_silence(audio, sr, keep_left_time=0.05, keep_right_time=0.22, hop_size=240):
-    _, index = librosa.effects.trim(audio, top_db=20, frame_length=512, hop_length=128)
+    index = _trim_silence_indices(audio, top_db=20, frame_length=512, hop_length=128)
     num_frames = int(math.ceil((index[1] - index[0]) / hop_size))  # 300
 
     left_sil_samples = int(keep_left_time * sr)

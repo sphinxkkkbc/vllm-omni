@@ -303,13 +303,11 @@ class StepAudioTokenizer:
 
     def encode(self, edit_type, audio, prompt, sr):
         """
-        edit mode: prompt = {
-                            prompt_text: str,
-                            edit_type: str,
-                            edit_info: str | None = None,
-                            target_text: str | None = None
-                        }
-        clone mode: prompt = {prompt_text, target_text}
+        output: (token_ids, vq0206_codes)
+
+        supported prompt template:
+        • edit:  {prompt_text, edit_type, edit_info, target_text}
+        • clone: {prompt_text, target_text}
         """
         audio_tokens, vq0206_codes = self._audio_tokenize(audio, sr)
 
