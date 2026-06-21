@@ -10,7 +10,8 @@ import torch
 from vllm_omni.model_executor.stage_input_processors.step_audio_editx import (
     _extract_ref_payload,
     talker2code2wav_async_chunk,
-    talker2code2wav_sync,
+    talker2code2wav_full_payload,
+    talker2code2wav_token_only,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -41,6 +42,10 @@ def _request(req_id: str, tokens: list[int], *, finished: bool = False, ref_audi
         additional_information=_additional_information(ref_audio),
         is_finished=lambda: finished,
     )
+
+
+def _full_payload_request(ref_audio="ref.wav"):
+    return SimpleNamespace(additional_information=_additional_information(ref_audio))
 
 
 def _mm(ref_tokens: list[int] | torch.Tensor | None = None):
@@ -148,29 +153,70 @@ def test_async_chunk_errors_when_finished_without_audio_codes() -> None:
         )
 
 
-def test_sync_processor_builds_code2wav_prompt_with_ref_audio_and_ref_code() -> None:
+def test_token_only_processor_builds_placeholder_prompt_with_ref_audio_and_ref_code() -> None:
     output = SimpleNamespace(
         token_ids=[1, 65536, 65537, 2, 65538],
         multimodal_output=_mm([65540, 65541]),
     )
     talker_output = SimpleNamespace(finished=True, outputs=[output])
 
-    prompts = talker2code2wav_sync(
+    prompts = talker2code2wav_token_only(
         [talker_output],
         prompt={"additional_information": {"ref_audio": "ref.wav"}},
     )
 
     assert len(prompts) == 1
     prompt = prompts[0]
-    assert prompt["prompt_token_ids"] == [0, 1, 2]
+    assert prompt["prompt_token_ids"] == [0, 0, 0]
     assert prompt["additional_information"]["ref_audio"] == "ref.wav"
     assert prompt["additional_information"]["codes"]["ref"].tolist() == [4, 5]
 
 
-def test_sync_processor_skips_unfinished_outputs() -> None:
-    prompts = talker2code2wav_sync(
+def test_token_only_processor_skips_unfinished_outputs() -> None:
+    prompts = talker2code2wav_token_only(
         [SimpleNamespace(finished=False, outputs=[])],
         prompt={"additional_information": {"ref_audio": "ref.wav"}},
     )
 
     assert prompts == []
+
+
+def test_full_payload_processor_offsets_audio_and_ref_codes() -> None:
+    payload = talker2code2wav_full_payload(
+        transfer_manager=None,
+        pooling_output={
+            "codes.audio": torch.tensor([[65536], [65537], [3], [42], [65539]]),
+            "codes.ref": torch.tensor([[65540, 65541]]),
+        },
+        request=_full_payload_request(),
+    )
+
+    assert payload is not None
+    assert payload["codes"]["audio"].tolist() == [0, 1, 3]
+    assert payload["codes"]["ref"].tolist() == [[4, 5]]
+    assert payload["meta"]["finished"].item() is True
+
+
+def test_full_payload_processor_rejects_unoffset_ref_codes() -> None:
+    with pytest.raises(RuntimeError, match="offset by 65536"):
+        talker2code2wav_full_payload(
+            transfer_manager=None,
+            pooling_output={
+                "codes.audio": torch.tensor([65536, 65537]),
+                "codes.ref": torch.tensor([4, 5]),
+            },
+            request=_full_payload_request(),
+        )
+
+
+def test_full_payload_processor_returns_none_without_audio_codes() -> None:
+    payload = talker2code2wav_full_payload(
+        transfer_manager=None,
+        pooling_output={
+            "codes.audio": torch.tensor([1, 2, 3]),
+            "codes.ref": torch.tensor([65540, 65541]),
+        },
+        request=_full_payload_request(),
+    )
+
+    assert payload is None

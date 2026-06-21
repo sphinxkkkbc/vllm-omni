@@ -21,8 +21,6 @@ class StepAudioAR(nn.Module):
         super().__init__()
         self.vllm_config = vllm_config
         self.model_path = vllm_config.model_config.model
-        # extra = getattr(vllm_config.model_config, "additional_kwargs", None) or {}
-        # self.tokenizer_path = extra.get("audio_tokenizer", "stepfun-ai/Step-Audio-Tokenizer")
         self.tokenizer_path = os.environ["STEP_AUDIO_TOKENIZER_PATH"]
         self.model = Step1ForCausalLM(vllm_config=vllm_config, prefix=prefix)
         self.have_multimodal_outputs = True
@@ -72,6 +70,7 @@ class StepAudioAR(nn.Module):
         if info_dicts is None:
             info_dicts = kwargs.get("runtime_additional_information") or []
         ref_code_list: list[torch.Tensor] = []
+        audio_code_list: list[torch.Tensor] = []
         has_ref_code = False
         for info in info_dicts:
             if not isinstance(info, dict):
@@ -79,19 +78,26 @@ class StepAudioAR(nn.Module):
                 continue
             codes = info.get("codes", {})
             ref_code = codes.get("ref")
+            audio_code = codes.get("audio")
+            if isinstance(audio_code, torch.Tensor) and audio_code.numel() > 0:
+                audio_code_list.append(audio_code)
             if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
                 ref_code_list.append(ref_code)
                 has_ref_code = True
             else:
                 ref_code_list.append(torch.empty(0, dtype=torch.long))
 
-        if not has_ref_code:
+        if not audio_code_list:
+            if has_ref_code:
+                mm: OmniPayload = {"codes": {"ref": ref_code_list}}
+                return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
 
         mm: OmniPayload = {"codes": {}}
         # Batch-aligned passthrough data. The runner selects each request's
         # entry before serializing the multimodal payload.
         mm["codes"]["ref"] = ref_code_list
+        mm["codes"]["audio"] = audio_code_list
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
 
     def preprocess(
@@ -204,7 +210,12 @@ class StepAudioAR(nn.Module):
             device=input_ids.device,
             dtype=next(self.model.parameters()).dtype,
         )
-        return input_ids_out, prompt_embeds, {}
+        audio_ids = input_ids_out.detach().to("cpu").reshape(-1)
+        if audio_ids.numel() > 0:
+            info_update = {"codes": {"audio": audio_ids.reshape(-1, 1)}}
+        else:
+            info_update = {}
+        return input_ids_out, prompt_embeds, info_update
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

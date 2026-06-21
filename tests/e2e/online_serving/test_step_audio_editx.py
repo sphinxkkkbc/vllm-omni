@@ -19,9 +19,12 @@ import numpy as np
 import pytest
 from vllm.utils.network_utils import get_open_port
 
+from tests.helpers.mark import hardware_test
+
 MODEL = "stepfun-ai/Step-Audio-EditX"
 AUDIO_TOKENIZER = "stepfun-ai/Step-Audio-Tokenizer"
 STAGE_CONFIG = "vllm_omni/deploy/step_audio_editx.yaml"
+OUTPUT_SAMPLE_RATE = 24000
 
 
 class OmniServer:
@@ -106,6 +109,20 @@ def create_ref_audio_data_url(duration_sec: float = 2.0) -> str:
     return f"data:audio/wav;base64,{create_dummy_audio_base64(duration_sec=duration_sec)}"
 
 
+def assert_valid_wav_response(body: bytes) -> None:
+    assert len(body) > 44
+    with wave.open(io.BytesIO(body), "rb") as wav_file:
+        assert wav_file.getnchannels() == 1
+        assert wav_file.getsampwidth() == 2
+        assert wav_file.getframerate() == OUTPUT_SAMPLE_RATE
+        assert wav_file.getnframes() > 0
+
+
+def assert_valid_pcm_response(body: bytes) -> None:
+    assert len(body) > 0
+    assert len(body) % 2 == 0
+
+
 def create_speech_request(
     *,
     edit_type: str = "clone",
@@ -176,6 +193,9 @@ def step_audio_editx_server():
 
 
 @pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.tts
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 class TestStepAudioEditxOnlineServing:
     @pytest.mark.asyncio
     async def test_single_clone_request(self, step_audio_editx_server: str) -> None:
@@ -185,7 +205,7 @@ class TestStepAudioEditxOnlineServing:
             status, body = await send_speech_request(session, step_audio_editx_server, payload)
 
         assert status == 200
-        assert len(body) > 44
+        assert_valid_wav_response(body)
 
     @pytest.mark.asyncio
     async def test_single_edit_request(self, step_audio_editx_server: str) -> None:
@@ -195,7 +215,17 @@ class TestStepAudioEditxOnlineServing:
             status, body = await send_speech_request(session, step_audio_editx_server, payload)
 
         assert status == 200
-        assert len(body) > 44
+        assert_valid_wav_response(body)
+
+    @pytest.mark.asyncio
+    async def test_single_clone_stream_request(self, step_audio_editx_server: str) -> None:
+        payload = create_speech_request(edit_type="clone", stream=True)
+
+        async with aiohttp.ClientSession() as session:
+            status, body = await send_speech_request(session, step_audio_editx_server, payload)
+
+        assert status == 200
+        assert_valid_pcm_response(body)
 
 
 async def run_throughput_benchmark(

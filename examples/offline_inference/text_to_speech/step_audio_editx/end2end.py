@@ -1,36 +1,11 @@
 """
 Offline Inference for Step-Audio-Editx.
-Examples:
-    # Voice Clone
-    python3 step_audio_editx/offline_inference.py \
-        --model  /path/to/model \
-        --audio-tokenizer /path/to/tokenizer \
-        --ref-audio /path/to/ref_audio.wav \
-        --ref-text "This is the reference transcript" \
-        --text "What Are you talking about"
-
-    # Voice Edit
-    python3 step_audio_editx/offline_inference.py \
-        --model  /path/to/model \
-        --audio-tokenizer /path/to/tokenizer \
-        --ref-audio /path/to/ref_audio.wav \
-        --ref-text "This is the reference transcript" \
-        --edit-type "emotion" \
-        --edit-info "angry" \
-
-    #Voice Edit
-    python3 step_audio_editx/offline_inference.py \
-        --model  /path/to/model \
-        --audio-tokenizer /path/to/tokenizer \
-        --ref-audio /path/to/ref_audio.wav \
-        --ref-text "This is the reference transcript" \
-        --text "[cough]What Are you talking about" \
-        --edit-type "paralinguistic" \
 """
 
 import argparse
 import logging
 import os
+from pathlib import Path
 
 import soundfile as sf
 from vllm import SamplingParams
@@ -41,6 +16,13 @@ from vllm_omni.model_executor.models.step_audio_editx.step_audio_tokenizer impor
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _local_path_or_none(path: str) -> Path | None:
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute() or path.startswith(("./", "../", "~")):
+        return candidate
+    return None
 
 
 def _build_inputs(args):
@@ -118,8 +100,8 @@ def run_e2e():
     parser.add_argument("--ref-audio", type=str, default=None, help="Path to reference audio for voice cloning.")
     parser.add_argument("--output", type=str, default=None, help="Output audio path.")
     args = parser.parse_args()
-    # Ensure tokenizer directory exists
-    if not os.path.exists(args.audio_tokenizer):
+    audio_tokenizer_path = _local_path_or_none(args.audio_tokenizer)
+    if audio_tokenizer_path is not None and not audio_tokenizer_path.exists():
         raise FileNotFoundError(f"{args.audio_tokenizer} does not exist!")
 
     if args.deploy_config is not None and not os.path.exists(args.deploy_config):

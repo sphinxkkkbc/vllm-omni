@@ -11,6 +11,8 @@ from vllm_omni.engine.mm_outputs import MultimodalPayload
 
 logger = init_logger(__name__)
 
+AUDIO_TOKEN_OFFSET = 65536
+
 
 def _payload_get(payload: Any, key: str, default: Any = None) -> Any:
     if payload is None:
@@ -35,11 +37,11 @@ def _payload_keys(payload: Any) -> list[str]:
 
 def _extract_ref_audio(additional_information: Any) -> Any:
     if isinstance(additional_information, dict):
-        return additional_information.get("ref_audio")
+        return additional_information.get("ref_audio", additional_information.get("latent"))
     entries = getattr(additional_information, "entries", None)
     if not isinstance(entries, dict):
         return None
-    entry = entries.get("ref_audio")
+    entry = entries.get("ref_audio") or entries.get("latent")
     if entry is None:
         return None
     list_data = getattr(entry, "list_data", None)
@@ -49,6 +51,23 @@ def _extract_ref_audio(additional_information: Any) -> Any:
     if scalar_data is not None:
         return scalar_data
     return None
+
+
+def _offset_audio_tokens_to_codec(tokens: Any) -> torch.Tensor:
+    if tokens is None:
+        return torch.empty(0, dtype=torch.long)
+    if isinstance(tokens, torch.Tensor):
+        token_tensor = tokens.detach().to(torch.long).cpu().reshape(-1)
+    else:
+        token_tensor = torch.tensor([int(token) for token in tokens], dtype=torch.long)
+    return token_tensor[token_tensor >= AUDIO_TOKEN_OFFSET] - AUDIO_TOKEN_OFFSET
+
+
+def _offset_ref_tokens_to_codec(ref_code: torch.Tensor) -> torch.Tensor:
+    ref_code = ref_code.to(torch.long).cpu().contiguous()
+    if int(ref_code.min().item()) < AUDIO_TOKEN_OFFSET:
+        raise RuntimeError("ref_code should be offset by 65536; unexpected StepAudio AR output")
+    return ref_code - AUDIO_TOKEN_OFFSET
 
 
 def _extract_ref_payload(mm: OmniPayload | MultimodalPayload | None) -> torch.Tensor:
@@ -76,14 +95,10 @@ def _extract_ref_payload(mm: OmniPayload | MultimodalPayload | None) -> torch.Te
             f"codes keys={_payload_keys(mm_codes)}"
         )
 
-    ref_code = ref_code.to(torch.long).cpu().contiguous()
-    if int(ref_code.min().item()) < 65536:
-        raise RuntimeError("ref_code should be offset by 65536; unexpected StepAudio AR output")
-
-    return ref_code - 65536
+    return _offset_ref_tokens_to_codec(ref_code)
 
 
-def talker2code2wav_sync(
+def talker2code2wav_token_only(
     source_outputs: list,
     prompt=None,
     _requires_multimodal_data: bool = False,
@@ -102,10 +117,7 @@ def talker2code2wav_sync(
         output = talker_output.outputs[0]
         mm = output.multimodal_output if hasattr(output, "multimodal_output") else None
         audio_codes = output.token_ids if output.token_ids is not None else []
-        if isinstance(audio_codes, torch.Tensor):
-            audio_codes = audio_codes.detach().cpu().tolist()
-
-        audio_codes = torch.tensor([int(t) - 65536 for t in audio_codes if int(t) >= 65536])
+        audio_codes = _offset_audio_tokens_to_codec(audio_codes)
         ref_code = _extract_ref_payload(mm)
 
         additional_information = to_dict(
@@ -115,15 +127,42 @@ def talker2code2wav_sync(
         )
         if ref_audio is not None:
             additional_information["ref_audio"] = ref_audio
+        audio_codes_len = int(audio_codes.numel())
         code2wav_inputs.append(
             OmniTokensPrompt(
-                prompt_token_ids=audio_codes.tolist(),
+                prompt_token_ids=[0] * audio_codes_len,
                 additional_information=additional_information if additional_information else None,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
             )
         )
     return code2wav_inputs
+
+
+def talker2code2wav_full_payload(transfer_manager, pooling_output, request):
+    del transfer_manager
+    audio = pooling_output.get("codes.audio")
+    ref_code = pooling_output.get("codes.ref")
+
+    if audio is None or ref_code is None:
+        return None
+
+    audio = _offset_audio_tokens_to_codec(audio)
+    if audio.numel() == 0:
+        return None
+    ref_code = _offset_ref_tokens_to_codec(ref_code)
+
+    payload = {
+        "codes": {
+            "audio": audio,
+            "ref": ref_code,
+        },
+        "meta": {
+            "finished": torch.tensor(True, dtype=torch.bool),
+        },
+    }
+
+    return payload
 
 
 def talker2code2wav_async_chunk(
@@ -163,8 +202,8 @@ def talker2code2wav_async_chunk(
 
     for tok in new_tokens:
         tok = int(tok)
-        if tok >= 65536:
-            transfer_manager.code_prompt_token_ids[request_id].append([tok - 65536])
+        if tok >= AUDIO_TOKEN_OFFSET:
+            transfer_manager.code_prompt_token_ids[request_id].append([tok - AUDIO_TOKEN_OFFSET])
 
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}

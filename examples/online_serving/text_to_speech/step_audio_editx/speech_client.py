@@ -2,27 +2,6 @@
 
 This script demonstrates how to use the OpenAI-compatible speech API
 to generate audio from text using Step-Audio-Editx models.
-
-Examples:
-    # VoiceClone Task
-    python openai_speech_client.py \
-        --ref-audio /path/to/ref_audio.wav \
-        --ref-text "This is the reference transcript" \
-        --text "What Are you talking about"
-
-    # VoiceEdit Task With Edit Info
-    python openai_speech_client.py
-        --ref-audio /path/to/ref_audio.wav \
-        --ref-text "This is the reference transcript" \
-        --edit-type "emotion" \
-        --edit-info "angry" \
-
-    # VoiceEdit Task With Edit Info
-    python openai_speech_client.py
-        --ref-audio /path/to/ref_audio.wav \
-        --ref-text "This is the reference transcript" \
-        --text "[cough]What Are you talking about" \
-        --edit-type "paralinguistic" \
 """
 
 import argparse
