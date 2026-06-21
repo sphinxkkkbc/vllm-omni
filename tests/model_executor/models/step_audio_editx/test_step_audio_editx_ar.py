@@ -149,7 +149,7 @@ def test_preprocess_subsequent_prefill_slices_cached_prompt_and_pads() -> None:
     assert update["meta"]["talker_prefill_offset"] == 3
 
 
-def test_preprocess_decode_uses_sampled_token_embedding() -> None:
+def test_preprocess_decode_uses_sampled_token_embedding_and_forwards_audio_code() -> None:
     model = _make_ar()
     full_prompt = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     tts_pad = torch.full((1, 4), -1.0)
@@ -163,7 +163,7 @@ def test_preprocess_decode_uses_sampled_token_embedding() -> None:
 
     assert out_ids.tolist() == [123]
     torch.testing.assert_close(out_embeds, torch.full((1, 4), 123.0))
-    assert update == {}
+    assert update["codes"]["audio"].tolist() == [[123]]
 
 
 def test_compute_logits_unwraps_omni_output() -> None:

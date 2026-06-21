@@ -102,6 +102,23 @@ def test_extract_runtime_inputs_rejects_batched_reference_audio() -> None:
             StepAudioCode2wav._extract_runtime_inputs([{"latent": ["a", "b"]}], {})
 
 
+def test_extract_runtime_inputs_accepts_ref_audio_before_latent() -> None:
+    ref_audio = torch.ones((1, 8), dtype=torch.float32)
+
+    with patch(
+        "vllm_omni.model_executor.models.step_audio_editx.step_audio_decoder.StepAudioTokenizer._load_audio",
+        return_value=(ref_audio, 16000),
+    ) as load_audio:
+        out_audio, out_sr = StepAudioCode2wav._extract_runtime_inputs(
+            [{"ref_audio": "ref.wav", "latent": "latent.wav"}],
+            {},
+        )
+
+    load_audio.assert_called_once_with("ref.wav", None)
+    torch.testing.assert_close(out_audio, ref_audio)
+    assert out_sr == 16000
+
+
 def test_sync_forward_extracts_features_and_decodes_audio() -> None:
     model = _make_model(async_chunk=False)
     ref_audio = torch.ones((1, 8), dtype=torch.float32)
