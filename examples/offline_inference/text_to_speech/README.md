@@ -485,6 +485,7 @@ hf download stepfun-ai/Step-Audio-Tokenizer
 
 ### Quick Start
 `--ref-audio` and `--ref-text` are required.
+`--text` is required for `clone` and `paralinguistic`; other edit modes use `--ref-text`.
 Replace the Hugging Face repo IDs with local checkpoint paths when running offline.
 
 ### Voice Clone

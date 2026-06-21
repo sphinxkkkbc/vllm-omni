@@ -649,7 +649,6 @@ python examples/online_serving/text_to_speech/step_audio_editx/speech_client.py 
     --model stepfun-ai/Step-Audio-EditX \
     --ref-audio /path/to/ref_audio.wav \
     --ref-text "This is the reference transcript." \
-    --text "This is the reference transcript." \
     --edit-type emotion \
     --edit-info angry \
     --output result/audio_emotion_angry.wav
@@ -663,7 +662,6 @@ python examples/online_serving/text_to_speech/step_audio_editx/speech_client.py 
     --model stepfun-ai/Step-Audio-EditX \
     --ref-audio /path/to/ref_audio.wav \
     --ref-text "This is the reference transcript." \
-    --text "This is the reference transcript." \
     --edit-type style \
     --edit-info whisper \
     --output result/audio_style_whisper.wav
@@ -685,6 +683,7 @@ python examples/online_serving/text_to_speech/step_audio_editx/speech_client.py 
 
 ### Notes
 - `--ref-audio` and `--ref-text` are required.
+- `--text` is required for `clone` and `paralinguistic`; other edit modes use `--ref-text`.
 - Default output is 24 kHz mono WAV. Use `--response-format pcm` for raw PCM output.
 - Streaming requests are supported through the Speech API with `stream=true`; for low-latency
   chunked decoding, use a StepAudioEditX deploy config with `async_chunk: true`.

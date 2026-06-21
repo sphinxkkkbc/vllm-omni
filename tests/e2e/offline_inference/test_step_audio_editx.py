@@ -65,13 +65,14 @@ def test_build_inputs_edit_includes_edit_info() -> None:
             _args(
                 edit_type="emotion",
                 edit_info="angry",
-                text="Please review the document before we begin.",
+                text=None,
             )
         )
 
     assert inputs[0]["prompt_token_ids"] == [0] * 77
     assert inputs[0]["additional_information"]["edit_type"] == "emotion"
     assert inputs[0]["additional_information"]["edit_info"] == "angry"
+    assert inputs[0]["additional_information"]["text"] == [""]
 
 
 def test_build_inputs_requires_ref_text_when_ref_audio_is_explicit() -> None:

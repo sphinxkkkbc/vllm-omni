@@ -2329,6 +2329,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "step_audio_editx requests require 'ref_audio'"
         if request.ref_text is None:
             return "step_audio_editx requests require 'ref_text'"
+        extra_params = dict(request.extra_params or {})
+        edit_type = extra_params.get("edit_type", "clone")
+        if edit_type in {"clone", "paralinguistic"} and (not request.input or not request.input.strip()):
+            return f"step_audio_editx {edit_type} requests require non-empty input text"
         if request.max_new_tokens is not None:
             if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
                 return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
@@ -2962,7 +2966,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         edit_info = extra_params.pop("edit_info", None)
 
         additional_information = {
-            "text": [request.input],
+            "text": [request.input or ""],
             "ref_text": [request.ref_text],
             "ref_audio": [request.ref_audio],
             "edit_type": edit_type,

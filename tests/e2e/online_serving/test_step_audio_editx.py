@@ -127,21 +127,24 @@ def create_speech_request(
     *,
     edit_type: str = "clone",
     edit_info: str | None = None,
+    text: str | None = None,
     stream: bool = False,
 ) -> dict:
+    if text is None:
+        text = "Please review the document before we begin." if edit_type in {"clone", "paralinguistic"} else ""
     payload = {
         "model": MODEL,
-        "input": "Please review the document before we begin.",
+        "input": text,
         "voice": "step_audio_editx",
         "response_format": "pcm" if stream else "wav",
         "stream": stream,
         "ref_audio": create_ref_audio_data_url(),
         "ref_text": "Good one. Okay, fine, I'm just gonna leave this here. Goodbye.",
         "max_new_tokens": 256,
-        "edit_type": edit_type,
+        "extra_params": {"edit_type": edit_type},
     }
     if edit_info is not None:
-        payload["edit_info"] = edit_info
+        payload["extra_params"]["edit_info"] = edit_info
     return payload
 
 
@@ -166,20 +169,24 @@ def test_create_dummy_audio_base64_is_wav() -> None:
         ("clone", None),
         ("emotion", "angry"),
         ("style", "sweet"),
+        ("paralinguistic", "laughter"),
         ("denoise", None),
     ],
 )
 def test_create_speech_request_shape(edit_type: str, edit_info: str | None) -> None:
     payload = create_speech_request(edit_type=edit_type, edit_info=edit_info)
 
-    assert payload["input"]
+    if edit_type in {"clone", "paralinguistic"}:
+        assert payload["input"]
+    else:
+        assert payload["input"] == ""
     assert payload["ref_audio"].startswith("data:audio/wav;base64,")
     assert payload["ref_text"]
-    assert payload["edit_type"] == edit_type
+    assert payload["extra_params"]["edit_type"] == edit_type
     if edit_info is None:
-        assert "edit_info" not in payload
+        assert "edit_info" not in payload["extra_params"]
     else:
-        assert payload["edit_info"] == edit_info
+        assert payload["extra_params"]["edit_info"] == edit_info
 
 
 @pytest.fixture(scope="class")

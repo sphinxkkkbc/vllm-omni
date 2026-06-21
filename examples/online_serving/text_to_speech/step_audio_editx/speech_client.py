@@ -45,7 +45,7 @@ def run_tts_generation(args) -> None:
     # Build request payload
     payload = {
         "model": args.model,
-        "input": args.text,
+        "input": args.text or "",
         "response_format": args.response_format,
     }
     if args.max_new_tokens is not None:
@@ -160,7 +160,7 @@ def parse_args():
     parser.add_argument(
         "--text",
         type=str,
-        required=True,
+        default=None,
         help="Text to synthesize",
     )
     # Base (voice clone) parameters
