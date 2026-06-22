@@ -15,11 +15,12 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
+from examples.offline_inference.text_to_speech.step_audio_editx import end2end
+
 omni_module = types.ModuleType("vllm_omni.entrypoints.omni")
 omni_module.Omni = object
 sys.modules.setdefault("vllm_omni.entrypoints.omni", omni_module)
 
-from examples.offline_inference.text_to_speech.step_audio_editx import end2end
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
