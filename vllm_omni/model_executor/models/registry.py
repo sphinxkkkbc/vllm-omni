@@ -343,6 +343,11 @@ _OMNI_MODELS = {
         "minicpmo_4_5_omni_tts",
         "MiniCPMO45OmniTTSForConditionalGeneration",
     ),
+    "AuraQwen3VLForConditionalGeneration": (
+        "aura_omni",
+        "qwen3_vl",
+        "AuraQwen3VLForConditionalGeneration",
+    ),
     "StepAudioAR": ("step_audio_editx", "step_audio_ar", "StepAudioAR"),
     "StepAudioCode2wav": ("step_audio_editx", "step_audio_decoder", "StepAudioCode2wav"),
 }
