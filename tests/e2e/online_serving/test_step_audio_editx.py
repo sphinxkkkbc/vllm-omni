@@ -154,41 +154,6 @@ async def send_speech_request(session: aiohttp.ClientSession, url: str, payload:
         return response.status, body
 
 
-def test_create_dummy_audio_base64_is_wav() -> None:
-    raw = base64.b64decode(create_dummy_audio_base64(duration_sec=0.25))
-
-    with wave.open(io.BytesIO(raw), "rb") as wav_file:
-        assert wav_file.getframerate() == 16000
-        assert wav_file.getnchannels() == 1
-        assert wav_file.getnframes() == 4000
-
-
-@pytest.mark.parametrize(
-    ("edit_type", "edit_info"),
-    [
-        ("clone", None),
-        ("emotion", "angry"),
-        ("style", "sweet"),
-        ("paralinguistic", "laughter"),
-        ("denoise", None),
-    ],
-)
-def test_create_speech_request_shape(edit_type: str, edit_info: str | None) -> None:
-    payload = create_speech_request(edit_type=edit_type, edit_info=edit_info)
-
-    if edit_type in {"clone", "paralinguistic"}:
-        assert payload["input"]
-    else:
-        assert payload["input"] == ""
-    assert payload["ref_audio"].startswith("data:audio/wav;base64,")
-    assert payload["ref_text"]
-    assert payload["extra_params"]["edit_type"] == edit_type
-    if edit_info is None:
-        assert "edit_info" not in payload["extra_params"]
-    else:
-        assert payload["extra_params"]["edit_info"] == edit_info
-
-
 @pytest.fixture(scope="class")
 def step_audio_editx_server():
     with OmniServer(

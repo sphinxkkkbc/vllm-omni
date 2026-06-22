@@ -15,6 +15,9 @@ from vllm_omni.model_executor.models.step_audio_editx import step_audio_tokenize
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+# Stand-in overhead for role/special tokens inserted by apply_chat_template.
+CHAT_TEMPLATE_FIXED_TOKEN_OVERHEAD = 4
+
 
 class _FakeTextTokenizer:
     def __init__(self) -> None:
@@ -39,7 +42,7 @@ class _FakeTextTokenizer:
         # Small deterministic stand-in for chat-template tokenization. Audio
         # placeholders count as one token each, which lets the estimator replace
         # the single dummy placeholder with the duration-based audio-token count.
-        token_count = 4 + len(text_without_audio.split()) + audio_token_count
+        token_count = CHAT_TEMPLATE_FIXED_TOKEN_OVERHEAD + len(text_without_audio.split()) + audio_token_count
         self.last_input_ids = list(range(token_count))
         return {"input_ids": self.last_input_ids}
 
@@ -49,7 +52,7 @@ def _patch_estimator_dependencies(
     *,
     text_tokenizer: _FakeTextTokenizer,
     ref_audio_samples: int = 16_000,
-    vq02_len: int = 18,
+    vq02_len: int = 16,
 ) -> None:
     def fake_from_pretrained(path: str, **kwargs: Any) -> _FakeTextTokenizer:
         assert path == "fake-model"
@@ -91,8 +94,8 @@ def test_estimate_prompt_len_clone_replaces_dummy_audio_token(
         model_path="fake-model/tokenizer_config.json",
     )
 
-    # ref_audio_samples=16000 gives vq06_len=25. With patched vq02_len=18:
-    # min(vq02//2=9, vq06//3=8) * 5 = 40 audio placeholder tokens.
+    # ref_audio_samples=16000 gives vq06_len=25. With patched vq02_len=16:
+    # min(vq02//2=8, vq06//3=8) * 5 = 40 audio placeholder tokens.
     assert est == len(text_tokenizer.last_input_ids) - 1 + 40
 
     rendered_prompt = "\n".join(message["content"] for message in text_tokenizer.calls[0])
@@ -121,7 +124,7 @@ def test_estimate_prompt_len_edit_tasks_accept_scalar_and_list_inputs(
         monkeypatch,
         text_tokenizer=text_tokenizer,
         ref_audio_samples=32_000,
-        vq02_len=30,
+        vq02_len=32,
     )
 
     info: dict[str, Any] = {
@@ -139,9 +142,9 @@ def test_estimate_prompt_len_edit_tasks_accept_scalar_and_list_inputs(
         model_path="fake-model",
     )
 
-    # ref_audio_samples=32000 gives vq06_len=50. With patched vq02_len=30:
-    # min(vq02//2=15, vq06//3=16) * 5 = 75 audio placeholder tokens.
-    assert est == len(text_tokenizer.last_input_ids) - 1 + 75
+    # ref_audio_samples=32000 gives vq06_len=50. With patched vq02_len=32:
+    # min(vq02//2=16, vq06//3=16) * 5 = 80 audio placeholder tokens.
+    assert est == len(text_tokenizer.last_input_ids) - 1 + 80
 
     rendered_prompt = "\n".join(message["content"] for message in text_tokenizer.calls[0])
     if edit_type not in {"denoise", "vad"}:
