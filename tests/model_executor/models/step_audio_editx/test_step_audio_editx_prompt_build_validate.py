@@ -27,10 +27,7 @@ MODEL = "stepfun-ai/Step-Audio-EditX"
 AUDIO_TOKENIZER = "stepfun-ai/Step-Audio-Tokenizer"
 STAGE_CONFIG = "vllm_omni/deploy/step_audio_editx.yaml"
 REF_AUDIO = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
-REF_TEXT = (
-    "Okay. Yeah. I resent you. I love you. I respect you. "
-    "But you know what? You blew it!"
-)
+REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it!"
 DEFAULT_TEXT = "Please review the document before we begin."
 ONLINE_REF_TEXT = "Good one. Okay, fine, I'm just gonna leave this here. Goodbye."
 
