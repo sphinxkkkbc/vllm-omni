@@ -401,8 +401,8 @@ class SenseNovaU1Attention(nn.Module):
                 sin_w,
                 self.config.rms_norm_eps,
             )
-        else:
-            logger.debug("Triton fused SenseNova qk norm rope unavailable; using PyTorch fallback")
+            return query_states, key_states, value_states
+        logger.debug("Triton fused SenseNova qk norm rope unavailable; using PyTorch fallback")
 
         # Split head_dim into t and hw halves
         q_t, q_hw = q.chunk(2, dim=-1)
