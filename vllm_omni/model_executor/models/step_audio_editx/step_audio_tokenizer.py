@@ -7,6 +7,7 @@ import os.path
 import threading
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -33,47 +34,86 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
-def estimate_vq02_len(num_samples: int) -> int:
-    frame_len = 400
-    frame_shift = 160
-    chunk_stride = 4 * 960  # 3840
-    lfr_m = 7
-    lfr_n = 6
-    left_ctx = (lfr_m - 1) // 2  # 3
+@dataclass(frozen=True)
+class EstimateConfig:
+    """Constants for the StepAudioEditX prompt-length estimator.
+
+    The VQ02 estimate mirrors the current StepAudioEditX streaming frontend.
+    These fields document the frontend assumptions behind the default formula;
+    they are not intended to be changed.
+    """
+
+    sample_rate: int = 16000
+    ref_audio_chunk_seconds: int = 30
+    vq06_tokens_per_second: int = 25
+    vq02_codes_per_group: int = 2
+    vq06_codes_per_group: int = 3
+    audio_tokens_per_group: int = 5
+    dummy_audio_len: int = 1
+    min_prompt_len: int = 2
+    fallback_prompt_len: int = 2048
+
+    # Defaults mirror the StepAudioEditX streaming VQ02 frontend.
+    vq02_frame_len: int = 400
+    vq02_frame_shift: int = 160
+    vq02_chunk_stride: int = 4 * 960
+    vq02_lfr_m: int = 7
+    vq02_lfr_n: int = 6
+    vq02_full_chunk_lfr_frames: int = 4
+    vq02_steady_state_input_cache_len: int = 320
+    vq02_steady_state_lfr_cache_len: int = 1
+
+    @property
+    def ref_audio_chunk_samples(self) -> int:
+        return self.ref_audio_chunk_seconds * self.sample_rate
+
+    @property
+    def vq02_left_context_frames(self) -> int:
+        return (self.vq02_lfr_m - 1) // 2
+
+
+DEFAULT_ESTIMATE_CONFIG = EstimateConfig()
+
+
+def estimate_vq02_len(
+    num_samples: int,
+    config: EstimateConfig = DEFAULT_ESTIMATE_CONFIG,
+) -> int:
+    left_ctx = config.vq02_left_context_frames
 
     if num_samples <= 0:
         return 0
 
-    full_chunks = num_samples // chunk_stride
-    tail_samples = num_samples % chunk_stride
+    full_chunks = num_samples // config.vq02_chunk_stride
+    tail_samples = num_samples % config.vq02_chunk_stride
 
     # In the default StepAudioEditX streaming frontend, each complete 3840-sample
     # chunk contributes four LFR frames. The first chunk gets a 3-frame left
     # context; subsequent full chunks reuse the 1-frame LFR splice cache.
-    total = full_chunks * 4
+    total = full_chunks * config.vq02_full_chunk_lfr_frames
 
     if tail_samples == 0:
         return total
 
     # The final partial chunk is processed with the steady-state caches left by
     # previous complete chunks: 320 waveform samples for fbank and 1 LFR frame.
-    input_cache_len = 320 if full_chunks > 0 else 0
-    lfr_cache_len = 1 if full_chunks > 0 else left_ctx
+    input_cache_len = config.vq02_steady_state_input_cache_len if full_chunks > 0 else 0
+    lfr_cache_len = config.vq02_steady_state_lfr_cache_len if full_chunks > 0 else left_ctx
 
     effective_len = input_cache_len + tail_samples
-    if effective_len < frame_len:
+    if effective_len < config.vq02_frame_len:
         return total
 
-    tail_fbank_len = int((effective_len - frame_len) / frame_shift + 1)
+    tail_fbank_len = int((effective_len - config.vq02_frame_len) / config.vq02_frame_shift + 1)
     if tail_fbank_len < 1:
         return total
 
     tail_lfr_input_len = lfr_cache_len + tail_fbank_len
 
-    if tail_lfr_input_len < lfr_m:
+    if tail_lfr_input_len < config.vq02_lfr_m:
         return total
 
-    tail_lfr_len = max(0, math.ceil((tail_lfr_input_len - left_ctx) / lfr_n))
+    tail_lfr_len = max(0, math.ceil((tail_lfr_input_len - left_ctx) / config.vq02_lfr_n))
 
     return total + tail_lfr_len
 
@@ -81,6 +121,7 @@ def estimate_vq02_len(num_samples: int) -> int:
 def estimate_step_audio_editx_prompt_len(
     additional_information: dict[str, Any],
     model_path: str,
+    config: EstimateConfig = DEFAULT_ESTIMATE_CONFIG,
 ) -> int:
     config_path = os.path.dirname(model_path) if model_path.endswith("tokenizer_config.json") else model_path
     text_tokenizer = AutoTokenizer.from_pretrained(config_path, trust_remote_code=True)
@@ -94,23 +135,25 @@ def estimate_step_audio_editx_prompt_len(
         ref_audio = _first(additional_information.get("ref_audio"), None)
         ref_text = _first(additional_information.get("ref_text"), "")
         text = _first(additional_information.get("text"), "")
-        sr = _first(additional_information.get("sr"), 16000)
+        sr = _first(additional_information.get("sr"), config.sample_rate)
         edit_type = _first(additional_information.get("edit_type", "clone"))
 
         ref_audio = StepAudioTokenizer.preprocess_wav(ref_audio, sr)
         ref_audio = ref_audio.squeeze(0)
 
-        audio_chunks = StepAudioTokenizer.split_audio(ref_audio, chunk_duration=30 * 16000)
+        audio_chunks = StepAudioTokenizer.split_audio(ref_audio, chunk_duration=config.ref_audio_chunk_samples)
         vq06_len = 0
         for chunks in audio_chunks:
-            duration = round(chunks.shape[0] / 16000, 2)
-            vq06_len += math.ceil(duration * 25)
+            duration = round(chunks.shape[0] / config.sample_rate, 2)
+            vq06_len += math.ceil(duration * config.vq06_tokens_per_second)
 
-        vq02_len = estimate_vq02_len(len(ref_audio))
-        estimated_audio_token_len = min(vq02_len // 2, vq06_len // 3) * 5
+        vq02_len = estimate_vq02_len(len(ref_audio), config)
+        estimated_audio_token_len = (
+            min(vq02_len // config.vq02_codes_per_group, vq06_len // config.vq06_codes_per_group)
+            * config.audio_tokens_per_group
+        )
 
-        dummy_audio_len = 1
-        dummy_audio = "".join(f"<audio_{i}>" for i in range(dummy_audio_len))
+        dummy_audio = "".join(f"<audio_{i}>" for i in range(config.dummy_audio_len))
 
         if edit_type == "clone":
             prompt_speaker = "debug"
@@ -131,11 +174,15 @@ def estimate_step_audio_editx_prompt_len(
             add_generation_prompt=True,
         )
         token_ids = dummy_token_ids.get("input_ids")
-        prompt_len = len(token_ids) - dummy_audio_len + estimated_audio_token_len
-        return max(2, prompt_len)
+        prompt_len = len(token_ids) - config.dummy_audio_len + estimated_audio_token_len
+        return max(config.min_prompt_len, prompt_len)
     except Exception as exc:
-        logger.warning("Failed to estimate prompt length, using fallback 2048: %s", exc)
-        return 2048
+        logger.warning(
+            "Failed to estimate prompt length, using fallback %s: %s",
+            config.fallback_prompt_len,
+            exc,
+        )
+        return config.fallback_prompt_len
 
 
 class FunASRModel:

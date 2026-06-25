@@ -74,7 +74,7 @@ def _patch_estimator_dependencies(
         "split_audio",
         staticmethod(lambda audio, chunk_duration=480000: [audio]),
     )
-    monkeypatch.setattr(step_audio_tokenizer, "estimate_vq02_len", lambda _num_samples: vq02_len)
+    monkeypatch.setattr(step_audio_tokenizer, "estimate_vq02_len", lambda _num_samples, _config=None: vq02_len)
 
 
 def test_estimate_prompt_len_clone_replaces_dummy_audio_token(
