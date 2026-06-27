@@ -28,7 +28,7 @@ TOTAL_UPSAMPLE = 4
 
 # Load CUDAGraphDecoderWrapper: try package import first, fall back to direct file load
 try:
-    from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
+    from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_wrapper import CUDAGraphDecoderWrapper
 except Exception:
     _WRAPPER_PATH = os.path.join(
         os.path.dirname(__file__),
@@ -393,17 +393,17 @@ def test_single_frame(decoder, wrapper):
 def test_disabled_wrapper_matches_eager(decoder, wrapper):
     """Disabled wrapper should produce bit-identical output to eager."""
     codes = _random_codes(30)
-    wrapper.enabled = False
+    wrapper.normal_graph.enabled = False
     with torch.no_grad():
         eager_out = decoder(codes)
         graph_out = wrapper.decode(codes)
-    wrapper.enabled = True
+    wrapper.normal_graph.enabled = True
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
 
 
 def test_batch_size_gt1_uses_matching_graph(decoder, wrapper):
     """Captured batch size > 1 should replay a matching graph."""
-    assert (2, 25) in wrapper.graphs
+    assert (2, 25) in wrapper.normal_graph.graphs
     codes = _random_codes(25, batch_size=2)
     with torch.no_grad():
         eager_out = decoder(codes)
@@ -413,7 +413,16 @@ def test_batch_size_gt1_uses_matching_graph(decoder, wrapper):
 
 def test_uncaptured_batch_size_falls_back(decoder, wrapper):
     """Uncaptured batch sizes should fall back to eager."""
-    assert (3, 25) not in wrapper.graphs
+    assert (3, 25) not in wrapper.normal_graph.graphs
+    codes = _random_codes(25, batch_size=3)
+    with torch.no_grad():
+        eager_out = decoder(codes)
+        graph_out = wrapper.decode(codes)
+    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
+
+
+def test_outer_stream_fallback(decoder, wrapper, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     codes = _random_codes(25, batch_size=3)
     with torch.no_grad():
         eager_out = decoder(codes)
@@ -433,9 +442,9 @@ def test_extra_capture_shape_uses_sparse_graph(decoder):
     )
     sparse_wrapper.warmup(DEVICE)
 
-    assert (1, 25) in sparse_wrapper.graphs
-    assert (2, 50) in sparse_wrapper.graphs
-    assert (2, 25) not in sparse_wrapper.graphs
+    assert (1, 25) in sparse_wrapper.normal_graph.graphs
+    assert (2, 50) in sparse_wrapper.normal_graph.graphs
+    assert (2, 25) not in sparse_wrapper.normal_graph.graphs
 
     codes = _random_codes(50, batch_size=2)
     with torch.no_grad():

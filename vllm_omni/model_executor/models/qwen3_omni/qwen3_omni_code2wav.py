@@ -141,9 +141,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         codec_left_context_frames: int = 0,
     ):
         """Enable CUDA graph acceleration (same pattern as Qwen3-TTS Code2Wav)."""
-        from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper import (
-            CUDAGraphDecoderWrapper,
-        )
+        from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_wrapper import CUDAGraphDecoderWrapper
 
         if device is None:
             device = next(self.parameters()).device

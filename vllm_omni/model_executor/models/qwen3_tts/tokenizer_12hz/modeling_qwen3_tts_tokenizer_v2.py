@@ -878,7 +878,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         decode_chunk_size: int = 300,
         decode_left_context: int = 25,
     ):
-        from ..cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
+        from ..cuda_graph_wrapper import CUDAGraphDecoderWrapper
 
         if device is None:
             device = next(self.parameters()).device
