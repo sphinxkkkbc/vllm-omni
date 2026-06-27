@@ -32,7 +32,6 @@ class QueryResult(NamedTuple):
 def _load_codec_frame_rate(model_name: str) -> float | None:
     try:
         import json
-        import os
 
         from transformers.utils import cached_file
 
@@ -141,6 +140,7 @@ def _estimate_prompt_len(
                     if len(shape) == 1:
                         n_samples = int(shape[0])
                     else:
+                        # Using max(shape) to handle multichannel audio as deliberate hardening over online path
                         n_samples = int(max(shape))
                 elif hasattr(wav, "__len__"):
                     n_samples = len(wav)
