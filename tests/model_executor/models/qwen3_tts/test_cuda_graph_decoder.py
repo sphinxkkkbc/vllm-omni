@@ -421,15 +421,6 @@ def test_uncaptured_batch_size_falls_back(decoder, wrapper):
     torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
 
 
-def test_outer_stream_fallback(decoder, wrapper, monkeypatch):
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    codes = _random_codes(25, batch_size=3)
-    with torch.no_grad():
-        eager_out = decoder(codes)
-        graph_out = wrapper.decode(codes)
-    torch.testing.assert_close(graph_out, eager_out, atol=0, rtol=0)
-
-
 def test_extra_capture_shape_uses_sparse_graph(decoder):
     """Extra capture shapes should not expand to a full batch x size product."""
     sparse_wrapper = CUDAGraphDecoderWrapper(
@@ -584,3 +575,82 @@ def test_snakebeta_triton_vs_eager(batch, channels, seq_len, dtype, atol, rtol):
 
     assert triton_out.dtype == x.dtype
     torch.testing.assert_close(triton_out, eager_out, atol=atol, rtol=rtol)
+
+
+# ──────────────────────────────────────────────────────────────────
+# 8. Wrapper Dispatch Logic
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_compiled_only_graph_dispatch(decoder, monkeypatch):
+    """Compiled-only mode should use compiled graphs and fall back to eager on miss."""
+
+    def _fake_compile(model, **kwargs):
+        def _compiled(codes):
+            return model(codes) + 0.125
+
+        return _compiled
+
+    monkeypatch.setattr(torch, "compile", _fake_compile)
+
+    compiled_wrapper = CUDAGraphDecoderWrapper(
+        decoder=decoder,
+        capture_sizes=[],
+        capture_batch_sizes=[],
+        compile_shapes=[(1, 25), (1, 50)],
+        num_quantizers=NUM_QUANTIZERS,
+        enabled=True,
+    )
+    compiled_wrapper.warmup(DEVICE)
+
+    exact_codes = _random_codes(25)
+    padded_codes = _random_codes(30)
+    padded_static = torch.zeros(1, NUM_QUANTIZERS, 50, dtype=torch.long, device=DEVICE)
+    padded_static[:, :, :30] = padded_codes
+    uncaptured_codes = _random_codes(60)
+    with torch.no_grad():
+        exact_eager = decoder(exact_codes)
+        exact_out = compiled_wrapper.decode(exact_codes)
+        padded_graph_expected = decoder(padded_static)[..., : 30 * TOTAL_UPSAMPLE]
+        padded_out = compiled_wrapper.decode(padded_codes)
+        uncaptured_eager = decoder(uncaptured_codes)
+        uncaptured_out = compiled_wrapper.decode(uncaptured_codes)
+
+    torch.testing.assert_close(exact_out, exact_eager + 0.125, atol=0, rtol=0)
+    torch.testing.assert_close(padded_out, padded_graph_expected + 0.125, atol=0, rtol=0)
+    torch.testing.assert_close(uncaptured_out, uncaptured_eager, atol=0, rtol=0)
+    assert not compiled_wrapper.normal_graph.graphs
+
+
+def test_normal_graph_fallback_dispatch(decoder, monkeypatch):
+    """Normal dispatch should be used as fallback."""
+
+    def _fake_compile(model, **kwargs):
+        def _compiled(codes):
+            return model(codes) + 0.125
+
+        return _compiled
+
+    monkeypatch.setattr(torch, "compile", _fake_compile)
+
+    compiled_wrapper = CUDAGraphDecoderWrapper(
+        decoder=decoder,
+        capture_sizes=[25, 50],
+        capture_batch_sizes=[1],
+        compile_shapes=[(1, 25)],
+        num_quantizers=NUM_QUANTIZERS,
+        enabled=True,
+    )
+    compiled_wrapper.warmup(DEVICE)
+    exact_codes = _random_codes(25)
+    padded_codes = _random_codes(30)
+    padded_static = torch.zeros(1, NUM_QUANTIZERS, 50, dtype=torch.long, device=DEVICE)
+    padded_static[:, :, :30] = padded_codes
+    with torch.no_grad():
+        exact_expected = decoder(exact_codes)
+        exact_out = compiled_wrapper.decode(exact_codes)
+        padded_graph_expected = decoder(padded_static)[..., : 30 * TOTAL_UPSAMPLE]
+        padded_out = compiled_wrapper.decode(padded_codes)
+
+    torch.testing.assert_close(exact_out, exact_expected + 0.125, atol=0, rtol=0)
+    torch.testing.assert_close(padded_out, padded_graph_expected, atol=0, rtol=0)

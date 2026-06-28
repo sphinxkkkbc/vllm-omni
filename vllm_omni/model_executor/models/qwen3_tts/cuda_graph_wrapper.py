@@ -136,7 +136,7 @@ class Qwen3DecoderGraph(BaseCUDAGraphWrapper[tuple[int, int]]):
         num_quantizers: int = 8,
         enabled: bool = True,
     ):
-        super().__init__(fn=decoder.forward, enabled=enabled)
+        super().__init__(fn=decoder, enabled=enabled)
         self.decoder = decoder
         self._explicit_sizes = capture_sizes is not None
         self.capture_sizes = sorted(capture_sizes) if capture_sizes else []
@@ -150,7 +150,6 @@ class Qwen3DecoderGraph(BaseCUDAGraphWrapper[tuple[int, int]]):
         )
         self._bucket_sizes = self.capture_sizes
         self.num_quantizers = num_quantizers
-        self._dtype = torch.long
 
     @staticmethod
     def compute_capture_sizes(
@@ -187,20 +186,31 @@ class Qwen3DecoderGraph(BaseCUDAGraphWrapper[tuple[int, int]]):
             return self._bucket_sizes[idx]
         return None
 
-    def _trim_replay_output(self, static_output: torch.Tensor, actual_size: int, bucket_size: int) -> torch.Tensor:
-        """Trim a graph/compiled replay output to the eager-equivalent length.
+    def prepare_capture_context(
+        self,
+        codec_chunk_frames: int = 0,
+        codec_left_context_frames: int = 0,
+        decode_chunk_size: int = 300,
+        decode_left_context: int = 25,
+    ):
+        self.decoder.eval()
+        if not self._explicit_sizes:
+            self.capture_sizes = self.compute_capture_sizes(
+                codec_chunk_frames=codec_chunk_frames,
+                codec_left_context_frames=codec_left_context_frames,
+                decode_chunk_size=decode_chunk_size,
+                decode_left_context=decode_left_context,
+            )
 
-        The captured ``static_output`` already reflects the decoder's TRUE output
-        length for ``bucket_size`` frames, which for causal decoders (e.g.
-        Qwen3-Omni Code2Wav) is shorter than ``padded_size * total_upsample`` by a
-        fixed amount. Each zero-padded frame beyond ``actual_size`` contributes
-        ``total_upsample`` trailing samples that are stale buffer content, so trim
-        relative to the captured length instead of the nominal length. This is a
-        no-op for decoders whose output equals the nominal length (e.g. Qwen3-TTS).
-        """
-        drop = (bucket_size - actual_size) * self.decoder.total_upsample
-        actual_out_len = max(0, static_output.shape[-1] - drop)
-        return static_output[..., :actual_out_len]
+        self.capture_batch_sizes = [bs for bs in self.capture_batch_sizes if bs > 0] or [1]
+        self._bucket_sizes = sorted(set(self.capture_sizes) | {size for _, size in self.extra_capture_shapes})
+
+    def before_capture(self, keys):
+        for key in keys:
+            static_args, static_kwargs = self.get_static_call_args(key)
+            with torch.no_grad():
+                self.fn(*static_args, **static_kwargs)
+        torch.accelerator.synchronize(self.device)
 
     def get_capture_keys(self) -> list[tuple[int, int]]:
         shapes = {
@@ -209,18 +219,6 @@ class Qwen3DecoderGraph(BaseCUDAGraphWrapper[tuple[int, int]]):
         shapes.update(self.extra_capture_shapes)
         return sorted(shapes)
 
-    def before_capture(self):
-        if not self._explicit_sizes:
-            self.capture_sizes = self.compute_capture_sizes(
-                codec_chunk_frames=self._codec_chunk_frames,
-                codec_left_context_frames=self._codec_left_context_frames,
-                decode_chunk_size=self._decode_chunk_size,
-                decode_left_context=self._decode_left_context,
-            )
-
-        self.capture_batch_sizes = [bs for bs in self.capture_batch_sizes if bs > 0] or [1]
-        self._bucket_sizes = sorted(set(self.capture_sizes) | {size for _, size in self.extra_capture_shapes})
-
     def get_static_call_args(self, key, *args, **kwargs):
         if key not in self.static_inputs:
             batch_size, bucket_size = key
@@ -228,10 +226,10 @@ class Qwen3DecoderGraph(BaseCUDAGraphWrapper[tuple[int, int]]):
                 batch_size,
                 self.num_quantizers,
                 bucket_size,
-                dtype=self._dtype,
+                dtype=self.dtype,
                 device=self.device,
             )
-        return self.static_inputs[key]
+        return (self.static_inputs[key],), {}
 
     def warmup(
         self,
@@ -242,16 +240,14 @@ class Qwen3DecoderGraph(BaseCUDAGraphWrapper[tuple[int, int]]):
         decode_chunk_size: int = 300,
         decode_left_context: int = 25,
     ):
-        if device.type != "cuda" or not self.enabled or self._warmed_up:
-            return
-        self._codec_chunk_frames = codec_chunk_frames
-        self._codec_left_context_frames = codec_left_context_frames
-        self._decode_chunk_size = decode_chunk_size
-        self._decode_left_context = decode_left_context
-        self.device = device
-        self._dtype = dtype
-        self.decoder.eval()
-        self.capture()
+        self.capture(
+            device=device,
+            dtype=dtype,
+            codec_chunk_frames=codec_chunk_frames,
+            codec_left_context_frames=codec_left_context_frames,
+            decode_chunk_size=decode_chunk_size,
+            decode_left_context=decode_left_context,
+        )
 
     def select_runtime_key(self, codes: torch.Tensor, *args, **kwargs) -> tuple[int, int] | None:
         batch_size = int(codes.shape[0])
@@ -271,21 +267,28 @@ class Qwen3DecoderGraph(BaseCUDAGraphWrapper[tuple[int, int]]):
             static_input.zero_()
             static_input[:, :, :actual_size] = codes
 
-    def run_eager(self, codes: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        return self.decoder(codes)
-
     def postprocess(
         self,
         key: tuple[int, int],
         codes: torch.Tensor,
-        *,
-        clone_graph_output: bool = True,
         **kwargs,
     ) -> torch.Tensor:
+        """Trim a graph/compiled replay output to the eager-equivalent length.
+
+        The captured ``static_output`` already reflects the decoder's TRUE output
+        length for ``bucket_size`` frames, which for causal decoders (e.g.
+        Qwen3-Omni Code2Wav) is shorter than ``padded_size * total_upsample`` by a
+        fixed amount. Each zero-padded frame beyond ``actual_size`` contributes
+        ``total_upsample`` trailing samples that are stale buffer content, so trim
+        relative to the captured length instead of the nominal length. This is a
+        no-op for decoders whose output equals the nominal length (e.g. Qwen3-TTS).
+        """
         actual_size = int(codes.shape[-1])
         bucket_size = key[1]
-        output = self._trim_replay_output(self.static_outputs[key], actual_size, bucket_size)
-        return output.clone() if clone_graph_output else output
+        output = self.trim_captured_minus_padding(
+            self.static_outputs[key], actual_size, bucket_size, self.decoder.total_upsample
+        )
+        return output
 
     def decode(self, codes: torch.Tensor, *, clone_graph_output: bool) -> torch.Tensor:
         return self.replay(codes, clone_graph_output=clone_graph_output)
@@ -295,15 +298,17 @@ class Qwen3CompiledDecoderGraph(Qwen3DecoderGraph):
     def __init__(
         self,
         decoder,
+        enabled: bool = True,
         compile_shapes: list[tuple[int, int]] | None = None,
+        num_quantizers: int = 8,
     ):
-        super().__init__(decoder, capture_sizes=[])
+        super().__init__(decoder, capture_sizes=[], enabled=enabled, num_quantizers=num_quantizers)
         self.compile_shapes = sorted(compile_shapes or [])
         self._bucket_sizes = sorted({size for _, size in self.compile_shapes})
         self.num_warmup = 5
         self.fn = None
 
-    def before_capture(self):
+    def prepare_capture_context(self):
         logger.info(
             "Starting torch.compile + CUDA Graph warmup for decoder shapes: %s",
             self.compile_shapes,
@@ -316,11 +321,7 @@ class Qwen3CompiledDecoderGraph(Qwen3DecoderGraph):
         )
 
     def warmup(self, device: torch.device, dtype: torch.dtype = torch.long):
-        if device.type != "cuda" or not self.enabled or self._warmed_up:
-            return
-        self.device = device
-        self._dtype = dtype
-        self.capture()
+        self.capture(device=device, dtype=dtype)
 
     def get_capture_keys(self):
         return self.compile_shapes
@@ -336,17 +337,17 @@ class Qwen3CompiledDecoderGraph(Qwen3DecoderGraph):
             return bucket_key
         return None
 
+    def before_capture(self, keys):
+        pass
+
+    def run_eager(self, codes: torch.Tensor, *args, **kwargs):
+        return None
+
+    def _replay_fallback_log(self, reason, key, *args, **kwargs):
+        pass
+
     def try_decode(self, codes: torch.Tensor, *, clone_graph_output: bool) -> torch.Tensor | None:
-        if not self.can_replay(codes):
-            return None
-        if torch.cuda.is_current_stream_capturing():
-            return None
-        key = self.select_runtime_key(codes)
-        if key is None or key not in self.graphs:
-            return None
-        self.prepare_runtime_input(key, codes)
-        self.graphs[key].replay()
-        return self.postprocess(key, codes, clone_graph_output=clone_graph_output)
+        return self.replay(codes, clone_graph_output=clone_graph_output)
 
 
 class CUDAGraphDecoderWrapper:
@@ -387,6 +388,8 @@ class CUDAGraphDecoderWrapper:
             Qwen3CompiledDecoderGraph(
                 decoder=decoder,
                 compile_shapes=compile_shapes,
+                num_quantizers=num_quantizers,
+                enabled=enabled,
             )
             if compile_shapes
             else None
