@@ -648,6 +648,11 @@ def test_normal_graph_fallback_dispatch(decoder, monkeypatch):
     torch.testing.assert_close(padded_out, padded_graph_expected, atol=0, rtol=0)
 
 
+# ──────────────────────────────────────────────────────────────────
+# 8. Wrapper log / stats count
+# ──────────────────────────────────────────────────────────────────
+
+
 def test_decode_stats_counts(decoder, monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_QWEN3_CODE2WAV_CUDAGRAPH_STATS", "1")
 
@@ -688,7 +693,7 @@ def test_decode_stats_log_every(decoder, monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_QWEN3_CODE2WAV_CUDAGRAPH_STATS_LOG_EVERY", "1")
     info_calls = []
     monkeypatch.setattr(
-        "vllm_omni.model_executor.models.qwen3_tts.cuda_graph_wrapper.logger.info",
+        "vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper.logger.info",
         lambda *args, **kwargs: info_calls.append((args, kwargs)),
     )
 
