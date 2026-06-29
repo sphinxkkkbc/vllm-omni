@@ -294,7 +294,7 @@ def test_chunked_decode_exact_size_equivalence(decoder, wrapper, total_len):
 
 
 def test_chunked_decode_output_survives_later_replay(wrapper):
-    """Chunked output must not alias graph static buffers overwritten by later replays."""
+    """Chunked output slices must keep decode() clones, not graph static buffers."""
     codes = _random_codes(100)
     overwrite_codes = _random_codes(100)
 
@@ -654,3 +654,63 @@ def test_normal_graph_fallback_dispatch(decoder, monkeypatch):
 
     torch.testing.assert_close(exact_out, exact_expected + 0.125, atol=0, rtol=0)
     torch.testing.assert_close(padded_out, padded_graph_expected, atol=0, rtol=0)
+
+
+def test_decode_stats_counts(decoder, monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_QWEN3_CODE2WAV_CUDAGRAPH_STATS", "1")
+
+    def _fake_compile(model, **kwargs):
+        def _compiled(codes):
+            return model(codes) + 0.125
+
+        return _compiled
+
+    monkeypatch.setattr(torch, "compile", _fake_compile)
+
+    stats_wrapper = CUDAGraphDecoderWrapper(
+        decoder=decoder,
+        capture_sizes=[25, 50],
+        capture_batch_sizes=[1],
+        compile_shapes=[(1, 25)],
+        num_quantizers=NUM_QUANTIZERS,
+        enabled=True,
+    )
+    stats_wrapper.warmup(DEVICE)
+
+    with torch.no_grad():
+        stats_wrapper.decode(_random_codes(25))
+        stats_wrapper.decode(_random_codes(30))
+        stats_wrapper.decode(_random_codes(60))
+
+    assert stats_wrapper._stats_total == 3
+    assert stats_wrapper._stats_hits == 2
+    assert stats_wrapper._stats_compiled_hits == 1
+    assert stats_wrapper._stats_fallbacks == 1
+    assert stats_wrapper._stats_requests[(1, 25)] == 1
+    assert stats_wrapper._stats_compiled_shapes[(1, 25)] == 1
+    assert stats_wrapper._stats_hit_shapes[(1, 30, 50)] == 1
+    assert stats_wrapper._stats_fallback_shapes[(1, 60, -1)] == 1
+
+
+def test_decode_stats_log_every(decoder, monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_QWEN3_CODE2WAV_CUDAGRAPH_STATS", "1")
+    monkeypatch.setenv("VLLM_OMNI_QWEN3_CODE2WAV_CUDAGRAPH_STATS_LOG_EVERY", "1")
+    info_calls = []
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.qwen3_tts.cuda_graph_wrapper.logger.info",
+        lambda *args, **kwargs: info_calls.append((args, kwargs)),
+    )
+
+    stats_wrapper = CUDAGraphDecoderWrapper(
+        decoder=decoder,
+        capture_sizes=[25],
+        capture_batch_sizes=[1],
+        num_quantizers=NUM_QUANTIZERS,
+        enabled=True,
+    )
+    stats_wrapper.warmup(DEVICE)
+
+    with torch.no_grad():
+        stats_wrapper.decode(_random_codes(25))
+
+    assert any("Code2Wav CUDA Graph stats" in call[0][0] for call in info_calls)

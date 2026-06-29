@@ -5,7 +5,11 @@
 import pytest
 import torch
 
-from vllm_omni.model_executor.cuda_graph_wrapper import BaseCUDAGraphWrapper
+from vllm_omni.model_executor.cuda_graph_wrapper import (
+    BaseCUDAGraphWrapper,
+    CaptureMode,
+    CUDAGraphOptions,
+)
 
 pytestmark = [pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")]
 
@@ -21,12 +25,14 @@ class ToyCUDAGraphWrapper(BaseCUDAGraphWrapper[tuple[int]]):
         capture_sizes: list[int] | None = None,
         capture_mode: str = "pre-capture",
         enabled: bool = True,
-        fn=None,
+        runnable=None,
+        cudagraph_options: CUDAGraphOptions | None = None,
     ):
         super().__init__(
-            fn=fn or self._default_fn,
+            runnable=runnable or self._default_fn,
             enabled=enabled,
             capture_mode=capture_mode,
+            cudagraph_options=cudagraph_options,
         )
         self.capture_sizes = capture_sizes or [4]
         self.events: list[str] = []
@@ -34,6 +40,11 @@ class ToyCUDAGraphWrapper(BaseCUDAGraphWrapper[tuple[int]]):
         self.before_capture_calls = 0
         self.prepare_runtime_calls = 0
         self.eager_calls = 0
+        self.capture_begin_log_calls = 0
+        self.capture_success_log_calls = 0
+        self.replay_hit_log_calls = 0
+        self.replay_fallback_log_calls = 0
+        self.capture_success_elapsed_ms: list[float | None] = []
 
     @staticmethod
     def _default_fn(x: torch.Tensor) -> torch.Tensor:
@@ -84,11 +95,25 @@ class ToyCUDAGraphWrapper(BaseCUDAGraphWrapper[tuple[int]]):
         self.events.append("run_eager")
         return super().run_eager(*args, **kwargs)
 
+    def on_capture_begin_log(self, key: tuple[int]) -> None:
+        self.capture_begin_log_calls += 1
+
+    def on_capture_success_log(self, key: tuple[int], elapsed_ms: float | None = None) -> None:
+        self.capture_success_log_calls += 1
+        self.capture_success_elapsed_ms.append(elapsed_ms)
+
+    def on_replay_hit_log(self, key: tuple[int], *args, **kwargs) -> None:
+        self.replay_hit_log_calls += 1
+
+    def on_replay_fallback_log(self, reason, key, *args, **kwargs) -> None:
+        self.replay_fallback_log_calls += 1
+        super().on_replay_fallback_log(reason, key, *args, **kwargs)
+
 
 class NoFnCUDAGraphWrapper(ToyCUDAGraphWrapper):
     def __init__(self):
-        super().__init__(fn=lambda x: x)
-        self.fn = None
+        super().__init__(runnable=lambda x: x)
+        self.runnable = None
 
 
 def _input(size: int) -> torch.Tensor:
@@ -221,11 +246,20 @@ def test_invalid_capture_mode_raises():
         ToyCUDAGraphWrapper(capture_mode="invalid")
 
 
+def test_capture_mode_accepts_enum():
+    wrapper = ToyCUDAGraphWrapper(capture_mode=CaptureMode.LAZY)
+
+    wrapper.capture(device=DEVICE)
+
+    assert wrapper.capture_mode is CaptureMode.LAZY
+    assert not wrapper.graphs
+
+
 def test_fn_none_requires_adapter_overrides():
     wrapper = NoFnCUDAGraphWrapper()
 
-    with pytest.raises(NotImplementedError, match="_warmup_for_key"):
-        wrapper._warmup_for_key((4,))
+    with pytest.raises(NotImplementedError, match="_warmup"):
+        wrapper._warmup((4,))
 
     wrapper.capture(device=DEVICE)
     assert not wrapper.graphs
@@ -247,17 +281,53 @@ def test_default_replay_clones_static_output():
     torch.testing.assert_close(out, wrapper.static_outputs[(4,)])
 
 
-def test_replay_can_return_static_output_handle_when_clone_disabled():
+def test_options_can_disable_default_output_clone():
     class DefaultPostprocessWrapper(ToyCUDAGraphWrapper):
         def postprocess(self, key: tuple[int], *args, **kwargs):
             return BaseCUDAGraphWrapper.postprocess(self, key, *args, **kwargs)
 
-    wrapper = DefaultPostprocessWrapper(capture_sizes=[4])
+    wrapper = DefaultPostprocessWrapper(
+        capture_sizes=[4],
+        cudagraph_options=CUDAGraphOptions(clone_output=False),
+    )
     wrapper.capture(device=DEVICE)
 
-    out = wrapper.replay(_input(4), clone_graph_output=False)
+    out = wrapper.replay(_input(4))
 
     assert out is wrapper.static_outputs[(4,)]
+
+
+def test_options_can_disable_capture_logs(monkeypatch):
+    info_calls = []
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.cuda_graph_wrapper.logger.info",
+        lambda *args, **kwargs: info_calls.append((args, kwargs)),
+    )
+
+    wrapper = ToyCUDAGraphWrapper(
+        capture_sizes=[4],
+        cudagraph_options=CUDAGraphOptions(enable_log=False),
+    )
+
+    wrapper.capture(device=DEVICE)
+
+    assert info_calls == []
+    assert wrapper.capture_begin_log_calls == 0
+    assert wrapper.capture_success_log_calls == 0
+
+
+def test_replay_log_hooks_are_called():
+    wrapper = ToyCUDAGraphWrapper(capture_sizes=[4])
+    wrapper.capture(device=DEVICE)
+
+    wrapper.replay(_input(4))
+    wrapper.replay(_input(8))
+
+    assert wrapper.capture_begin_log_calls == 1
+    assert wrapper.capture_success_log_calls == 1
+    assert wrapper.capture_success_elapsed_ms[0] is not None
+    assert wrapper.replay_hit_log_calls == 1
+    assert wrapper.replay_fallback_log_calls == 1
 
 
 def test_default_replay_output_survives_later_replay():
