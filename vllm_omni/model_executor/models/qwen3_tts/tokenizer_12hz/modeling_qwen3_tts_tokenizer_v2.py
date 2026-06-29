@@ -39,6 +39,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import ModelOutput, auto_docstring, logging
 from transformers.utils.deprecation import deprecate_kwarg
+from vllm.config import VllmConfig
 
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 
@@ -877,8 +878,9 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         codec_left_context_frames: int = 0,
         decode_chunk_size: int = 300,
         decode_left_context: int = 25,
+        vllm_config: VllmConfig | None = None,
     ):
-        from ..cuda_graph_wrapper import CUDAGraphDecoderWrapper
+        from ..cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
 
         if device is None:
             device = next(self.parameters()).device
@@ -893,7 +895,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             extra_capture_shapes=extra_capture_shapes,
             compile_shapes=compile_shapes,
             num_quantizers=self.config.num_quantizers,
-            enabled=True,
+            vllm_config=vllm_config,
         )
         self._cudagraph_wrapper.warmup(
             device,
@@ -903,7 +905,9 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             decode_chunk_size=decode_chunk_size,
             decode_left_context=decode_left_context,
         )
-        self._cudagraph_enabled = True
+        self._cudagraph_enabled = self._cudagraph_wrapper.enabled
+        if not self._cudagraph_enabled:
+            return
         logger.info(
             "CUDA Graph enabled for decoder: batch_sizes=%s seq_lens=%s extra_shapes=%s compile_shapes=%s",
             self._cudagraph_wrapper.capture_batch_sizes,

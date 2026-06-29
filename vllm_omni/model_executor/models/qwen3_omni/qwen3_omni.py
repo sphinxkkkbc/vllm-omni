@@ -1313,16 +1313,14 @@ class Qwen3OmniMoeForConditionalGeneration(
         if not self.code2wav or not hasattr(self.code2wav, "enable_cudagraph"):
             return
 
-        model_cfg = getattr(self.vllm_config, "model_config", None)
-        if getattr(model_cfg, "enforce_eager", False):
-            logger.info("Code2Wav CUDA Graph disabled because enforce_eager is set")
-            return
-
         chunk_frames, left_frames = self._get_codec_frame_config()
         self.code2wav.enable_cudagraph(
             codec_chunk_frames=chunk_frames,
             codec_left_context_frames=left_frames,
+            vllm_config=self.vllm_config,
         )
+        if getattr(getattr(self.vllm_config, "model_config", None), "enforce_eager", False):
+            logger.info("Code2Wav CUDA Graph disabled because enforce_eager is set")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for all components of the omni model."""

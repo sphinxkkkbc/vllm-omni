@@ -139,9 +139,10 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         device: torch.device | None = None,
         codec_chunk_frames: int = 0,
         codec_left_context_frames: int = 0,
+        vllm_config: VllmConfig | None = None,
     ):
         """Enable CUDA graph acceleration (same pattern as Qwen3-TTS Code2Wav)."""
-        from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_wrapper import CUDAGraphDecoderWrapper
+        from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
 
         if device is None:
             device = next(self.parameters()).device
@@ -152,7 +153,7 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         wrapper = CUDAGraphDecoderWrapper(
             decoder=self,
             num_quantizers=self.config.num_quantizers,
-            enabled=True,
+            vllm_config=vllm_config,
         )
         try:
             wrapper.warmup(
@@ -166,7 +167,9 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
             self._cudagraph_enabled = False
             raise
         self._cudagraph_wrapper = wrapper
-        self._cudagraph_enabled = True
+        self._cudagraph_enabled = wrapper.enabled
+        if not self._cudagraph_enabled:
+            return
         logger.info(
             "CUDA Graph enabled for Code2Wav: num_quantizers=%d, sizes=%s",
             self.config.num_quantizers,

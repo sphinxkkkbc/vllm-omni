@@ -150,13 +150,8 @@ class Qwen3TTSCode2Wav(nn.Module):
         decode_cudagraph_extra_capture_shapes: list[tuple[int, int]] | None,
         decode_compile_shapes: list[tuple[int, int]] | None,
     ) -> None:
-        """Enable inner Code2Wav CUDA graph unless stage is enforce_eager."""
+        """Enable inner Code2Wav CUDA graph."""
         if not hasattr(self.decoder, "enable_cudagraph") or device.type != "cuda":
-            return
-
-        model_cfg = getattr(self.vllm_config, "model_config", None)
-        if getattr(model_cfg, "enforce_eager", False):
-            logger.info("Qwen3-TTS Code2Wav CUDA Graph disabled because enforce_eager is set")
             return
 
         if (
@@ -186,8 +181,12 @@ class Qwen3TTSCode2Wav(nn.Module):
             codec_left_context_frames=codec_left_context_frames,
             decode_chunk_size=self._decode_chunk_frames,
             decode_left_context=self._decode_left_context_frames,
+            vllm_config=self.vllm_config,
         )
-        logger.info("Code2Wav decoder CUDA Graph enabled")
+        if getattr(getattr(self.vllm_config, "model_config", None), "enforce_eager", False):
+            logger.info("Qwen3-TTS Code2Wav CUDA Graph disabled because enforce_eager is set")
+        else:
+            logger.info("Code2Wav decoder CUDA Graph enabled")
 
     def _get_decode_batch_bucket_frames(self, actual_frames: int) -> int:
         for bucket_frames in self._decode_batch_bucket_frames:

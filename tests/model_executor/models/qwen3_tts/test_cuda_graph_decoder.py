@@ -28,7 +28,7 @@ TOTAL_UPSAMPLE = 4
 
 # Load CUDAGraphDecoderWrapper: try package import first, fall back to direct file load
 try:
-    from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_wrapper import CUDAGraphDecoderWrapper
+    from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
 except Exception:
     _WRAPPER_PATH = os.path.join(
         os.path.dirname(__file__),
@@ -97,7 +97,6 @@ def wrapper(decoder):
         capture_sizes=[25, 50, 100],
         capture_batch_sizes=[1, 2],
         num_quantizers=NUM_QUANTIZERS,
-        enabled=True,
     )
     w.warmup(DEVICE)
     return w
@@ -192,7 +191,6 @@ def test_padded_short_output_decode_length_matches_eager(seq_len):
         capture_sizes=[25, 50, 100],
         capture_batch_sizes=[1],
         num_quantizers=NUM_QUANTIZERS,
-        enabled=True,
     )
     short_wrapper.warmup(DEVICE)
     codes = _random_codes(seq_len)
@@ -233,7 +231,6 @@ def test_compiled_padded_short_output_length_matches_eager(monkeypatch):
         capture_batch_sizes=[1],
         compile_shapes=[(1, 25), (1, 50)],
         num_quantizers=NUM_QUANTIZERS,
-        enabled=True,
     )
     compiled_wrapper.warmup(DEVICE)
     codes = _random_codes(30)  # not a capture size -> padded to bucket 50 on the compiled path
@@ -322,7 +319,6 @@ def test_chunked_decode_preserves_short_chunk_concat_semantics():
         capture_sizes=[50],
         capture_batch_sizes=[1],
         num_quantizers=NUM_QUANTIZERS,
-        enabled=True,
     )
     short_wrapper.warmup(DEVICE)
     codes = _random_codes(100)
@@ -429,7 +425,6 @@ def test_extra_capture_shape_uses_sparse_graph(decoder):
         capture_batch_sizes=[1],
         extra_capture_shapes=[(2, 50)],
         num_quantizers=NUM_QUANTIZERS,
-        enabled=True,
     )
     sparse_wrapper.warmup(DEVICE)
 
@@ -465,7 +460,6 @@ def test_compile_shape_supports_exact_and_padded_buckets(decoder, monkeypatch):
         capture_batch_sizes=[1],
         compile_shapes=[(1, 25), (1, 50)],
         num_quantizers=NUM_QUANTIZERS,
-        enabled=True,
     )
     compiled_wrapper.warmup(DEVICE)
 
@@ -599,7 +593,6 @@ def test_compiled_only_graph_dispatch(decoder, monkeypatch):
         capture_batch_sizes=[],
         compile_shapes=[(1, 25), (1, 50)],
         num_quantizers=NUM_QUANTIZERS,
-        enabled=True,
     )
     compiled_wrapper.warmup(DEVICE)
 
@@ -639,7 +632,6 @@ def test_normal_graph_fallback_dispatch(decoder, monkeypatch):
         capture_batch_sizes=[1],
         compile_shapes=[(1, 25)],
         num_quantizers=NUM_QUANTIZERS,
-        enabled=True,
     )
     compiled_wrapper.warmup(DEVICE)
     exact_codes = _random_codes(25)
@@ -673,7 +665,6 @@ def test_decode_stats_counts(decoder, monkeypatch):
         capture_batch_sizes=[1],
         compile_shapes=[(1, 25)],
         num_quantizers=NUM_QUANTIZERS,
-        enabled=True,
     )
     stats_wrapper.warmup(DEVICE)
 
@@ -706,7 +697,6 @@ def test_decode_stats_log_every(decoder, monkeypatch):
         capture_sizes=[25],
         capture_batch_sizes=[1],
         num_quantizers=NUM_QUANTIZERS,
-        enabled=True,
     )
     stats_wrapper.warmup(DEVICE)
 

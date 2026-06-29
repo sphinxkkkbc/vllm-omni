@@ -7,16 +7,15 @@ This module provides CUDA Graph acceleration for the speech tokenizer decoder,
 reducing kernel launch overhead during inference.
 """
 
-import bisect
 import os
-import time
 from collections import Counter
 from collections.abc import Callable, Sequence
 
 import torch
-from torch.cuda import CUDAGraph
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
+
+from vllm_omni.model_executor.cuda_graph_wrapper import BaseCUDAGraphWrapper
 
 logger = init_logger(__name__)
 
@@ -129,31 +128,18 @@ def _batched_chunked_decode(
     return wav_out
 
 
-class CUDAGraphDecoderWrapper:
-    """
-    CUDA Graph wrapper for Qwen3TTSTokenizerV2Decoder.
-
-    This wrapper captures the decoder forward pass for fixed input sizes
-    and replays them during inference to reduce kernel launch overhead.
-
-    Usage:
-        wrapper = CUDAGraphDecoderWrapper(decoder, capture_sizes=[25, 50, 100, 200, 300])
-        wrapper.warmup(device)
-
-        # During inference:
-        output = wrapper.decode(codes)  # Automatically uses CUDA graph if possible
-    """
-
+class Qwen3DecoderGraph(BaseCUDAGraphWrapper[tuple[int, int]]):
     def __init__(
         self,
         decoder: torch.nn.Module,
         capture_sizes: list[int] | None = None,
         capture_batch_sizes: list[int] | None = None,
         extra_capture_shapes: list[tuple[int, int]] | None = None,
-        compile_shapes: list[tuple[int, int]] | None = None,
         num_quantizers: int = 8,
-        enabled: bool = True,
+        enabled: bool | None = None,
+        vllm_config: VllmConfig | None = None,
     ):
+        super().__init__(runnable=decoder, enabled=enabled, vllm_config=vllm_config)
         self.decoder = decoder
         self._explicit_sizes = capture_sizes is not None
         self.capture_sizes = sorted(capture_sizes) if capture_sizes else []
@@ -165,44 +151,8 @@ class CUDAGraphDecoderWrapper:
                 if int(batch_size) > 0 and int(size) > 0
             }
         )
-        self.compile_shapes = sorted(
-            {
-                (int(batch_size), int(size))
-                for batch_size, size in compile_shapes or []
-                if int(batch_size) > 0 and int(size) > 0
-            }
-        )
         self._bucket_sizes = self.capture_sizes
         self.num_quantizers = num_quantizers
-        self.enabled = enabled
-
-        self.graphs: dict[tuple[int, int], CUDAGraph] = {}
-        self.static_inputs: dict[tuple[int, int], torch.Tensor] = {}
-        self.static_outputs: dict[tuple[int, int], torch.Tensor] = {}
-        self._compiled_decoder: Callable[[torch.Tensor], torch.Tensor] | None = None
-        self._compiled_graphs: dict[tuple[int, int], CUDAGraph] = {}
-        self._compiled_static_inputs: dict[tuple[int, int], torch.Tensor] = {}
-        self._compiled_static_outputs: dict[tuple[int, int], torch.Tensor] = {}
-        self._compiled_shapes: set[tuple[int, int]] = set()
-
-        self._warmed_up = False
-        self._device = None
-        self._stats_enabled = os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_CUDAGRAPH_STATS", "").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        self._stats_log_every = int(os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_CUDAGRAPH_STATS_LOG_EVERY", "0") or 0)
-        self._stats_total = 0
-        self._stats_hits = 0
-        self._stats_compiled_hits = 0
-        self._stats_fallbacks = 0
-        self._stats_stream_capture_fallbacks = 0
-        self._stats_requests: Counter[tuple[int, int]] = Counter()
-        self._stats_hit_shapes: Counter[tuple[int, int, int]] = Counter()
-        self._stats_compiled_shapes: Counter[tuple[int, int]] = Counter()
-        self._stats_fallback_shapes: Counter[tuple[int, int, int]] = Counter()
 
     @staticmethod
     def compute_capture_sizes(
@@ -231,18 +181,289 @@ class CUDAGraphDecoderWrapper:
 
         return sorted(sizes)
 
-    def _get_padded_size(self, actual_size: int) -> int | None:
-        # bisect_left over the pre-sorted _bucket_sizes is O(log n) vs the linear scan;
-        # this matters because _decode invokes it on every per-chunk replay.
-        idx = bisect.bisect_left(self._bucket_sizes, actual_size)
-        if idx < len(self._bucket_sizes):
-            return self._bucket_sizes[idx]
-        return None
+    def prepare_capture_context(
+        self,
+        codec_chunk_frames: int = 0,
+        codec_left_context_frames: int = 0,
+        decode_chunk_size: int = 300,
+        decode_left_context: int = 25,
+    ):
+        if not self._explicit_sizes:
+            self.capture_sizes = self.compute_capture_sizes(
+                codec_chunk_frames=codec_chunk_frames,
+                codec_left_context_frames=codec_left_context_frames,
+                decode_chunk_size=decode_chunk_size,
+                decode_left_context=decode_left_context,
+            )
 
-    def _get_capture_shapes(self) -> list[tuple[int, int]]:
-        shapes = {(batch_size, size) for batch_size in self.capture_batch_sizes for size in self.capture_sizes}
+        self.capture_batch_sizes = [bs for bs in self.capture_batch_sizes if bs > 0] or [1]
+        self._bucket_sizes = sorted(set(self.capture_sizes) | {size for _, size in self.extra_capture_shapes})
+
+    def before_capture(self, keys):
+        for key in keys:
+            static_args, static_kwargs = self.get_static_call_args(key)
+            with torch.no_grad():
+                self.runnable(*static_args, **static_kwargs)
+        torch.accelerator.synchronize(self.device)
+
+    def get_capture_keys(self) -> list[tuple[int, int]]:
+        shapes = {
+            (batch_size, bucket_size) for batch_size in self.capture_batch_sizes for bucket_size in self.capture_sizes
+        }
         shapes.update(self.extra_capture_shapes)
         return sorted(shapes)
+
+    def get_static_call_args(self, key, *args, **kwargs):
+        if key not in self.static_inputs:
+            batch_size, bucket_size = key
+            self.static_inputs[key] = torch.zeros(
+                batch_size,
+                self.num_quantizers,
+                bucket_size,
+                dtype=self.dtype,
+                device=self.device,
+            )
+        return (self.static_inputs[key],), {}
+
+    def warmup(
+        self,
+        device: torch.device,
+        dtype: torch.dtype = torch.long,
+        codec_chunk_frames: int = 0,
+        codec_left_context_frames: int = 0,
+        decode_chunk_size: int = 300,
+        decode_left_context: int = 25,
+    ):
+        self.capture(
+            device=device,
+            dtype=dtype,
+            codec_chunk_frames=codec_chunk_frames,
+            codec_left_context_frames=codec_left_context_frames,
+            decode_chunk_size=decode_chunk_size,
+            decode_left_context=decode_left_context,
+        )
+
+    def select_runtime_key(self, codes: torch.Tensor, *args, **kwargs) -> tuple[int, int] | None:
+        batch_size = int(codes.shape[0])
+        actual_size = int(codes.shape[-1])
+        bucket_size = self.find_ge_bucket(self._bucket_sizes, actual_size)
+        return (batch_size, bucket_size) if bucket_size is not None else None
+
+    def on_replay_fallback_log(self, reason, key, codes: torch.Tensor, *args, **kwargs) -> None:
+        logger.debug(
+            "Qwen3 decoder CUDA Graph fallback: reason=%s key=%s batch=%d frames=%d buckets=%s",
+            reason,
+            key,
+            int(codes.shape[0]),
+            int(codes.shape[-1]),
+            self._bucket_sizes,
+        )
+
+    def prepare_runtime_input(self, key: tuple[int, int], codes: torch.Tensor, *args, **kwargs) -> None:
+        _, bucket_size = key
+        actual_size = int(codes.shape[-1])
+        static_input = self.static_inputs[key]
+        if actual_size == bucket_size:
+            static_input.copy_(codes)
+        else:
+            static_input.zero_()
+            static_input[:, :, :actual_size] = codes
+
+    def postprocess(
+        self,
+        key: tuple[int, int],
+        codes: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Trim a graph/compiled replay output to the eager-equivalent length.
+
+        The captured ``static_output`` already reflects the decoder's TRUE output
+        length for ``bucket_size`` frames, which for causal decoders (e.g.
+        Qwen3-Omni Code2Wav) is shorter than ``padded_size * total_upsample`` by a
+        fixed amount. Each zero-padded frame beyond ``actual_size`` contributes
+        ``total_upsample`` trailing samples that are stale buffer content, so trim
+        relative to the captured length instead of the nominal length. This is a
+        no-op for decoders whose output equals the nominal length (e.g. Qwen3-TTS).
+        """
+        actual_size = int(codes.shape[-1])
+        bucket_size = key[1]
+        output = self.trim_captured_minus_padding(
+            self.static_outputs[key], actual_size, bucket_size, self.decoder.total_upsample
+        )
+        return output
+
+    def decode(self, codes: torch.Tensor) -> torch.Tensor:
+        return self.replay(codes)
+
+
+class Qwen3CompiledDecoderGraph(Qwen3DecoderGraph):
+    def __init__(
+        self,
+        decoder,
+        compile_shapes: list[tuple[int, int]] | None = None,
+        num_quantizers: int = 8,
+        enabled: bool | None = None,
+        vllm_config: VllmConfig | None = None,
+    ):
+        super().__init__(
+            decoder,
+            capture_sizes=[],
+            num_quantizers=num_quantizers,
+            enabled=enabled,
+            vllm_config=vllm_config,
+        )
+        self.compile_shapes = sorted(compile_shapes or [])
+        self._bucket_sizes = sorted({size for _, size in self.compile_shapes})
+        self.num_warmup = 5
+        self.runnable = None
+
+    def prepare_capture_context(self):
+        logger.info(
+            "Starting torch.compile + CUDA Graph warmup for decoder shapes: %s",
+            self.compile_shapes,
+        )
+        self.runnable = torch.compile(
+            self.decoder.forward,
+            mode="default",
+            fullgraph=False,
+            dynamic=False,
+        )
+
+    def warmup(self, device: torch.device, dtype: torch.dtype = torch.long):
+        self.capture(device=device, dtype=dtype)
+
+    def get_capture_keys(self):
+        return self.compile_shapes
+
+    def select_runtime_key(self, codes: torch.Tensor, *args, **kwargs) -> tuple[int, int] | None:
+        batch_size = int(codes.shape[0])
+        actual_size = int(codes.shape[-1])
+        exact_key = (batch_size, actual_size)
+        if exact_key in self.graphs:
+            return exact_key
+        bucket_key = super().select_runtime_key(codes, *args, **kwargs)
+        if bucket_key in self.graphs:
+            return bucket_key
+        return None
+
+    def on_replay_fallback_log(self, reason, key, codes: torch.Tensor, *args, **kwargs) -> None:
+        logger.debug(
+            "Qwen3 compiled decoder CUDA Graph fallback: reason=%s key=%s batch=%d frames=%d buckets=%s",
+            reason,
+            key,
+            int(codes.shape[0]),
+            int(codes.shape[-1]),
+            self._bucket_sizes,
+        )
+
+    def before_capture(self, keys):
+        pass
+
+    def run_eager(self, codes: torch.Tensor, *args, **kwargs):
+        return None
+
+    def try_decode(self, codes: torch.Tensor) -> torch.Tensor | None:
+        return self.replay(codes)
+
+
+class CUDAGraphDecoderWrapper:
+    """
+    CUDA Graph wrapper for Qwen3TTSTokenizerV2Decoder.
+
+    This wrapper captures the decoder forward pass for fixed input sizes
+    and replays them during inference to reduce kernel launch overhead.
+
+    Usage:
+        wrapper = CUDAGraphDecoderWrapper(decoder, capture_sizes=[25, 50, 100, 200, 300])
+        wrapper.warmup(device)
+
+        # During inference:
+        output = wrapper.decode(codes)  # Automatically uses CUDA graph if possible
+    """
+
+    def __init__(
+        self,
+        decoder: torch.nn.Module,
+        capture_sizes: list[int] | None = None,
+        capture_batch_sizes: list[int] | None = None,
+        extra_capture_shapes: list[tuple[int, int]] | None = None,
+        compile_shapes: list[tuple[int, int]] | None = None,
+        num_quantizers: int = 8,
+        vllm_config: VllmConfig | None = None,
+    ):
+        self.decoder = decoder
+        self.normal_graph = Qwen3DecoderGraph(
+            decoder=decoder,
+            capture_sizes=capture_sizes,
+            capture_batch_sizes=capture_batch_sizes,
+            extra_capture_shapes=extra_capture_shapes,
+            num_quantizers=num_quantizers,
+            vllm_config=vllm_config,
+        )
+        self.compiled_graph = (
+            Qwen3CompiledDecoderGraph(
+                decoder=decoder,
+                compile_shapes=compile_shapes,
+                num_quantizers=num_quantizers,
+                vllm_config=vllm_config,
+            )
+            if compile_shapes
+            else None
+        )
+        self._stats_enabled = os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_CUDAGRAPH_STATS", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._stats_log_every = int(os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_CUDAGRAPH_STATS_LOG_EVERY", "0") or 0)
+        self._stats_total = 0
+        self._stats_hits = 0
+        self._stats_compiled_hits = 0
+        self._stats_fallbacks = 0
+        self._stats_stream_capture_fallbacks = 0
+        self._stats_requests: Counter[tuple[int, int]] = Counter()
+        self._stats_hit_shapes: Counter[tuple[int, int, int]] = Counter()
+        self._stats_compiled_shapes: Counter[tuple[int, int]] = Counter()
+        self._stats_fallback_shapes: Counter[tuple[int, int, int]] = Counter()
+
+    @staticmethod
+    def compute_capture_sizes(
+        codec_chunk_frames: int = 0,
+        codec_left_context_frames: int = 0,
+        decode_chunk_size: int = 300,
+        decode_left_context: int = 25,
+    ) -> list[int]:
+        return Qwen3DecoderGraph.compute_capture_sizes(
+            codec_chunk_frames=codec_chunk_frames,
+            codec_left_context_frames=codec_left_context_frames,
+            decode_chunk_size=decode_chunk_size,
+            decode_left_context=decode_left_context,
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.normal_graph.enabled
+
+    @property
+    def capture_batch_sizes(self):
+        return self.normal_graph.capture_batch_sizes
+
+    @property
+    def capture_sizes(self):
+        return self.normal_graph.capture_sizes
+
+    @property
+    def compile_shapes(self):
+        return self.compiled_graph.compile_shapes if self.compiled_graph is not None else []
+
+    @property
+    def _warmed_up(self) -> bool:
+        return self.normal_graph._warmed_up
+
+    @property
+    def extra_capture_shapes(self):
+        return self.normal_graph.extra_capture_shapes
 
     def _record_decode_stats(
         self,
@@ -296,6 +517,12 @@ class CUDAGraphDecoderWrapper:
             self._stats_fallback_shapes.most_common(12),
         )
 
+    def _decode_stats_shape(self, codes: torch.Tensor) -> tuple[int, int, int | None]:
+        batch_size = int(codes.shape[0])
+        actual_size = int(codes.shape[-1])
+        padded_size = self.normal_graph.find_ge_bucket(self.normal_graph._bucket_sizes, actual_size)
+        return batch_size, actual_size, padded_size
+
     def warmup(
         self,
         device: torch.device,
@@ -304,271 +531,52 @@ class CUDAGraphDecoderWrapper:
         codec_left_context_frames: int = 0,
         decode_chunk_size: int = 300,
         decode_left_context: int = 25,
-    ):
-        if device.type != "cuda" or not self.enabled or self._warmed_up:
-            return
-
-        self._device = device
-        self.decoder.eval()
-
-        if not self._explicit_sizes:
-            self.capture_sizes = self.compute_capture_sizes(
-                codec_chunk_frames=codec_chunk_frames,
-                codec_left_context_frames=codec_left_context_frames,
-                decode_chunk_size=decode_chunk_size,
-                decode_left_context=decode_left_context,
-            )
-
-        self.capture_batch_sizes = [bs for bs in self.capture_batch_sizes if bs > 0]
-        if not self.capture_batch_sizes:
-            self.capture_batch_sizes = [1]
-
-        self._bucket_sizes = sorted(set(self.capture_sizes) | {size for _, size in self.extra_capture_shapes})
-        capture_shapes = self._get_capture_shapes()
-
-        logger.info(
-            "Starting CUDA Graph warmup for %d shapes: batch_sizes=%s seq_lens=%s extra_shapes=%s",
-            len(capture_shapes),
-            self.capture_batch_sizes,
-            self.capture_sizes,
-            self.extra_capture_shapes,
+    ) -> None:
+        self.normal_graph.warmup(
+            device=device,
+            dtype=dtype,
+            codec_chunk_frames=codec_chunk_frames,
+            codec_left_context_frames=codec_left_context_frames,
+            decode_chunk_size=decode_chunk_size,
+            decode_left_context=decode_left_context,
         )
-        warmup_start_s = time.perf_counter()
-        mem_before = self._get_cuda_memory_stats(device)
-
-        # Warmup runs to ensure CUDA memory is allocated
-        for batch_size, size in capture_shapes:
-            dummy = torch.zeros(batch_size, self.num_quantizers, size, dtype=dtype, device=device)
-            with torch.no_grad():
-                _ = self.decoder(dummy)
-
-        torch.accelerator.synchronize(device)
-
-        for batch_size, size in capture_shapes:
-            try:
-                self._capture(batch_size, size, device, dtype)
-                logger.info("  Captured CUDA Graph for batch=%d size=%d", batch_size, size)
-            except Exception:
-                logger.warning("  Failed to capture graph for batch=%d size=%d", batch_size, size, exc_info=True)
-
-        if self.compile_shapes:
-            self._warmup_compile_shapes(device, dtype)
-
-        self._warmed_up = True
-        warmup_ms = (time.perf_counter() - warmup_start_s) * 1000.0
-        mem_after = self._get_cuda_memory_stats(device)
-        logger.info(
-            "CUDA Graph warmup complete: %d/%d captured in %.1f ms%s",
-            len(self.graphs),
-            len(capture_shapes),
-            warmup_ms,
-            self._format_cuda_memory_delta(mem_before, mem_after),
-        )
-
-    def _warmup_compile_shapes(self, device: torch.device, dtype: torch.dtype) -> None:
-        logger.info("Starting torch.compile + CUDA Graph warmup for decoder shapes: %s", self.compile_shapes)
-        compile_start_s = time.perf_counter()
-        try:
-            self._compiled_decoder = torch.compile(
-                self.decoder.forward,
-                mode="default",
-                fullgraph=False,
-                dynamic=False,
-            )
-        except Exception:
-            logger.warning("Failed to create torch.compile decoder wrapper", exc_info=True)
-            self._compiled_decoder = None
-            return
-
-        assert self._compiled_decoder is not None
-        for batch_size, size in self.compile_shapes:
-            shape_start_s = time.perf_counter()
-            try:
-                self._capture_compiled(batch_size, size, device, dtype)
-                self._compiled_shapes.add((batch_size, size))
-                logger.info(
-                    "  torch.compile + CUDA Graph ready for batch=%d size=%d in %.1f ms",
-                    batch_size,
-                    size,
-                    (time.perf_counter() - shape_start_s) * 1000.0,
-                )
-            except Exception:
-                logger.warning(
-                    "  Failed to capture torch.compile CUDA Graph for batch=%d size=%d; "
-                    "this shape will use CUDA Graph/eager fallback",
-                    batch_size,
-                    size,
-                    exc_info=True,
-                )
-        logger.info(
-            "torch.compile + CUDA Graph warmup complete: %d/%d shapes ready in %.1f ms",
-            len(self._compiled_shapes),
-            len(self.compile_shapes),
-            (time.perf_counter() - compile_start_s) * 1000.0,
-        )
-
-    def _capture(self, batch_size: int, size: int, device: torch.device, dtype: torch.dtype):
-        key = (batch_size, size)
-        static_input = torch.zeros(batch_size, self.num_quantizers, size, dtype=dtype, device=device)
-        with torch.no_grad():
-            _ = self.decoder(static_input)
-        torch.accelerator.synchronize(device)
-
-        graph = CUDAGraph()
-        with torch.no_grad():
-            with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
-                static_output = self.decoder(static_input)
-
-        self.graphs[key] = graph
-        self.static_inputs[key] = static_input
-        self.static_outputs[key] = static_output
-
-    def _capture_compiled(self, batch_size: int, size: int, device: torch.device, dtype: torch.dtype):
-        if self._compiled_decoder is None:
-            raise RuntimeError("Compiled decoder is not initialized")
-
-        key = (batch_size, size)
-        static_input = torch.zeros(batch_size, self.num_quantizers, size, dtype=dtype, device=device)
-        with torch.inference_mode():
-            for _ in range(5):
-                _ = self._compiled_decoder(static_input)
-        torch.accelerator.synchronize(device)
-
-        graph = CUDAGraph()
-        with torch.inference_mode():
-            with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
-                static_output = self._compiled_decoder(static_input)
-
-        self._compiled_graphs[key] = graph
-        self._compiled_static_inputs[key] = static_input
-        self._compiled_static_outputs[key] = static_output
-
-    @staticmethod
-    def _get_cuda_memory_stats(device: torch.device) -> tuple[int, int, int] | None:
-        if device.type != "cuda":
-            return None
-        try:
-            return (
-                int(torch.cuda.memory_allocated(device)),
-                int(torch.cuda.memory_reserved(device)),
-                int(torch.cuda.max_memory_reserved(device)),
-            )
-        except Exception:
-            return None
-
-    @staticmethod
-    def _format_cuda_memory_delta(
-        before: tuple[int, int, int] | None,
-        after: tuple[int, int, int] | None,
-    ) -> str:
-        if before is None or after is None:
-            return ""
-
-        def gib(value: int) -> float:
-            return value / 1024**3
-
-        alloc_before, reserved_before, max_reserved_before = before
-        alloc_after, reserved_after, max_reserved_after = after
-        return (
-            f" (cuda_mem allocated {gib(alloc_before):.2f}->{gib(alloc_after):.2f} GiB, "
-            f"reserved {gib(reserved_before):.2f}->{gib(reserved_after):.2f} GiB, "
-            f"max_reserved {gib(max_reserved_before):.2f}->{gib(max_reserved_after):.2f} GiB)"
-        )
-
-    def _decode(self, codes: torch.Tensor, *, clone_graph_output: bool) -> torch.Tensor:
-        if not self.enabled or not self._warmed_up:
-            return self.decoder(codes)
-
-        # Inner CUDA graph replay is illegal while an outer stream capture is
-        # active (e.g. vLLM's cudagraph_mode=FULL warmup on Stage 1). Fall back
-        # to eager in that case so the outer capture can complete. The guard is
-        # a no-op at runtime: is_current_stream_capturing() returns False
-        # outside the startup capture window, so normal inference still hits
-        # the graph fast path.
-        if torch.cuda.is_current_stream_capturing():
-            self._record_decode_stats(
-                hit=False,
-                batch_size=int(codes.shape[0]),
-                actual_size=int(codes.shape[-1]),
-                padded_size=None,
-                stream_capture=True,
-            )
-            return self.decoder(codes)
-
-        batch_size = int(codes.shape[0])
-        actual_size = int(codes.shape[-1])
-        padded_size = self._get_padded_size(actual_size)
-        compile_key = (batch_size, actual_size)
-        if compile_key not in self._compiled_shapes and padded_size is not None:
-            compile_key = (batch_size, padded_size)
-        if compile_key in self._compiled_shapes:
-            compiled_size = compile_key[1]
-            self._record_decode_stats(
-                hit=True,
-                batch_size=batch_size,
-                actual_size=actual_size,
-                padded_size=compiled_size,
-                compiled=True,
-            )
-            static_input = self._compiled_static_inputs[compile_key]
-            if actual_size == compiled_size:
-                static_input.copy_(codes)
-            else:
-                static_input.zero_()
-                static_input[:, :, :actual_size] = codes
-            self._compiled_graphs[compile_key].replay()
-            output = self._trim_replay_output(self._compiled_static_outputs[compile_key], actual_size, compiled_size)
-            if clone_graph_output:
-                return output.clone()
-            return output
-
-        graph_key = (batch_size, padded_size) if padded_size is not None else None
-
-        if graph_key is None or graph_key not in self.graphs:
-            self._record_decode_stats(
-                hit=False,
-                batch_size=batch_size,
-                actual_size=actual_size,
-                padded_size=padded_size,
-            )
-            return self.decoder(codes)
-
-        self._record_decode_stats(
-            hit=True,
-            batch_size=batch_size,
-            actual_size=actual_size,
-            padded_size=padded_size,
-        )
-        static_input = self.static_inputs[graph_key]
-        if actual_size == padded_size:
-            static_input.copy_(codes)
-        else:
-            static_input.zero_()
-            static_input[:, :, :actual_size] = codes
-        self.graphs[graph_key].replay()
-
-        output = self._trim_replay_output(self.static_outputs[graph_key], actual_size, padded_size)
-        if clone_graph_output:
-            return output.clone()
-        return output
-
-    def _trim_replay_output(self, static_output: torch.Tensor, actual_size: int, padded_size: int) -> torch.Tensor:
-        """Trim a graph/compiled replay output to the eager-equivalent length.
-
-        The captured ``static_output`` already reflects the decoder's TRUE output
-        length for ``padded_size`` frames, which for causal decoders (e.g.
-        Qwen3-Omni Code2Wav) is shorter than ``padded_size * total_upsample`` by a
-        fixed amount. Each zero-padded frame beyond ``actual_size`` contributes
-        ``total_upsample`` trailing samples that are stale buffer content, so trim
-        relative to the captured length instead of the nominal length. This is a
-        no-op for decoders whose output equals the nominal length (e.g. Qwen3-TTS).
-        """
-        drop = (padded_size - actual_size) * self.decoder.total_upsample
-        actual_out_len = max(0, static_output.shape[-1] - drop)
-        return static_output[..., :actual_out_len]
+        if self.compiled_graph is not None:
+            self.compiled_graph.warmup(device, dtype)
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
-        return self._decode(codes, clone_graph_output=True)
+        batch_size, actual_size, padded_size = self._decode_stats_shape(codes)
+        stream_capture = torch.cuda.is_current_stream_capturing()
+
+        if self.compiled_graph is not None:
+            compile_key = (batch_size, actual_size)
+            if compile_key not in self.compiled_graph.graphs and padded_size is not None:
+                compile_key = (batch_size, padded_size)
+            compiled_output = self.compiled_graph.try_decode(codes)
+            if compiled_output is not None:
+                self._record_decode_stats(
+                    hit=True,
+                    batch_size=batch_size,
+                    actual_size=actual_size,
+                    padded_size=compile_key[1],
+                    compiled=True,
+                )
+                return compiled_output
+
+        graph_key = (batch_size, padded_size) if padded_size is not None else None
+        graph_hit = (
+            not stream_capture
+            and self.normal_graph.can_replay(codes)
+            and graph_key is not None
+            and graph_key in self.normal_graph.graphs
+        )
+        self._record_decode_stats(
+            hit=graph_hit,
+            batch_size=batch_size,
+            actual_size=actual_size,
+            padded_size=None if stream_capture else padded_size,
+            stream_capture=stream_capture,
+        )
+        return self.normal_graph.decode(codes)
 
     def chunked_decode_with_cudagraph(
         self,
@@ -586,13 +594,12 @@ class CUDAGraphDecoderWrapper:
             context_size = left_context_size if start_index - left_context_size > 0 else start_index
 
             codes_chunk = codes[..., start_index - context_size : end_index]
-            wav_chunk = self._decode(codes_chunk, clone_graph_output=False)
+            wav_chunk = self.decode(codes_chunk)
 
             # Keep origin/main's concat semantics: Qwen3-Omni can return a chunk
             # that is shorter than the nominal code_len * total_upsample length.
-            # Clone each slice because graph outputs are static buffers that later
-            # replays may overwrite.
-            wavs.append(wav_chunk[..., context_size * total_upsample :].clone())
+            # decode() already returns a clone, so this slice is safe to keep.
+            wavs.append(wav_chunk[..., context_size * total_upsample :])
             start_index = end_index
 
         if not wavs:
@@ -610,7 +617,7 @@ class CUDAGraphDecoderWrapper:
         return _batched_chunked_decode(
             codes,
             lengths,
-            decode_fn=lambda codes_chunk: self._decode(codes_chunk, clone_graph_output=False),
+            decode_fn=self.decode,
             total_upsample=self.decoder.total_upsample,
             chunk_size=chunk_size,
             left_context_size=left_context_size,
