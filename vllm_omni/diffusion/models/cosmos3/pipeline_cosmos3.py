@@ -1,18 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Cosmos3 text/image/video-to-video and text-to-image pipeline for vllm-omni.
+"""Cosmos3 text/image/video/sound/action pipeline for vllm-omni.
 
-Single pipeline class supports T2V, I2V, V2V, and T2I; the mode is selected at
-runtime by:
+One pipeline class serves the Cosmos3 family modes. Output modality is selected
+mainly by ``prompt["modalities"]``:
 
-* ``prompt["modalities"]`` contains ``"image"``: **T2I** (text-to-image).
-* ``prompt["modalities"]`` contains ``"video"`` or is omitted: **T2V**
-  (text-to-video).
-* ``multi_modal_data['image']`` present on the prompt:  **I2V**
-  (handled by :func:`get_cosmos3_pre_process_func`)
-* ``multi_modal_data['video']`` present on the prompt with no action mode:
-  **V2V** (handled by :func:`get_cosmos3_pre_process_func`)
+* ``"image"`` selects T2I (text-to-image) and forces a single visual frame.
+* ``"video"`` or omitted modalities select video generation.
+* ``"audio"`` is accepted for compatibility but does not request sound by
+  itself; sound is enabled with ``generate_sound`` or ``sound_gen``.
 
+Video generation is further specialized by inputs and extra args:
+
+* no image/video input: T2V (text-to-video).
+* ``multi_modal_data["image"]``: I2V (image-to-video).
+* ``multi_modal_data["video"]`` with no action/transfer mode: V2V
+  (video-to-video).
+* transfer hints (``edge``, ``blur``, ``depth``, ``seg``, or ``wsm``): control
+  transfer video generation.
+* ``action_mode``: action-capable video generation. RoboLab/OpenPI observation
+  payloads in ``extra_args["robot_obs"]`` or ``extra_args["observation"]``
+  bypass normal video output and return action-only custom output.
+
+Generated sound is video-only, cannot be combined with action or transfer, and
+is produced from sound latents rather than from ``multi_modal_data["audio"]``.
 """
 
 from __future__ import annotations
@@ -156,14 +167,20 @@ COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
 # Post-process function (registered in registry.py)
 # ---------------------------------------------------------------------------
 def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
-    """Pre-process function for T2V, I2V, V2V, and action inputs.
+    """Build the request preprocessor for Cosmos3 image/video inputs.
 
-    For T2V (no image in ``multi_modal_data``), the request is returned
-    unchanged after the optional guardrails check.  For I2V (image present),
-    the conditioning image is loaded, aspect-resized + center-cropped, and
-    stored back on the prompt as ``additional_information.preprocessed_image``.
-    For V2V (video present without action mode), source frames are cropped to
-    the target size and stored as ``additional_information.preprocessed_video``.
+    For plain T2V (no image or video in ``multi_modal_data``), the request is
+    returned unchanged after the optional guardrail check. For I2V, the
+    conditioning image is loaded, aspect-resized, center-cropped, and stored as
+    ``additional_information.preprocessed_image``. For V2V, source frames are
+    cropped to the target size and stored as
+    ``additional_information.preprocessed_video``.
+
+    Action modes reuse image/video preprocessing but use action-specific resize
+    and padding rules. Transfer requests store
+    ``additional_information.preprocessed_transfer_video`` for optional input
+    video conditioning. Cosmos3 sound generation is not driven by
+    ``multi_modal_data["audio"]``; it is enabled later from sampling params.
     """
     from .guardrails import check_text_safety, ensure_initialized, is_guardrails_enabled
 
@@ -470,6 +487,13 @@ def get_cosmos3_pre_process_func(od_config: OmniDiffusionConfig):
 
 
 def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
+    """Build the postprocessor for Cosmos3 image, video, and video+audio output.
+
+    The pipeline returns image payloads as ``{"image": tensor}`` and video
+    payloads as ``{"video": tensor}``. Sound-enabled video returns the same
+    video payload plus ``audio`` and ``audio_sample_rate``. Image output with
+    audio is rejected because Cosmos3 sound generation is video-only.
+    """
     from .guardrails import check_video_safety, is_guardrails_enabled
 
     video_processor = VideoProcessor(vae_scale_factor=16)
@@ -563,6 +587,13 @@ def get_cosmos3_post_process_func(od_config: OmniDiffusionConfig):
 
 
 def get_cosmos3_action_post_process_func(od_config: OmniDiffusionConfig):
+    """Build the custom-output postprocessor for Cosmos3 action predictions.
+
+    Action modes return predicted action tensors in ``custom_output`` alongside
+    normal video output. RoboLab/OpenPI policy serving marks action-only output
+    and carries observation metadata used here to map model-space actions back
+    to the requested robot action representation.
+    """
     del od_config
 
     def action_post_process_func(action: Any, custom_output: dict[str, Any] | None = None, sampling_params=None):
@@ -598,14 +629,15 @@ def get_cosmos3_ir_op_priority_func(od_config: OmniDiffusionConfig):
 class Cosmos3OmniDiffusersPipeline(
     nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin
 ):
-    """Cosmos3 text/image/video-to-video / text-to-image pipeline.
+    """Cosmos3 text/image/video/sound/action pipeline.
 
     Architecture: Mixture-of-Transformers with Qwen3-VL backbone.
     - Understanding pathway: causal self-attention on text (runs once, K/V cached)
-    - Generation pathway: cross-attention on noisy visual latents (runs each step)
+    - Generation pathway: cross-attention on visual latents and optional
+      transfer-control, action, and sound latents (runs each step)
 
-    Supports T2V, I2V, V2V, and T2I from the same class.  Mode is selected at
-    runtime:
+    Supports T2V, I2V, V2V, T2I, transfer, sound-enabled video, and action
+    generation from the same class. Mode is selected at runtime:
 
     * **T2I** when ``prompt["modalities"]`` contains ``"image"``.  Latent
       T-dim is forced to 1, T2I-specific scheduler defaults are applied (50 steps,
@@ -622,6 +654,17 @@ class Cosmos3OmniDiffusersPipeline(
       ``multi_modal_data['video']`` without an action mode. Explicit latent
       frame indexes are kept clean with ``noisy_frame_mask`` and re-injected
       after each scheduler step.
+    * **Transfer** when ``edge``, ``blur``, ``depth``, ``seg``, or ``wsm`` hints
+      are supplied. Transfer is video-output only and cannot be combined with
+      sound or action generation.
+    * **Sound-enabled video** when ``generate_sound`` or ``sound_gen`` is true.
+      Sound is generated from sound latents, not from ``multi_modal_data['audio']``;
+      T2I, transfer, and action+sound are rejected.
+    * **Action generation** when ``action_mode`` is provided. ``policy`` and
+      ``forward_dynamics`` require an image or video input; ``inverse_dynamics``
+      requires video input. Action predictions are returned in ``custom_output``.
+      RoboLab/OpenPI observations in ``extra_args['robot_obs']`` or
+      ``extra_args['observation']`` return action-only custom output.
     * **T2V** otherwise (default video generation).
     """
 
@@ -733,16 +776,11 @@ class Cosmos3OmniDiffusersPipeline(
             subfolder="scheduler",
             local_files_only=local_files_only,
         )
-        init_flow_shift = (
-            od_config.flow_shift
-            if od_config.flow_shift is not None
-            else getattr(self.scheduler.config, "flow_shift", 1.0)
-        )
-        self.scheduler = UniPCMultistepScheduler.from_config(
-            self.scheduler.config,
-            flow_shift=init_flow_shift,
-            use_karras_sigmas=False,
-        )
+        if od_config.flow_shift is not None:
+            self.scheduler = UniPCMultistepScheduler.from_config(
+                self.scheduler.config,
+                flow_shift=od_config.flow_shift,
+            )
         self._cpu_scheduler_state()
 
         # --- Video processor for post-decode ---
@@ -766,6 +804,8 @@ class Cosmos3OmniDiffusersPipeline(
         self._base_scheduler_config = self.scheduler.config
         self._engine_init_flow_shift = float(getattr(self.scheduler.config, "flow_shift", 1.0) or 1.0)
         self._current_flow_shift = self._engine_init_flow_shift
+        self._base_scheduler_use_karras_sigmas = self._scheduler_use_karras_sigmas(self.scheduler.config)
+        self._current_scheduler_use_karras_sigmas = self._base_scheduler_use_karras_sigmas
 
         self._guidance_scale = None
         self._num_timesteps = None
@@ -1389,7 +1429,14 @@ class Cosmos3OmniDiffusersPipeline(
 
     @staticmethod
     def _is_t2i_request(req: OmniDiffusionRequest) -> bool:
-        """Detect text-to-image mode from request-level prompt modalities."""
+        """Return whether request-level modalities select image output.
+
+        Only ``"image"`` switches Cosmos3 into T2I. ``"video"`` and omitted
+        modalities select video output. ``"text"`` and ``"audio"`` are accepted
+        compatibility values for callers that share prompt schemas, but they do
+        not select text or audio output in this pipeline. ``"image"`` and
+        ``"video"`` cannot be requested together.
+        """
         if not req.prompts:
             return False
         first_prompt = req.prompts[0]
@@ -1406,24 +1453,38 @@ class Cosmos3OmniDiffusersPipeline(
             raise ValueError(f"Incorrect modality value in {modalities}, expected one of {accepted_modalities}.")
         return "image" in modalities
 
-    def _set_flow_shift(self, target_shift: float) -> None:
-        """Set the UniPC ``flow_shift`` to a concrete target value.
+    @staticmethod
+    def _scheduler_use_karras_sigmas(config: Any) -> bool | None:
+        value = getattr(config, "use_karras_sigmas", None)
+        return None if value is None else bool(value)
+
+    def _set_flow_shift(self, target_shift: float, *, use_karras_sigmas: bool | None = None) -> None:
+        """Set UniPC scheduler mode for a concrete request.
 
         The scheduler is rebuilt from the saved base config if
-        the target differs from the current shift.  Tracking
-        ``self._current_flow_shift`` explicitly is required because the
-        previous mode may have rebuilt the scheduler - we cannot rely on
-        ``self.scheduler.config.flow_shift`` reflecting the last requested
-        target if a rebuild was skipped via the equality check.
+        the target differs from the current shift or Karras-sigma mode.
+        Tracking explicit scheduler state is required because the previous
+        mode may have rebuilt the scheduler - we cannot rely on
+        ``self.scheduler.config`` reflecting the last requested target if a
+        rebuild was skipped via the equality check.
         """
         target = float(target_shift)
-        if target == float(self._current_flow_shift):
-            return
-        self.scheduler = UniPCMultistepScheduler.from_config(
-            self._base_scheduler_config, flow_shift=target, use_karras_sigmas=False
+        target_use_karras_sigmas = (
+            self._base_scheduler_use_karras_sigmas if use_karras_sigmas is None else bool(use_karras_sigmas)
         )
+        if (
+            target == float(self._current_flow_shift)
+            and target_use_karras_sigmas == self._current_scheduler_use_karras_sigmas
+        ):
+            return
+
+        scheduler_kwargs: dict[str, Any] = {"flow_shift": target}
+        if use_karras_sigmas is not None:
+            scheduler_kwargs["use_karras_sigmas"] = bool(use_karras_sigmas)
+        self.scheduler = UniPCMultistepScheduler.from_config(self._base_scheduler_config, **scheduler_kwargs)
         self._cpu_scheduler_state()
         self._current_flow_shift = target
+        self._current_scheduler_use_karras_sigmas = self._scheduler_use_karras_sigmas(self.scheduler.config)
 
     def _cpu_scheduler_state(self) -> None:
         # We need to move scheduler tensors to CPU, as unipc from diffusers assumes they are on CPU.
@@ -1771,31 +1832,7 @@ class Cosmos3OmniDiffusersPipeline(
 
     # -- I2V latent preparation ---------------------------------------------
 
-    def _encode_conditioning_video(
-        self,
-        image_tensor: torch.Tensor,
-        num_frames: int,
-        height: int,
-        width: int,
-    ) -> torch.Tensor:
-        """VAE-encode a conditioning image as a full-length video.
-
-        The WAN VAE has temporal compression (factor 4), so encoding a single
-        frame produces degenerate temporal features.  We fill the entire
-        pixel-space video with the conditioning image (repeating it across all
-        frames) so the temporal encoder sees plausible content everywhere.
-        The caller keeps only the conditioned latent frame(s) and replaces
-        the rest with noise.
-        """
-        # Move the single conditioning frame first, then materialize the
-        # repeated video on GPU.  Materializing [1, 3, T, H, W] on CPU creates
-        # a large pageable H2D copy on I2V requests.
-        image_tensor = self._to_vae_device(image_tensor, pin_cpu=True)
-        video = image_tensor.unsqueeze(2).expand(-1, -1, num_frames, -1, -1).contiguous()
-
-        latent = self.vae.encode(video).latent_dist.mode()
-
-        # Normalize (inverse of _decode_latents denormalization)
+    def _normalize_vae_latent(self, latent: torch.Tensor) -> torch.Tensor:
         if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
             latents_mean, latents_std = self._get_latents_mean_std(latent.device, latent.dtype)
             latent = (latent - latents_mean) / latents_std
@@ -1803,7 +1840,20 @@ class Cosmos3OmniDiffusersPipeline(
             scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
             latent = latent * scaling_factor
 
-        return latent.to(self.dtype)
+        return latent
+
+    def _encode_conditioning_image_latent(self, image_tensor: torch.Tensor) -> torch.Tensor:
+        """VAE-encode the first I2V conditioning frame.
+
+        I2V only consumes the first conditioning latent frame.  Encoding the
+        input image as a one-frame video keeps that latent while avoiding VAE
+        work for repeated frames that are later replaced by noise.
+        """
+        image_tensor = self._to_vae_device(image_tensor, pin_cpu=True)
+        video = image_tensor.unsqueeze(2)
+        latent = self.vae.encode(video).latent_dist.mode()
+        latent = self._normalize_vae_latent(latent)
+        return latent[:, :, 0:1, :, :].to(self.dtype)
 
     def _latent_hw_from_image_size(self, image_size: Any | None) -> tuple[int, int] | None:
         if image_size is None:
@@ -1837,14 +1887,7 @@ class Cosmos3OmniDiffusersPipeline(
 
         video = self._to_vae_device(video_tensor)
         latent = self.vae.encode(video).latent_dist.mode()
-
-        if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
-            latents_mean, latents_std = self._get_latents_mean_std(latent.device, latent.dtype)
-            latent = (latent - latents_mean) / latents_std
-        else:
-            scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
-            latent = latent * scaling_factor
-
+        latent = self._normalize_vae_latent(latent)
         latent = self._crop_latent_to_image_size(latent, image_size)
         return latent.to(self.dtype)
 
@@ -1875,13 +1918,12 @@ class Cosmos3OmniDiffusersPipeline(
             dtype=self.dtype,
         )
 
-        cond_latent = self._encode_conditioning_video(image_tensor, num_frames, height, width)
-        image_latent = cond_latent[:, :, 0:1, :, :]
+        image_latent = self._encode_conditioning_image_latent(image_tensor)
+        latents = noise
+        latents[:, :, 0:1, :, :] = image_latent
 
-        condition_mask = torch.zeros(1, 1, T_lat, 1, 1, device=self.device, dtype=self.dtype)
-        condition_mask[:, :, 0, :, :] = 1.0
-        latents = condition_mask * cond_latent + (1.0 - condition_mask) * noise
-        velocity_mask = 1.0 - condition_mask
+        velocity_mask = torch.ones(1, 1, T_lat, 1, 1, device=self.device, dtype=self.dtype)
+        velocity_mask[:, :, 0, :, :] = 0.0
         return latents, velocity_mask, image_latent
 
     def _prepare_latents_v2v(
@@ -2191,7 +2233,10 @@ class Cosmos3OmniDiffusersPipeline(
         ) -> torch.Tensor | tuple[torch.Tensor, ...]:
             video_pred, action_pred, sound_pred = _split_noise_pred(noise_pred)
             if velocity_mask is not None:
-                video_pred = video_pred * velocity_mask
+                if image_latent is not None and condition_latents is None:
+                    video_pred[:, :, 0:1, :, :] = 0
+                else:
+                    video_pred = video_pred * velocity_mask
             if action_pred is not None and action_velocity_mask is not None:
                 action_pred = action_pred * action_velocity_mask
                 if raw_action_dim is not None and 0 < raw_action_dim < action_pred.shape[-1]:
@@ -2635,7 +2680,7 @@ class Cosmos3OmniDiffusersPipeline(
 
         self._guidance_scale = guidance_scale
         self._num_timesteps = num_inference_steps
-        self._set_flow_shift(flow_shift_target)
+        self._set_flow_shift(flow_shift_target, use_karras_sigmas=False)
 
         generator = sp.generator
         if generator is None:
@@ -2934,7 +2979,7 @@ class Cosmos3OmniDiffusersPipeline(
             self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
             or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
         )
-        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", not action_enabled))
+        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", is_v2v))
 
         if action_enabled and action_video_tensor is None:
             extra_action_video = self._get_sp_param(sp, "action_video", None)
@@ -2958,7 +3003,7 @@ class Cosmos3OmniDiffusersPipeline(
 
         # Always resolve to a concrete target shift for this request, then
         # update the shared Diffusers scheduler.
-        self._set_flow_shift(flow_shift_target)
+        self._set_flow_shift(flow_shift_target, use_karras_sigmas=False if is_v2v else None)
 
         generator = sp.generator
         if generator is None:
