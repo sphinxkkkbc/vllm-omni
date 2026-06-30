@@ -28,12 +28,18 @@ def _vllm_config(*, enforce_eager: bool):
     return cast(VllmConfig, SimpleNamespace(model_config=SimpleNamespace(enforce_eager=enforce_eager)))
 
 
-def test_enabled_defaults_to_constructor_flag_without_vllm_config():
-    assert ConfigOnlyCUDAGraphWrapper(enabled=True).enabled is True
-    assert ConfigOnlyCUDAGraphWrapper(enabled=False).enabled is False
+def test_enabled_defaults_to_true_without_vllm_config():
+    assert ConfigOnlyCUDAGraphWrapper().enabled is True
 
 
-def test_enabled_combines_constructor_flag_and_vllm_enforce_eager():
-    assert ConfigOnlyCUDAGraphWrapper(enabled=True, vllm_config=_vllm_config(enforce_eager=False)).enabled is True
-    assert ConfigOnlyCUDAGraphWrapper(enabled=True, vllm_config=_vllm_config(enforce_eager=True)).enabled is False
-    assert ConfigOnlyCUDAGraphWrapper(enabled=False, vllm_config=_vllm_config(enforce_eager=False)).enabled is False
+def test_enabled_uses_vllm_enforce_eager():
+    assert ConfigOnlyCUDAGraphWrapper(vllm_config=_vllm_config(enforce_eager=False)).enabled is True
+    assert ConfigOnlyCUDAGraphWrapper(vllm_config=_vllm_config(enforce_eager=True)).enabled is False
+
+
+def test_adapter_can_override_vllm_enable_policy():
+    class AdapterPolicyWrapper(ConfigOnlyCUDAGraphWrapper):
+        def is_enabled(self, vllm_config: VllmConfig | None) -> bool:
+            return False
+
+    assert AdapterPolicyWrapper(vllm_config=_vllm_config(enforce_eager=False)).enabled is False

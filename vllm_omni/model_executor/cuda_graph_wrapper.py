@@ -38,17 +38,11 @@ class BaseCUDAGraphWrapper(ABC, Generic[KeyT]):
         capture_mode: CaptureMode | str = CaptureMode.PRE_CAPTURE,
         num_warmup: int = 1,
         graph_pool=None,
-        enabled: bool | None = None,
         vllm_config: VllmConfig | None = None,
         cudagraph_options: CUDAGraphOptions | None = None,
     ):
         self.runnable = runnable
-        self.enabled = True
-        if vllm_config is not None:
-            self.enabled = self.enabled and not vllm_config.model_config.enforce_eager
-
-        if enabled is not None:
-            self.enabled = self.enabled and bool(enabled)
+        self.enabled = self.is_enabled(vllm_config)
 
         self.cudagraph_options = cudagraph_options or CUDAGraphOptions()
         self.graphs: dict[KeyT, CUDAGraph] = {}
@@ -62,6 +56,12 @@ class BaseCUDAGraphWrapper(ABC, Generic[KeyT]):
         self.static_outputs: dict[KeyT, Any] = {}
         # Used only by lazy/hybrid replay misses to avoid duplicate first-hit capture.
         self._lazy_capture_lock = Lock()
+
+    @staticmethod
+    def is_enabled(vllm_config: VllmConfig | None) -> bool:
+        if vllm_config is None:
+            return True
+        return not vllm_config.model_config.enforce_eager
 
     @staticmethod
     def _normalize_capture_mode(capture_mode: CaptureMode | str) -> CaptureMode:

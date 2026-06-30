@@ -2,8 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the shared CUDA Graph wrapper lifecycle."""
 
+from types import SimpleNamespace
+from typing import cast
+
 import pytest
 import torch
+from vllm.config import VllmConfig
 
 from vllm_omni.model_executor.cuda_graph_wrapper import (
     BaseCUDAGraphWrapper,
@@ -16,6 +20,10 @@ pytestmark = [pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA req
 DEVICE = torch.device("cuda:0")
 
 
+def _vllm_config(*, enforce_eager: bool):
+    return cast(VllmConfig, SimpleNamespace(model_config=SimpleNamespace(enforce_eager=enforce_eager)))
+
+
 class ToyCUDAGraphWrapper(BaseCUDAGraphWrapper[tuple[int]]):
     """Tiny adapter that exercises the base capture/replay state machine."""
 
@@ -24,13 +32,13 @@ class ToyCUDAGraphWrapper(BaseCUDAGraphWrapper[tuple[int]]):
         *,
         capture_sizes: list[int] | None = None,
         capture_mode: str = "pre-capture",
-        enabled: bool = True,
+        vllm_config=None,
         runnable=None,
         cudagraph_options: CUDAGraphOptions | None = None,
     ):
         super().__init__(
             runnable=runnable or self._default_fn,
-            enabled=enabled,
+            vllm_config=vllm_config,
             capture_mode=capture_mode,
             cudagraph_options=cudagraph_options,
         )
@@ -174,7 +182,7 @@ def test_default_run_eager_is_used_for_no_key_fallback():
 
 
 def test_disabled_wrapper_falls_back_to_default_eager():
-    wrapper = ToyCUDAGraphWrapper(capture_sizes=[4], enabled=False)
+    wrapper = ToyCUDAGraphWrapper(capture_sizes=[4], vllm_config=_vllm_config(enforce_eager=True))
 
     x = _input(4)
     out = wrapper.replay(x)

@@ -136,10 +136,9 @@ class Qwen3DecoderGraph(BaseCUDAGraphWrapper[tuple[int, int]]):
         capture_batch_sizes: list[int] | None = None,
         extra_capture_shapes: list[tuple[int, int]] | None = None,
         num_quantizers: int = 8,
-        enabled: bool | None = None,
         vllm_config: VllmConfig | None = None,
     ):
-        super().__init__(runnable=decoder, enabled=enabled, vllm_config=vllm_config)
+        super().__init__(runnable=decoder, vllm_config=vllm_config)
         self.decoder = decoder
         self._explicit_sizes = capture_sizes is not None
         self.capture_sizes = sorted(capture_sizes) if capture_sizes else []
@@ -302,14 +301,12 @@ class Qwen3CompiledDecoderGraph(Qwen3DecoderGraph):
         decoder,
         compile_shapes: list[tuple[int, int]] | None = None,
         num_quantizers: int = 8,
-        enabled: bool | None = None,
         vllm_config: VllmConfig | None = None,
     ):
         super().__init__(
             decoder,
             capture_sizes=[],
             num_quantizers=num_quantizers,
-            enabled=enabled,
             vllm_config=vllm_config,
         )
         self.compile_shapes = sorted(compile_shapes or [])
