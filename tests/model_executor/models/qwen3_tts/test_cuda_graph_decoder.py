@@ -668,23 +668,28 @@ def test_decode_stats_counts(decoder, monkeypatch):
         decoder=decoder,
         capture_sizes=[25, 50],
         capture_batch_sizes=[1],
-        compile_shapes=[(1, 25)],
+        compile_shapes=[(1, 25), (1, 30)],
         num_quantizers=NUM_QUANTIZERS,
     )
     stats_wrapper.warmup(DEVICE)
 
     with torch.no_grad():
         stats_wrapper.decode(_random_codes(25))
-        stats_wrapper.decode(_random_codes(30))
+        stats_wrapper.decode(_random_codes(29))
+        stats_wrapper.decode(_random_codes(40))
         stats_wrapper.decode(_random_codes(60))
 
-    assert stats_wrapper._stats_total == 3
-    assert stats_wrapper._stats_hits == 2
-    assert stats_wrapper._stats_compiled_hits == 1
+    assert stats_wrapper._stats_total == 4
+    assert stats_wrapper._stats_hits == 3
+    assert stats_wrapper._stats_compiled_hits == 2
     assert stats_wrapper._stats_fallbacks == 1
     assert stats_wrapper._stats_requests[(1, 25)] == 1
-    assert stats_wrapper._stats_compiled_shapes[(1, 25)] == 1
-    assert stats_wrapper._stats_hit_shapes[(1, 30, 50)] == 1
+    assert stats_wrapper._stats_requests[(1, 29)] == 1
+    assert stats_wrapper._stats_requests[(1, 40)] == 1
+    assert stats_wrapper._stats_requests[(1, 60)] == 1
+    assert stats_wrapper._stats_compiled_shapes[(1, 25, 25)] == 1
+    assert stats_wrapper._stats_compiled_shapes[(1, 29, 30)] == 1
+    assert stats_wrapper._stats_hit_shapes[(1, 40, 50)] == 1
     assert stats_wrapper._stats_fallback_shapes[(1, 60, -1)] == 1
 
 

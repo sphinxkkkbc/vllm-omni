@@ -319,12 +319,16 @@ class Qwen3CompiledDecoderGraph(Qwen3DecoderGraph):
             "Starting torch.compile + CUDA Graph warmup for decoder shapes: %s",
             self.compile_shapes,
         )
-        self.runnable = torch.compile(
-            self.decoder.forward,
-            mode="default",
-            fullgraph=False,
-            dynamic=False,
-        )
+        try:
+            self.runnable = torch.compile(
+                self.decoder.forward,
+                mode="default",
+                fullgraph=False,
+                dynamic=False,
+            )
+        except Exception:
+            logger.warning("Failed to create torch.compile decoder wrapper", exc_info=True)
+            self.enabled = False
 
     def warmup(self, device: torch.device, dtype: torch.dtype = torch.long):
         self.capture(device=device, dtype=dtype)
@@ -482,7 +486,7 @@ class CUDAGraphDecoderWrapper:
             self._stats_hits += 1
             if compiled:
                 self._stats_compiled_hits += 1
-                self._stats_compiled_shapes[(batch_size, actual_size)] += 1
+                self._stats_compiled_shapes[(batch_size, actual_size, padded_key)] += 1
             else:
                 self._stats_hit_shapes[(batch_size, actual_size, padded_key)] += 1
         else:
@@ -517,6 +521,16 @@ class CUDAGraphDecoderWrapper:
     def _decode_stats_shape(self, codes: torch.Tensor) -> tuple[int, int, int | None]:
         batch_size = int(codes.shape[0])
         actual_size = int(codes.shape[-1])
+
+        if self.compiled_graph is not None and self.compiled_graph.graphs:
+            exact_key = (batch_size, actual_size)
+            if exact_key in self.compiled_graph.graphs:
+                return batch_size, actual_size, actual_size
+
+            padded_size = self.compiled_graph.find_ge_bucket(self.compiled_graph._bucket_sizes, actual_size)
+            if padded_size is not None and (batch_size, padded_size) in self.compiled_graph.graphs:
+                return batch_size, actual_size, padded_size
+
         padded_size = self.normal_graph.find_ge_bucket(self.normal_graph._bucket_sizes, actual_size)
         return batch_size, actual_size, padded_size
 
@@ -541,37 +555,40 @@ class CUDAGraphDecoderWrapper:
             self.compiled_graph.warmup(device, dtype)
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
-        batch_size, actual_size, padded_size = self._decode_stats_shape(codes)
         stream_capture = torch.cuda.is_current_stream_capturing()
+        if stream_capture:
+            self._record_decode_stats(
+                hit=False,
+                batch_size=int(codes.shape[0]),
+                actual_size=int(codes.shape[-1]),
+                padded_size=None,
+                stream_capture=True,
+            )
+            return self.normal_graph.run_eager(codes)
+
+        batch_size, actual_size, padded_size = self._decode_stats_shape(codes)
 
         if self.compiled_graph is not None:
-            compile_key = (batch_size, actual_size)
-            if compile_key not in self.compiled_graph.graphs and padded_size is not None:
-                compile_key = (batch_size, padded_size)
             compiled_output = self.compiled_graph.try_decode(codes)
             if compiled_output is not None:
                 self._record_decode_stats(
                     hit=True,
                     batch_size=batch_size,
                     actual_size=actual_size,
-                    padded_size=compile_key[1],
+                    padded_size=padded_size,
                     compiled=True,
                 )
                 return compiled_output
 
         graph_key = (batch_size, padded_size) if padded_size is not None else None
         graph_hit = (
-            not stream_capture
-            and self.normal_graph.can_replay(codes)
-            and graph_key is not None
-            and graph_key in self.normal_graph.graphs
+            self.normal_graph.can_replay(codes) and graph_key is not None and graph_key in self.normal_graph.graphs
         )
         self._record_decode_stats(
             hit=graph_hit,
             batch_size=batch_size,
             actual_size=actual_size,
-            padded_size=None if stream_capture else padded_size,
-            stream_capture=stream_capture,
+            padded_size=padded_size,
         )
         return self.normal_graph.decode(codes)
 
