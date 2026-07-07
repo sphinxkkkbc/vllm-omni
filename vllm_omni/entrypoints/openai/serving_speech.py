@@ -475,6 +475,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # instruction vs streaming voice-clone).
         self._moss_variant = self._detect_moss_variant() if self._tts_model_type == "moss_tts" else None
 
+        if self._moss_variant is not None and self._moss_variant != "realtime":
+            # Preload only variants that use the upstream MOSS processor path.
+            self._get_moss_processor()
+
         # GLM-TTS lazy-cached resources (populated on first GLM-TTS request)
         self._glm_tts_text_tokenizer: object | None = None
         self._glm_tts_text_frontend: object | None = None
@@ -1919,7 +1923,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # never reads -- info_dict["codes"]["ref"] is the only thing it
         # consumes, so skipping this path silently drops all voice-clone
         # conditioning and produces unconditioned/garbage audio online). ----
-        proc = self._get_moss_processor()
+        proc = self._moss_processor_cache  # already loaded during init and cached by _get_moss_processor()
         n_vq = int(getattr(proc.model_config, "n_vq", 32))
         # Local-v1.5 encodes reference audio at a fixed 24 kHz working rate
         # regardless of its 48 kHz stereo *output* codec -- mirrors the
