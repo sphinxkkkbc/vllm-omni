@@ -206,7 +206,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         assert cudagraph_mode is not None
         has_separate_talker = getattr(self.model, "talker", None) is not None
         talker_mtp_graph_safe = getattr(self.model, "talker_mtp_graph_safe", False)
-        if cudagraph_mode.has_full_cudagraphs() and (has_separate_talker or talker_mtp_graph_safe):
+        use_talker_mtp_graph = cudagraph_mode.has_full_cudagraphs() and (has_separate_talker or talker_mtp_graph_safe)
+        if use_talker_mtp_graph:
             graph_wrapper_cls = current_omni_platform.get_graph_wrapper_cls()
             self.talker_mtp = graph_wrapper_cls(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
         # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
@@ -218,6 +219,18 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.talker_mtp_inputs_embeds = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
         self.last_talker_hidden = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
         self.text_step = self._make_buffer(max_batch_size, hidden_size, dtype=self.dtype, numpy=False)
+        history_shape = getattr(self.model, "talker_mtp_history_codes_shape", None)
+        history_penalty = float(getattr(self.model, "talker_mtp_repetition_penalty", 1.0) or 1.0)
+        if history_penalty != 1.0 and history_shape:
+            history_dtype = getattr(self.model, "talker_mtp_history_codes_dtype", torch.int64)
+            self.talker_mtp_history_codes = self._make_buffer(
+                max_batch_size, *tuple(int(dim) for dim in history_shape), dtype=history_dtype, numpy=False
+            )
+        sampling_noise_shape = getattr(self.model, "talker_mtp_sampling_noise_shape", None)
+        if use_talker_mtp_graph and sampling_noise_shape:
+            self.talker_mtp_sampling_noise = self._make_buffer(
+                max_batch_size, *tuple(int(dim) for dim in sampling_noise_shape), dtype=torch.float32, numpy=False
+            )
 
     def _prewarm_attention_capture_workspaces(self) -> None:
         capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
@@ -257,6 +270,19 @@ class OmniGPUModelRunner(GPUModelRunner):
             for_cudagraph_capture=for_cudagraph_capture,
             num_scheduled_tokens_np=num_scheduled_tokens_np,
         )
+
+    def _fill_talker_mtp_history_codes(self, dst_start: int, req_infos: list[dict[str, Any]]) -> None:
+        history_buf = getattr(self, "talker_mtp_history_codes", None)
+        if history_buf is None:
+            return
+        history_buf.gpu[dst_start : dst_start + len(req_infos)].zero_()
+        for local_idx, req_info in enumerate(req_infos):
+            audio_codes = (req_info.get("audio_codes", {}) or {}) if isinstance(req_info, dict) else {}
+            value = audio_codes.get("history_codes")
+            if isinstance(value, torch.Tensor) and value.numel() > 0:
+                history_buf.gpu[dst_start + local_idx].copy_(
+                    value.to(device=history_buf.gpu.device, dtype=history_buf.gpu.dtype)
+                )
 
     def _build_model_sampler_output_token_ids(self) -> list[list[int]]:
         """Build decoded-token history for ``prefer_model_sampler`` models.
@@ -1705,6 +1731,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self.talker_mtp_inputs_embeds.gpu[dst].copy_(req_embeds)
                 self.last_talker_hidden.gpu[dst].copy_(last_talker_hidden)
                 self.text_step.gpu[dst].copy_(text_step)
+                self._fill_talker_mtp_history_codes(len(decode_req_ids), req_infos_b)
 
                 for req_id_b, update_dict_b in zip(req_ids_b, updates, strict=True):
                     self._merge_additional_information_update(req_id_b, update_dict_b)
@@ -1758,6 +1785,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
                     self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
                     self.text_step.gpu[decode_slice].copy_(text_step)
+                    self._fill_talker_mtp_history_codes(len(decode_req_ids), [req_infos])
                     decode_req_ids.append(req_id)
                     decode_start_offsets.append(s)
 
@@ -1834,12 +1862,26 @@ class OmniGPUModelRunner(GPUModelRunner):
             saved_embeds = self.talker_mtp_inputs_embeds.gpu[:decode_batch_size].clone()
             saved_hidden = self.last_talker_hidden.gpu[:decode_batch_size].clone()
             saved_text = self.text_step.gpu[:decode_batch_size].clone()
+            saved_history = (
+                self.talker_mtp_history_codes.gpu[:decode_batch_size].clone()
+                if getattr(self, "talker_mtp_history_codes", None) is not None
+                else None
+            )
+            saved_sampling_noise = (
+                self.talker_mtp_sampling_noise.gpu[:decode_batch_size].clone()
+                if getattr(self, "talker_mtp_sampling_noise", None) is not None
+                else None
+            )
             try:
                 for row, req_id in enumerate(decode_req_ids):
                     self.talker_mtp_input_ids.gpu[:1].copy_(saved_input_ids[row : row + 1])
                     self.talker_mtp_inputs_embeds.gpu[:1].copy_(saved_embeds[row : row + 1])
                     self.last_talker_hidden.gpu[:1].copy_(saved_hidden[row : row + 1])
                     self.text_step.gpu[:1].copy_(saved_text[row : row + 1])
+                    if saved_history is not None:
+                        self.talker_mtp_history_codes.gpu[:1].copy_(saved_history[row : row + 1])
+                    if saved_sampling_noise is not None:
+                        self.talker_mtp_sampling_noise.gpu[:1].copy_(saved_sampling_noise[row : row + 1])
                     row_offsets = None if start_offsets is None else [start_offsets[row]]
                     self._talker_mtp_forward([req_id], inputs_embeds, row_offsets)
             finally:
@@ -1847,6 +1889,10 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self.talker_mtp_inputs_embeds.gpu[:decode_batch_size].copy_(saved_embeds)
                 self.last_talker_hidden.gpu[:decode_batch_size].copy_(saved_hidden)
                 self.text_step.gpu[:decode_batch_size].copy_(saved_text)
+                if saved_history is not None:
+                    self.talker_mtp_history_codes.gpu[:decode_batch_size].copy_(saved_history)
+                if saved_sampling_noise is not None:
+                    self.talker_mtp_sampling_noise.gpu[:decode_batch_size].copy_(saved_sampling_noise)
             return
 
         generator = None
@@ -1869,7 +1915,18 @@ class OmniGPUModelRunner(GPUModelRunner):
             "top_k": subtalker_params.get("top_k"),
             "top_p": subtalker_params.get("top_p"),
         }
-        if generator is not None:
+        history_buf = getattr(self, "talker_mtp_history_codes", None)
+        if history_buf is not None:
+            talker_kwargs["history_codes"] = history_buf.gpu[:num_tokens_padded]
+        sampling_noise_buf = getattr(self, "talker_mtp_sampling_noise", None)
+        if sampling_noise_buf is not None:
+            sampling_noise = sampling_noise_buf.gpu[:num_tokens_padded]
+            if generator is not None:
+                sampling_noise.exponential_(generator=generator)
+            else:
+                sampling_noise.exponential_()
+            talker_kwargs["sampling_noise"] = sampling_noise
+        elif generator is not None:
             talker_kwargs["generator"] = generator
         if getattr(self.model, "talker_mtp_accepts_req_infos", False):
             talker_kwargs["req_ids"] = decode_req_ids

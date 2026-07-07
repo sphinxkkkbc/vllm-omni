@@ -159,8 +159,9 @@ class MossTTSLocalDepthTransformer(nn.Module):
         text_top_k: int = 50,
         text_top_p: float = 1.0,
         repetition_penalty: float = 1.0,
-        history_per_codebook: list[list[int]] | None = None,
         generator: torch.Generator | None = None,
+        history_codes: torch.Tensor | None = None,
+        sampling_noise: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate one audio frame for batch B.
 
@@ -169,10 +170,9 @@ class MossTTSLocalDepthTransformer(nn.Module):
         "continue" candidate, i.e. logits index 0); ``codes`` is a
         ``(B, n_vq)`` LongTensor of sampled codebook indices.
 
-        ``history_per_codebook[c]`` is a list of recently-emitted token ids
-        for codebook ``c``; when ``repetition_penalty != 1.0`` those tokens'
-        logits get scaled down before sampling (mirrors upstream's
-        ``_apply_repetition_penalty``).
+        ``history_codes`` is the graph-friendly batched form
+        ``(B, n_vq, window)``. When ``repetition_penalty != 1.0`` those tokens'
+        logits get scaled down before sampling.
         """
         batch_size = backbone_last_hidden.shape[0]
         dtype = self.ln_f.weight.dtype
@@ -193,6 +193,7 @@ class MossTTSLocalDepthTransformer(nn.Module):
             text_top_p,
             do_sample,
             generator=generator,
+            sampling_noise=None if sampling_noise is None else sampling_noise[:, 0, : binary_logits.shape[-1]],
         )
         should_continue = binary_choice.eq(0)
         import os as _os
@@ -207,18 +208,16 @@ class MossTTSLocalDepthTransformer(nn.Module):
         codes = backbone_last_hidden.new_zeros((batch_size, n_vq), dtype=torch.long)
         for channel_index in range(n_vq):
             channel_logits = audio_lm_heads[channel_index](local_hidden).float()
-            if (
-                repetition_penalty != 1.0
-                and history_per_codebook is not None
-                and channel_index < len(history_per_codebook)
-            ):
-                hist = history_per_codebook[channel_index]
-                if hist:
-                    hist_t = torch.tensor(hist, dtype=torch.long, device=channel_logits.device)
-                    sel = channel_logits.index_select(-1, hist_t)
-                    pos = sel > 0
-                    sel = torch.where(pos, sel / repetition_penalty, sel * repetition_penalty)
-                    channel_logits.index_copy_(-1, hist_t, sel)
+            if repetition_penalty != 1.0 and history_codes is not None:
+                hist_t = history_codes[:, channel_index, :].long()
+                valid = hist_t >= 0
+                safe_hist = hist_t.clamp_min(0)
+                counts = torch.zeros_like(channel_logits)
+                counts.scatter_add_(-1, safe_hist, valid.to(dtype=channel_logits.dtype))
+                rep_mask = counts > 0
+                pos = channel_logits > 0
+                penalized = torch.where(pos, channel_logits / repetition_penalty, channel_logits * repetition_penalty)
+                channel_logits = torch.where(rep_mask, penalized, channel_logits)
             channel_token = _sample_token(
                 channel_logits,
                 temperature,
@@ -226,6 +225,9 @@ class MossTTSLocalDepthTransformer(nn.Module):
                 top_p,
                 do_sample,
                 generator=generator,
+                sampling_noise=(
+                    None if sampling_noise is None else sampling_noise[:, channel_index + 1, : channel_logits.shape[-1]]
+                ),
             )
             codes[:, channel_index] = channel_token
 

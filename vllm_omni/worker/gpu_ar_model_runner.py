@@ -550,6 +550,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     emb = self.talker_mtp_inputs_embeds.gpu[:n]
                     hid = self.last_talker_hidden.gpu[:n]
                     ts = self.text_step.gpu[:n]
+                    history_buf = getattr(self, "talker_mtp_history_codes", None)
+                    history_codes = history_buf.gpu[:n] if history_buf is not None else None
+                    sampling_noise_buf = getattr(self, "talker_mtp_sampling_noise", None)
+                    sampling_noise = sampling_noise_buf.gpu[:n] if sampling_noise_buf is not None else None
+                    if sampling_noise is not None:
+                        sampling_noise.exponential_()
 
                     for _ in range(num_warmups):
                         with set_forward_context(
@@ -558,7 +564,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                             cudagraph_runtime_mode=CUDAGraphMode.NONE,
                             batch_descriptor=batch_desc,
                         ):
-                            self.talker_mtp(ids, emb, hid, ts)
+                            kwargs = {}
+                            if history_codes is not None:
+                                kwargs["history_codes"] = history_codes
+                            if sampling_noise is not None:
+                                kwargs["sampling_noise"] = sampling_noise
+                            self.talker_mtp(ids, emb, hid, ts, **kwargs)
 
                     with set_forward_context(
                         None,
@@ -566,7 +577,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         cudagraph_runtime_mode=CUDAGraphMode.FULL,
                         batch_descriptor=batch_desc,
                     ):
-                        self.talker_mtp(ids, emb, hid, ts)
+                        kwargs = {}
+                        if history_codes is not None:
+                            kwargs["history_codes"] = history_codes
+                        if sampling_noise is not None:
+                            kwargs["sampling_noise"] = sampling_noise
+                        self.talker_mtp(ids, emb, hid, ts, **kwargs)
                     torch.accelerator.synchronize()
 
             logger.info("Captured talker_mtp graphs for %d sizes", len(capture_sizes))

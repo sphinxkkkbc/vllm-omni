@@ -26,6 +26,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.v1.sample.ops.topk_topp_sampler import sample_with_exponential_noise
 
 from vllm_omni.model_executor.models.common.qwen3_code_predictor import (
     CodePredictorBaseModel,
@@ -127,6 +128,7 @@ def _sample_token(
     top_p: float,
     do_sample: bool,
     generator: torch.Generator | None = None,
+    sampling_noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Top-k + top-p sampling (matches upstream's ``sample_token`` for the
     inference branch).
@@ -153,7 +155,10 @@ def _sample_token(
 
     probs = F.softmax(logits, dim=-1)
     flat = probs.reshape(-1, probs.shape[-1])
-    sampled = torch.multinomial(flat, num_samples=1, generator=generator).reshape(probs.shape[:-1])
+    if sampling_noise is None:
+        sampled = torch.multinomial(flat, num_samples=1, generator=generator).reshape(probs.shape[:-1])
+    else:
+        sampled = sample_with_exponential_noise(flat, sampling_noise.reshape(flat.shape))
     return sampled
 
 

@@ -1321,9 +1321,12 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         # additive-fusion gathers (avoids an n_vq-iteration Python loop).
         self._stacked_audio_emb_w: torch.Tensor | None = None
         self.mtp_hidden_size = hidden_size
-        self.talker_mtp_accepts_req_infos = False
         self.talker_mtp_graph_safe = True
         self.talker_mtp_output_key = ("audio_codes", "sampled")
+        self.talker_mtp_repetition_penalty = 1.0
+        self.talker_mtp_history_window = 50
+        self.talker_mtp_history_codes_shape = (self.n_vq, self.talker_mtp_history_window)
+        self.talker_mtp_sampling_noise_shape = (1 + self.n_vq, self.audio_vocab_size)
 
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
             ("audio_codes", "current"),
@@ -1504,6 +1507,8 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         top_k: int | None = None,
         top_p: float | None = None,
         generator: torch.Generator | None = None,
+        history_codes: torch.Tensor | None = None,
+        sampling_noise: torch.Tensor | None = None,
         req_infos: list[dict[str, Any]] | None = None,
         **_: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1528,9 +1533,10 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             temperature=audio_temperature,
             top_k=audio_top_k,
             top_p=audio_top_p,
-            repetition_penalty=1.0,
-            history_per_codebook=None,
+            repetition_penalty=self.talker_mtp_repetition_penalty,
+            history_codes=history_codes,
             generator=generator,
+            sampling_noise=sampling_noise,
         )
         new_codes = new_codes.to(device=dev, dtype=torch.long)
         pad_codes = torch.full_like(new_codes, self.audio_pad_token_id)
@@ -1596,6 +1602,16 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
                             audio_codes["accumulated"] = torch.cat([acc.to(hidden.device), current_codes], dim=0)
                         else:
                             audio_codes["accumulated"] = current_codes
+                        if self.talker_mtp_repetition_penalty != 1.0:
+                            acc_for_hist = audio_codes["accumulated"]
+                            tail = acc_for_hist[-self.talker_mtp_history_window :].long().cpu()
+                            history_codes = torch.zeros(
+                                self.talker_mtp_history_codes_shape,
+                                dtype=torch.long,
+                            )
+                            if tail.numel() > 0:
+                                history_codes[:, -tail.shape[0] :] = tail.transpose(0, 1)
+                            audio_codes["history_codes"] = history_codes
                         audio_codes["current"] = current_codes
                         audio_codes["emit"] = True
                     audio_codes.pop("sampled", None)
