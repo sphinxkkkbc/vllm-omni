@@ -11,6 +11,7 @@ from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth impo
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 TEMPERATURE = 1.7
 TOP_K = 25
 TOP_P = 0.8
@@ -49,21 +50,7 @@ def _make_heads(
     return audio_lm_heads, audio_embeddings, local_text_lm_head
 
 
-class _FakeGraphedGenerateFrame:
-    def __init__(self, generate_frame, sampling_noise: torch.Tensor) -> None:
-        self.generate_frame = generate_frame
-        self.sampling_noise = sampling_noise
-
-    def __call__(self, *args, **kwargs):
-        if kwargs.get("generator") is not None:
-            raise AssertionError("graphed generate_frame should consume sampling_noise, not generator")
-        kwargs.pop("generator", None)
-        kwargs["sampling_noise"] = self.sampling_noise
-        return self.generate_frame(*args, **kwargs)
-
-
-@pytest.mark.parametrize("mode", ["generator_only", "noise_only", "noise_and_generator"])
-def test_generate_frame_sampling_rng_paths(monkeypatch, mode: str) -> None:
+def test_generate_frame_uses_sampling_noise_first(monkeypatch) -> None:
     hidden_size = 8
     n_vq = 2
     audio_vocab_size = 5
@@ -85,29 +72,6 @@ def test_generate_frame_sampling_rng_paths(monkeypatch, mode: str) -> None:
     )
     noise_shape = (batch_size, 1 + n_vq, audio_vocab_size)
 
-    if mode == "generator_only":
-        captured_generators = []
-
-        def fake_multinomial(input, num_samples, replacement=False, *, generator=None, out=None):
-            captured_generators.append(generator)
-            return torch.zeros((input.shape[0], num_samples), dtype=torch.long)
-
-        monkeypatch.setattr(torch, "multinomial", fake_multinomial)
-        generator = _generator(42)
-        should_continue, codes = transformer.generate_frame(
-            backbone_last_hidden,
-            audio_lm_heads,
-            audio_embeddings,
-            local_text_lm_head,
-            generator=generator,
-            **base_kwargs,
-        )
-        assert captured_generators
-        assert all(captured_generator is generator for captured_generator in captured_generators)
-        assert should_continue.shape == (batch_size,)
-        assert codes.shape == (batch_size, n_vq)
-        return
-
     def fail_multinomial(*args, **kwargs):
         raise AssertionError("sampling_noise path must not call torch.multinomial")
 
@@ -121,28 +85,32 @@ def test_generate_frame_sampling_rng_paths(monkeypatch, mode: str) -> None:
         sampling_noise=sampling_noise,
         **base_kwargs,
     )
-    extra_kwargs = {"generator": _generator(42)} if mode == "noise_and_generator" else {}
     should_continue_b, codes_b = transformer.generate_frame(
         backbone_last_hidden,
         audio_lm_heads,
         audio_embeddings,
         local_text_lm_head,
         sampling_noise=_noise(noise_shape, seed=7),
-        **extra_kwargs,
+        **base_kwargs,
+    )
+    should_continue_c, codes_c = transformer.generate_frame(
+        backbone_last_hidden,
+        audio_lm_heads,
+        audio_embeddings,
+        local_text_lm_head,
+        sampling_noise=_noise(noise_shape, seed=7),
+        generator=_generator(42),
         **base_kwargs,
     )
 
     assert torch.equal(should_continue_a, should_continue_b)
+    assert torch.equal(should_continue_a, should_continue_c)
     assert torch.equal(codes_a, codes_b)
+    assert torch.equal(codes_a, codes_c)
     assert codes_a.shape == (batch_size, n_vq)
 
 
-def test_graphed_generate_frame_uses_sampling_noise_not_generator(monkeypatch) -> None:
-    def fail_multinomial(*args, **kwargs):
-        raise AssertionError("graph replay path must not call torch.multinomial")
-
-    monkeypatch.setattr(torch, "multinomial", fail_multinomial)
-
+def test_generate_frame_eager_generator_paths(monkeypatch) -> None:
     hidden_size = 8
     n_vq = 3
     audio_vocab_size = 6
@@ -154,37 +122,35 @@ def test_graphed_generate_frame_uses_sampling_noise_not_generator(monkeypatch) -
         n_vq=n_vq,
         audio_vocab_size=audio_vocab_size,
     )
-    torch.manual_seed(4)
+    torch.manual_seed(7)
     backbone_last_hidden = torch.randn(batch_size, hidden_size)
-    sampling_noise = torch.empty((batch_size, 1 + n_vq, audio_vocab_size), dtype=torch.float32)
-    graphed_generate_frame = _FakeGraphedGenerateFrame(transformer.generate_frame, sampling_noise)
-    kwargs = dict(
+    base_kwargs = dict(
         n_vq=n_vq,
         do_sample=True,
         temperature=TEMPERATURE,
         top_k=TOP_K,
         top_p=TOP_P,
     )
+    captured_generators = []
 
-    sampling_noise.exponential_(generator=_generator(42))
-    should_continue_a, codes_a = graphed_generate_frame(
+    def fake_multinomial(input, num_samples, replacement=False, *, generator=None, out=None):
+        captured_generators.append(generator)
+        return torch.zeros((input.shape[0], num_samples), dtype=torch.long)
+
+    monkeypatch.setattr(torch, "multinomial", fake_multinomial)
+    generator = _generator(42)
+    should_continue, codes = transformer.generate_frame(
         backbone_last_hidden,
         audio_lm_heads,
         audio_embeddings,
         local_text_lm_head,
-        **kwargs,
+        generator=generator,
+        **base_kwargs,
     )
-    with pytest.raises(AssertionError):
-        graphed_generate_frame(
-            backbone_last_hidden,
-            audio_lm_heads,
-            audio_embeddings,
-            local_text_lm_head,
-            **kwargs,
-            generator=_generator(42),
-        )
-    assert should_continue_a.shape == (batch_size,)
-    assert codes_a.shape == (batch_size, n_vq)
+    assert captured_generators
+    assert all(captured_generator is generator for captured_generator in captured_generators)
+    assert should_continue.shape == (batch_size,)
+    assert codes.shape == (batch_size, n_vq)
 
 
 def test_generate_frame_accepts_tensor_history_codes() -> None:
