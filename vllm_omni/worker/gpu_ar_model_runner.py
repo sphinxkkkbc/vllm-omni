@@ -855,7 +855,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         end: int,
         audio_sparse_output: bool,
         sparse_mm_index: dict[str, int],
-        seq_len: int,
+        hidden_seq_len: int,
+        scheduled_seq_len: int,
     ) -> dict[str, object]:
         if combined_multimodal_outputs:
             return self._build_combined_prefix_cache_mm_payload(
@@ -892,7 +893,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 start=start,
                 end=end,
                 pass_lists_through=False,
-                seq_len=seq_len,
+                seq_len=hidden_seq_len,
+                scheduled_seq_len=scheduled_seq_len,
             )
         return mm_payload
 
@@ -910,7 +912,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         mm_cpu: dict[str, object] | None,
         audio_sparse_output: bool,
         sparse_mm_index: dict[str, int],
-        seq_len: int,
+        hidden_seq_len: int,
+        scheduled_seq_len: int,
     ) -> dict[str, object]:
         payload: dict[str, object] = {}
         if not audio_sparse_output:
@@ -936,7 +939,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             end=end,
             audio_sparse_output=audio_sparse_output,
             sparse_mm_index=sparse_mm_index,
-            seq_len=seq_len,
+            hidden_seq_len=hidden_seq_len,
+            scheduled_seq_len=scheduled_seq_len,
         )
         payload.update(mm_payload)
         return payload
@@ -1692,7 +1696,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         ec_connector_output: Any,
         cudagraph_stats: Any,
         kv_extracted_req_ids: list[str] | None,
-        seq_len: int,
         num_scheduled_tokens_np: np.ndarray,
         query_start_loc_cpu: Any,
         postprocess_already_applied: bool = False,
@@ -1748,6 +1751,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # The actual multimodal wire transport uses multimodal_outputs instead.
         pooler_output: list[dict[str, object]] | None = None
         if needs_pooler_payload:
+            hidden_seq_len = int(hidden_states.shape[0])
+            scheduled_seq_len = int(scheduler_output.total_num_scheduled_tokens)
             mm_cpu = None
             if self.omni_prefix_cache is not None:
                 (
@@ -1803,7 +1808,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         mm_cpu=mm_cpu,
                         audio_sparse_output=audio_sparse_output,
                         sparse_mm_index=sparse_mm_index,
-                        seq_len=seq_len,
+                        hidden_seq_len=hidden_seq_len,
+                        scheduled_seq_len=scheduled_seq_len,
                     )
                     pooler_output.append(flatten_payload(payload))
 
@@ -1889,7 +1895,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             slot_mappings,  # OMNI: unpack slot_mappings for drafter
         ) = self.execute_model_state
         self.execute_model_state = None
-        seq_len = hidden_states.shape[0]
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -2056,7 +2061,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     ec_connector_output=ec_connector_output,
                     cudagraph_stats=cudagraph_stats,
                     kv_extracted_req_ids=kv_extracted_req_ids,
-                    seq_len=seq_len,
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     query_start_loc_cpu=query_start_loc_cpu,
                     postprocess_already_applied=omni_postprocess_already_applied,

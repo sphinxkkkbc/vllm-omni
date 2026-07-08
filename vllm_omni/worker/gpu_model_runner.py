@@ -1854,7 +1854,34 @@ class OmniGPUModelRunner(GPUModelRunner):
                 seed = extra_args.get("tts_local_seed")
             return int(seed) if seed is not None else None
 
-        if decode_batch_size > 1 and any(_explicit_talker_seed(req_id) is not None for req_id in decode_req_ids):
+        def _row_generator(req_id: str) -> torch.Generator | None:
+            seed = _explicit_talker_seed(req_id)
+            if seed is None:
+                return None
+            cache = getattr(self, "_talker_mtp_generators", None)
+            if cache is None:
+                cache = {}
+                self._talker_mtp_generators = cache
+            generator = cache.get(req_id)
+            if generator is None or generator.device != req_input_ids.device:
+                generator = torch.Generator(device=req_input_ids.device)
+                generator.manual_seed(seed)
+                cache[req_id] = generator
+            return generator
+
+        row_generators = [_row_generator(req_id) for req_id in decode_req_ids]
+        cache = getattr(self, "_talker_mtp_generators", None)
+        if cache:
+            # Generators live as long as their request; drop finished ones.
+            for stale_id in [rid for rid in cache if rid not in self.requests]:
+                del cache[stale_id]
+
+        if (
+            decode_batch_size > 1
+            and any(generator is not None for generator in row_generators)
+            and getattr(self, "talker_mtp_sampling_noise", None) is None
+            and not getattr(self.model, "talker_mtp_accepts_per_row_generators", False)
+        ):
             # A torch.Generator is a single stream. Using one generator for a
             # multi-row batch would make explicitly-seeded requests depend on
             # other rows in the same scheduler step, so keep that path scalar.
@@ -1895,20 +1922,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                     self.talker_mtp_sampling_noise.gpu[:decode_batch_size].copy_(saved_sampling_noise)
             return
 
-        generator = None
-        if decode_req_ids:
-            first_req_id = decode_req_ids[0]
-            seed = _explicit_talker_seed(first_req_id)
-            if seed is not None:
-                generators = getattr(self, "_talker_mtp_generators", None)
-                if generators is None:
-                    generators = {}
-                    self._talker_mtp_generators = generators
-                generator = generators.get(first_req_id)
-                if generator is None or generator.device != req_input_ids.device:
-                    generator = torch.Generator(device=req_input_ids.device)
-                    generator.manual_seed(int(seed))
-                    generators[first_req_id] = generator
         talker_kwargs = {
             "do_sample": subtalker_params.get("do_sample"),
             "temperature": subtalker_params.get("temperature"),
@@ -1921,13 +1934,16 @@ class OmniGPUModelRunner(GPUModelRunner):
         sampling_noise_buf = getattr(self, "talker_mtp_sampling_noise", None)
         if sampling_noise_buf is not None:
             sampling_noise = sampling_noise_buf.gpu[:num_tokens_padded]
-            if generator is not None:
-                sampling_noise.exponential_(generator=generator)
-            else:
-                sampling_noise.exponential_()
+            sampling_noise.exponential_()
+            for row, generator in enumerate(row_generators):
+                if generator is not None:
+                    sampling_noise[row : row + 1].exponential_(generator=generator)
             talker_kwargs["sampling_noise"] = sampling_noise
-        elif generator is not None:
-            talker_kwargs["generator"] = generator
+        elif decode_batch_size == 1:
+            if row_generators[0] is not None:
+                talker_kwargs["generator"] = row_generators[0]
+        elif any(generator is not None for generator in row_generators):
+            talker_kwargs["generators"] = row_generators
         if getattr(self.model, "talker_mtp_accepts_req_infos", False):
             talker_kwargs["req_ids"] = decode_req_ids
             talker_kwargs["req_infos"] = [
