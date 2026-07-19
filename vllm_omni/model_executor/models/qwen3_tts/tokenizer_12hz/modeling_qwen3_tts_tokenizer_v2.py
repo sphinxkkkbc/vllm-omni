@@ -13,6 +13,7 @@
 # limitations under the License.
 """PyTorch Qwen3TTSTokenizerV2 model."""
 
+import copy
 import inspect
 import math
 from collections.abc import Callable
@@ -912,24 +913,142 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             self._cudagraph_wrapper.compile_shapes,
         )
 
-    def forward(self, codes):
+    def forward(self, codes, caches=None):
         if codes.shape[1] != self.config.num_quantizers:
             raise ValueError(f"Expected {self.config.num_quantizers} layer of codes, got {codes.shape[1]}")
 
-        hidden = self.quantizer.decode(codes)
-        hidden = self.pre_conv(hidden).transpose(1, 2)
+        if codes.shape[-1] == 4 or caches is None:
+            wav = self._forward_exact(codes)
+            return wav
 
-        hidden = self.pre_transformer(inputs_embeds=hidden).last_hidden_state
+        prefix_frames = int(caches["prefix_frames"])
+        if prefix_frames <= 0 or codes.shape[-1] < prefix_frames:
+            raise ValueError(
+                "Qwen3-TTS ICL prefix cache received invalid frame counts: "
+                f"prefix_frames={prefix_frames}, total_frames={codes.shape[-1]}"
+            )
+
+        if "ref_hidden" in caches:
+            ref_hidden = caches["ref_hidden"]
+            suffix_codes = codes[:, :, prefix_frames:]
+            suffix_frames = suffix_codes.shape[-1]
+            quantizer_suffix_frames = 97
+            if suffix_frames < quantizer_suffix_frames:
+                suffix_codes = F.pad(
+                    suffix_codes,
+                    (0, quantizer_suffix_frames - suffix_frames),
+                    mode="constant",
+                    value=0,
+                )
+            new_hidden = self.quantizer.decode(suffix_codes)
+            new_hidden = new_hidden[:, :, :suffix_frames]
+            hidden = torch.cat([ref_hidden, new_hidden], dim=2)
+        else:
+            hidden = self.quantizer.decode(codes)
+            caches.update({"ref_hidden": hidden[:, :, :prefix_frames]})
+
+        if "ref_conv" in caches:
+            ref_conv = caches["ref_conv"]
+            context_frames = 2
+            dummy_frames = 3
+            new_conv_input = hidden[:, :, prefix_frames - context_frames :]
+            new_conv_input = F.pad(new_conv_input, (0, dummy_frames), mode="constant", value=0)
+            new_conv = self.pre_conv(new_conv_input)
+            new_conv = new_conv[:, :, context_frames:-dummy_frames].transpose(1, 2)
+            hidden = torch.cat([ref_conv, new_conv], dim=1)
+            hidden = hidden.transpose(1, 2).contiguous().transpose(1, 2)
+        else:
+            hidden = self.pre_conv(hidden).transpose(1, 2)
+            caches.update({"ref_conv": hidden[:, :prefix_frames, :]})
+
+        if "past_key_values" not in caches:
+            if hidden.shape[1] < prefix_frames:
+                raise ValueError(
+                    "Qwen3-TTS ICL prefix cache requires at least prefix_frames inputs, "
+                    f"got prefix_frames={prefix_frames}, total_frames={hidden.shape[1]}"
+                )
+            prefix_result = self.pre_transformer(
+                inputs_embeds=hidden[:, :prefix_frames, :],
+                use_cache=True,
+            )
+
+            prefix_cache = prefix_result.past_key_values
+            working_cache = copy.deepcopy(prefix_cache)
+
+            suffix_result = self.pre_transformer(
+                inputs_embeds=hidden[:, prefix_frames:, :],
+                past_key_values=working_cache,
+                use_cache=True,
+            )
+
+            hidden = torch.cat(
+                [
+                    prefix_result.last_hidden_state,
+                    suffix_result.last_hidden_state,
+                ],
+                dim=1,
+            )
+            caches.update({"past_key_values": prefix_cache})
+            caches.update({"prefix_hidden": prefix_result.last_hidden_state})
+        else:
+            prefix_cache = caches["past_key_values"]
+            working_cache = copy.deepcopy(prefix_cache)
+            prefix_result = caches["prefix_hidden"]
+            hidden = self.pre_transformer(
+                inputs_embeds=hidden[:, prefix_frames:, :],
+                past_key_values=working_cache,
+                use_cache=True,
+            ).last_hidden_state
+            hidden = torch.cat([prefix_result, hidden], dim=1)
+
         hidden = hidden.permute(0, 2, 1)
-        for blocks in self.upsample:
-            for block in blocks:
-                hidden = block(hidden)
-        wav = hidden
-        for block in self.decoder:
-            wav = block(wav)
-        return wav.clamp(min=-1, max=1)
 
-    def chunked_decode(self, codes, chunk_size=300, left_context_size=25):
+        if "ref_upsample" not in caches:
+            for blocks in self.upsample:
+                for block in blocks:
+                    hidden = block(hidden)
+            caches.update({"ref_upsample": hidden[:, :, : prefix_frames * 4]})
+        else:
+            ref_upsample = caches["ref_upsample"]
+            context_frames = 5
+            dummy_frames = 7
+            new_hidden = hidden[:, :, prefix_frames - context_frames :]
+            new_hidden = F.pad(new_hidden, (dummy_frames, 0), mode="constant", value=0)
+            for blocks in self.upsample:
+                for block in blocks:
+                    new_hidden = block(new_hidden)
+            upsample_factor = int(np.prod(self.config.upsampling_ratios))
+            prefix_positions = (dummy_frames + context_frames) * upsample_factor
+            new_hidden = new_hidden[:, :, prefix_positions:]
+            hidden = torch.cat([ref_upsample, new_hidden], dim=2)
+
+        wav = hidden
+        if "ref_wav" not in caches:
+            for block in self.decoder:
+                wav = block(wav)
+            caches.update({"ref_wav": wav[:, :, : prefix_frames * 4 * 480]})
+        else:
+            ref_wav = caches["ref_wav"]
+            context_frames = 15
+            dummy_frames = 5
+            decoder_upsample = 480
+            new_wav = wav[:, :, prefix_frames * 4 - context_frames :]
+            new_wav = F.pad(new_wav, (dummy_frames, 0), mode="constant", value=0)
+            for block in self.decoder:
+                new_wav = block(new_wav)
+            prefix_samples = (dummy_frames + context_frames) * decoder_upsample
+            new_wav = new_wav[:, :, prefix_samples:]
+            wav = torch.cat([ref_wav, new_wav], dim=2)
+        wav = wav.clamp(min=-1, max=1)
+        return wav
+
+    def chunked_decode(
+        self,
+        codes,
+        caches=None,
+        chunk_size=300,
+        left_context_size=25,
+    ):
         # Use CUDA graph if enabled
         if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
             return self._cudagraph_wrapper.chunked_decode_with_cudagraph(codes, chunk_size, left_context_size)
@@ -941,7 +1060,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             end_index = min(start_index + chunk_size, codes.shape[-1])
             context_size = left_context_size if start_index - left_context_size > 0 else start_index
             codes_chunk = codes[..., start_index - context_size : end_index]
-            wav_chunk = self(codes_chunk)
+            wav_chunk = self(codes_chunk, caches)
             wavs.append(wav_chunk[..., context_size * self.total_upsample :])
             start_index = end_index
         return torch.cat(wavs, dim=-1)

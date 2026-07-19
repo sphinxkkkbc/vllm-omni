@@ -107,6 +107,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._ref_context_cache_bytes = 0
         self._ref_context_cache_max_entries = _REF_CONTEXT_CACHE_MAX_ENTRIES
         self._ref_context_cache_max_bytes = _REF_CONTEXT_CACHE_MAX_BYTES
+        self._decoder_state_cache: dict[str, dict[str, Any]] = {}
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         # This stage ignores token embeddings. Keep a stable dummy embedding for vLLM runner.
@@ -255,6 +256,10 @@ class Qwen3TTSCode2Wav(nn.Module):
         if cached is not None:
             self._ref_context_cache_bytes -= self._tensor_nbytes(cached)
 
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        for req_id in finished_req_ids:
+            self._decoder_state_cache.pop(req_id, None)
+
     def log_decode_batch_stats(self) -> None:
         if not self._batch_stats_enabled or self._batch_stats_requests == 0:
             return
@@ -315,7 +320,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
 
         parsed: list[tuple[int, int]] = []
-        valid_codes_qf: list[torch.Tensor] = []
+        valid_codes_qf: list[tuple[str, torch.Tensor]] = []
         valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
         ref_context_size = [0] * len(request_ids_list)
@@ -407,7 +412,16 @@ class Qwen3TTSCode2Wav(nn.Module):
                     codes_qf = torch.cat((cached_ref, codes_qf), dim=1)
                     frames = int(codes_qf.shape[1])
             parsed.append((ctx_frames, frames))
-            valid_codes_qf.append(codes_qf)
+            valid_codes_qf.append((ref_req_id, codes_qf))
+            if ref_req_id is not None:
+                state = self._decoder_state_cache.setdefault(ref_req_id, {})
+                if ref_ctx_frames > 0:
+                    cached_prefix_frames = state.setdefault("prefix_frames", ref_ctx_frames)
+                    if cached_prefix_frames != ref_ctx_frames:
+                        raise ValueError(
+                            "Qwen3-TTS ref context size changed within request "
+                            f"{ref_req_id!r}: cached={cached_prefix_frames}, current={ref_ctx_frames}"
+                        )
             valid_indices.append(i)
 
         num_req = len(request_ids_list)
@@ -438,7 +452,9 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         wav_tensors: list[torch.Tensor | None] = [None] * len(valid_codes_qf)
 
-        def _decode_group_chunks(group_chunks: list[list[tuple[int, torch.Tensor]]]) -> None:
+        def _decode_group_chunks(
+            group_chunks: list[list[tuple[int, torch.Tensor]]], states: dict[str, Any] | None
+        ) -> None:
             for group_chunk in group_chunks:
                 actual_frames = [int(codes_qf.shape[1]) for _, codes_qf in group_chunk]
                 target_frames = max(actual_frames)
@@ -475,6 +491,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                     else:
                         wav_batch = decoder.chunked_decode(
                             codes_bqf,
+                            caches=states,
                             chunk_size=self._decode_chunk_frames,
                             left_context_size=self._decode_left_context_frames,
                         )  # [B, 1, wav_len]
@@ -504,12 +521,17 @@ class Qwen3TTSCode2Wav(nn.Module):
         # For ordinary async streaming windows this is the real batching
         # opportunity; decoder-internal variable chunk batching is gated to
         # longer inputs where repeated full chunks can amortize its overhead.
-        grouped_codes: dict[int, list[tuple[int, torch.Tensor]]] = {}
-        for j, codes_qf in enumerate(valid_codes_qf):
-            frames = int(codes_qf.shape[1])
-            grouped_codes.setdefault(self._get_decode_batch_bucket_frames(frames), []).append((j, codes_qf))
+        grouped_codes: dict[tuple[str, int], list[tuple[int, torch.Tensor]]] = {}
+        for j, (ref_req_id, codes_qf) in enumerate(valid_codes_qf):
+            bucket = self._get_decode_batch_bucket_frames(int(codes_qf.shape[1]))
+            grouped_codes.setdefault(
+                (ref_req_id, bucket),
+                [],
+            ).append((j, codes_qf))
 
-        for _bucket_frames, group in grouped_codes.items():
+        for (ref_req_id, _bucket_frames), group in grouped_codes.items():
+            states = self._decoder_state_cache[ref_req_id] if ref_req_id is not None else None
+
             if self._decode_batch_max_size > 0 and len(group) > self._decode_batch_max_size:
                 # Keep each decoder call inside the configured CUDA graph batch
                 # envelope. Sorting by length lowers right-padding within each
@@ -521,7 +543,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 ]
             else:
                 group_chunks = [group]
-            _decode_group_chunks(group_chunks)
+            _decode_group_chunks(group_chunks, states)
 
         if self._batch_stats_log_every > 0 and self._batch_stats_forwards % self._batch_stats_log_every == 0:
             self.log_decode_batch_stats()
