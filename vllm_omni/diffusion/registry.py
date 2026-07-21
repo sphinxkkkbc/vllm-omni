@@ -73,17 +73,17 @@ _DIFFUSION_MODELS = {
     ),
     "LTX2ImageToVideoPipeline": (
         "ltx2",
-        "pipeline_ltx2_image2video",
+        "pipeline_ltx2",
         "LTX2ImageToVideoPipeline",
     ),
     "LTX2TwoStagesPipeline": (
         "ltx2",
-        "pipeline_ltx2",
+        "pipeline_ltx2_two_stage",
         "LTX2TwoStagesPipeline",
     ),
     "LTX2ImageToVideoTwoStagesPipeline": (
         "ltx2",
-        "pipeline_ltx2_image2video",
+        "pipeline_ltx2_two_stage",
         "LTX2ImageToVideoTwoStagesPipeline",
     ),
     "LTX2T2VDMD2Pipeline": (
@@ -93,17 +93,17 @@ _DIFFUSION_MODELS = {
     ),
     "LTX2I2VDMD2Pipeline": (
         "ltx2",
-        "pipeline_ltx2_image2video",
+        "pipeline_ltx2",
         "LTX2I2VDMD2Pipeline",
     ),
     "LTX23Pipeline": (
         "ltx2",
-        "pipeline_ltx2_3",
+        "pipeline_ltx2",
         "LTX23Pipeline",
     ),
     "LTX23ImageToVideoPipeline": (
         "ltx2",
-        "pipeline_ltx2_3_image2video",
+        "pipeline_ltx2",
         "LTX23ImageToVideoPipeline",
     ),
     "StableAudioPipeline": (
@@ -272,6 +272,11 @@ _DIFFUSION_MODELS = {
         "OmniVoicePipeline",
     ),
     "Cosmos3OmniDiffusersPipeline": (
+        "cosmos3",
+        "pipeline_cosmos3",
+        "Cosmos3OmniDiffusersPipeline",
+    ),
+    "Cosmos3OmniPipeline": (
         "cosmos3",
         "pipeline_cosmos3",
         "Cosmos3OmniDiffusersPipeline",
@@ -536,6 +541,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
+    "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
@@ -546,6 +552,7 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
     # `ir_op_priority_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are defined and mapped using `_DIFFUSION_MODELS` via the `arch` key.
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_ir_op_priority_func",
+    "Cosmos3OmniPipeline": "get_cosmos3_ir_op_priority_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -570,6 +577,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
     "MagiHumanPipeline": "get_magi_human_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
+    "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
     "SoulXSingerPipeline": "get_soulxsinger_pre_process_func",
     "SoulXSingerSVCPipeline": "get_soulxsinger_svc_pre_process_func",
 }
