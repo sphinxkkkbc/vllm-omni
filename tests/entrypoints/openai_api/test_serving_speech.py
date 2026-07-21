@@ -3300,7 +3300,7 @@ class TestCosyVoice3Serving:
                 "mm_processor_kwargs": {"prompt_text": "ref text", "sample_rate": 24000},
             }
         )
-        cosyvoice3_server._apply_cosyvoice3_dynamic_tokens = mocker.MagicMock(side_effect=lambda spl, req: spl)
+        cosyvoice3_server._adapter.apply_sampling_overrides = mocker.MagicMock(side_effect=lambda spl, req, prompt: spl)
 
         request = OpenAICreateSpeechRequest(
             input="Hello",
@@ -3517,6 +3517,9 @@ class TestTTSAsyncOffloading:
                     tts_params={},
                     model_type=adapter_model_type,
                 )
+
+            def apply_sampling_overrides(self, sampling_params_list, request, prompt):
+                return sampling_params_list
 
         voxtral_server._tts_model_type = legacy_tts_model_type
         mocker.patch.object(voxtral_server, "_get_tts_adapter", return_value=FakeAdapter())

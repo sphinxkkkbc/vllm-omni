@@ -117,16 +117,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _STEP_AUDIO2_TTS_MODEL_STAGES
     | _INDEXTTS2_TTS_MODEL_STAGES
 )
-_SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {
-    "fish_tts",
-    "qwen3_tts",
-    "voxtral_tts",
-    "cosyvoice3",
-    "voxcpm2",
-    "higgs_audio_v2",
-    "higgs_audio_v3",
-    "indextts2",
-}
+
 _TTS_LANGUAGES = frozenset(
     {
         "Auto",
@@ -2805,51 +2796,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         return {"prompt_token_ids": prompt_ids}
 
-    def _apply_cosyvoice3_dynamic_tokens(
-        self,
-        sampling_params_list: list,
-        request: OpenAICreateSpeechRequest,
-    ) -> list:
-        """Set min/max tokens from tokenized text length (ratios target tokens, not chars)."""
-        import copy
-
-        from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
-        from vllm_omni.model_executor.models.cosyvoice3.utils import extract_text_token
-
-        sampling_params_list = copy.deepcopy(sampling_params_list)
-        hf_cfg = self.model_config.hf_config
-        # Build the Qwen tokenizer once per process (resolving the model dir via
-        # snapshot_download at most once) and reuse it across requests.
-        tokenizer = self._cosyvoice3_tokenizer
-        if tokenizer is None:
-            model_path = self.engine_client.model_config.model
-            if not os.path.isdir(model_path):
-                from huggingface_hub import snapshot_download
-
-                model_path = snapshot_download(model_path)
-            tokenizer = get_qwen_tokenizer(
-                token_path=os.path.join(model_path, hf_cfg.qwen_pretrain_path),
-                skip_special_tokens=hf_cfg.skip_special_tokens,
-                version=hf_cfg.version,
-            )
-            self._cosyvoice3_tokenizer = tokenizer
-        _, text_token_len = extract_text_token(
-            request.input,
-            tokenizer,
-            hf_cfg.allowed_special,
-        )
-        min_ratio = getattr(hf_cfg, "min_token_text_ratio", 2)
-        max_ratio = getattr(hf_cfg, "max_token_text_ratio", 20)
-        sampling_params_list[0].min_tokens = max(1, int(text_token_len * min_ratio))
-        sampling_params_list[0].max_tokens = min(2048, int(text_token_len * max_ratio))
-        logger.info(
-            "CosyVoice3 dynamic tokens: text_tokens=%d, min_tokens=%d, max_tokens=%d",
-            text_token_len,
-            sampling_params_list[0].min_tokens,
-            sampling_params_list[0].max_tokens,
-        )
-        return sampling_params_list
-
     # ---- GLM-TTS helpers ----
 
     async def _build_glm_tts_prompt(
@@ -3113,63 +3059,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type,
         )
 
-        # CosyVoice3: set dynamic min/max tokens based on text length.
-        # The official model requires min_token_text_ratio to prevent early
-        # EOS and max_token_text_ratio to cap generation length.
-        if self._tts_model_type == "cosyvoice3" and sampling_params_list:
-            sampling_params_list = self._apply_cosyvoice3_dynamic_tokens(sampling_params_list, request)
-
-        # GLM-TTS: set dynamic min/max tokens based on text length.
-        if self._tts_model_type == "glm_tts" and sampling_params_list:
-            import copy
-
-            sampling_params_list = copy.deepcopy(sampling_params_list)
-            glm_metadata = prompt.get("additional_information") if isinstance(prompt, dict) else None
-            text_len_value = None
-            if isinstance(glm_metadata, dict):
-                text_len_value = glm_metadata.get("glm_tts_text_token_len")
-                if isinstance(text_len_value, list) and text_len_value:
-                    text_len_value = text_len_value[0]
-            text_token_len = (
-                int(text_len_value)
-                if text_len_value is not None
-                else self._estimate_glm_tts_text_token_len(request.input)
-            )
-            hf_cfg = self.model_config.hf_config
-            min_ratio = getattr(hf_cfg, "min_token_text_ratio", 2)
-            max_ratio = getattr(hf_cfg, "max_token_text_ratio", 20)
-            stage_min_tokens = getattr(sampling_params_list[0], "min_tokens", None)
-            stage_max_tokens = getattr(sampling_params_list[0], "max_tokens", None)
-            cap_candidates = [int(cap) for cap in (stage_max_tokens, request.max_new_tokens) if cap is not None]
-            hard_cap = min(cap_candidates) if cap_candidates else None
-
-            min_tokens = max(1, int(text_token_len * min_ratio))
-            if stage_min_tokens is not None:
-                min_tokens = max(min_tokens, int(stage_min_tokens))
-            if hard_cap is not None:
-                min_tokens = min(min_tokens, hard_cap)
-
-            max_tokens = max(min_tokens, int(text_token_len * max_ratio))
-            if hard_cap is not None:
-                max_tokens = min(max_tokens, hard_cap)
-            sampling_params_list[0].min_tokens = min_tokens
-            sampling_params_list[0].max_tokens = max_tokens
-            seed = getattr(request, "seed", None)
-            if seed is not None:
-                sampling_params_list[0].seed = seed
-            logger.info(
-                "GLM-TTS dynamic tokens: text_tokens=%d, min_ratio=%s, max_ratio=%s, "
-                "stage_min=%s, stage_max=%s, request_max=%s, min_tokens=%d, max_tokens=%d",
-                text_token_len,
-                min_ratio,
-                max_ratio,
-                stage_min_tokens,
-                stage_max_tokens,
-                request.max_new_tokens,
-                min_tokens,
-                max_tokens,
-            )
-
         # Apply model-specific extra parameters
         if request.extra_params is not None and sampling_params_list:
             if not isinstance(request.extra_params, dict):
@@ -3188,38 +3077,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Some TTS model defaults come from deploy YAML. Their AR
         # generation length is controlled by SamplingParams.max_tokens, so only
         # override it when the caller explicitly requests max_new_tokens.
-        if (
-            self._tts_model_type in _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES
-            and request.max_new_tokens is not None
-            and sampling_params_list
-        ):
-            import copy
-
-            sampling_params_list = copy.deepcopy(sampling_params_list)
-            sampling_params_list[0].max_tokens = request.max_new_tokens
-            if self._tts_model_type == "cosyvoice3":
-                sampling_params_list[0].min_tokens = min(
-                    getattr(sampling_params_list[0], "min_tokens", 0),
-                    request.max_new_tokens,
-                )
-        elif self._tts_model_type == "ming_tts" and sampling_params_list:
-            import copy
-
-            from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
-                MOE_TEXT_EOS_TOKEN_ID,
-                TEXT_EOS_TOKEN_ID,
-            )
-
-            hf_config = self.engine_client.model_config.hf_config
-            is_moe = getattr(hf_config, "model_type", "") == "bailingmm"
-            stop_token_id = MOE_TEXT_EOS_TOKEN_ID if is_moe else TEXT_EOS_TOKEN_ID
-
-            sampling_params_list = copy.deepcopy(sampling_params_list)
-            sampling_params_list[0].stop_token_ids = [int(stop_token_id)]
-            if request.max_new_tokens is not None:
-                # Ming emits TEXT_EOS after the latent decode budget is exhausted, so
-                # Stage-0 needs one extra token beyond ming_max_decode_steps.
-                sampling_params_list[0].max_tokens = int(request.max_new_tokens) + 1
+        if (adapter := self._get_tts_adapter()) is not None:
+            sampling_params_list = adapter.apply_sampling_overrides(sampling_params_list, request, prompt)
 
         if request.seed is not None and sampling_params_list:
             import copy

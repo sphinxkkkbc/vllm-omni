@@ -2,7 +2,7 @@
 """Qwen3-TTS serving adapter."""
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
@@ -163,3 +163,16 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             model_type=tts_params.get("task_type", ["unknown"])[0],
             warmup_artifact_key=warmup_key,
         )
+
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: "OpenAICreateSpeechRequest",
+        prompt: dict[str, Any] | None = None,
+    ) -> list:
+        if request.max_new_tokens is not None:
+            import copy
+
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            sampling_params_list[0].max_tokens = request.max_new_tokens
+        return sampling_params_list

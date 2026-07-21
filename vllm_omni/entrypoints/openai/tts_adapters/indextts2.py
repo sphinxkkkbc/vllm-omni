@@ -215,6 +215,19 @@ class IndexTTS2Adapter(ARTTSAdapter):
         prompt["cache_salt"] = indextts2_conditioning_cache_salt(request, tts_params)
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="indextts2")
 
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: OpenAICreateSpeechRequest,
+        prompt: dict[str, Any] | None = None,
+    ) -> list:
+        if request.max_new_tokens is not None:
+            import copy
+
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            sampling_params_list[0].max_tokens = request.max_new_tokens
+        return sampling_params_list
+
     async def _build_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         server = self.ctx.server
         params: dict[str, Any] = {"text": [request.input]}

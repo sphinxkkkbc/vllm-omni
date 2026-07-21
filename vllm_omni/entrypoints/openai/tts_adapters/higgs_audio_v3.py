@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Higgs-Audio v3 serving adapter."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
@@ -36,3 +36,16 @@ class HiggsAudioV3Adapter(ARTTSAdapter):
     ) -> PreparedRequest:
         prompt = await self.ctx.server._build_higgs_audio_v3_params(request)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="higgs_audio_v3")
+
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: "OpenAICreateSpeechRequest",
+        prompt: dict[str, Any] | None = None,
+    ) -> list:
+        if request.max_new_tokens is not None:
+            import copy
+
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            sampling_params_list[0].max_tokens = request.max_new_tokens
+        return sampling_params_list

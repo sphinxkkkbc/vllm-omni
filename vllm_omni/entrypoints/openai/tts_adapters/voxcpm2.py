@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """VoxCPM2 serving adapter (AR base-LM + diffusion side-computation)."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
@@ -65,3 +65,16 @@ class VoxCPM2Adapter(ARTTSAdapter):
                 additional["voice_name"] = voice_lower
                 additional["voice_created_at"] = server._voice_created_at(voice_lower)
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="voxcpm2")
+
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: "OpenAICreateSpeechRequest",
+        prompt: dict[str, Any] | None = None,
+    ) -> list:
+        if request.max_new_tokens is not None:
+            import copy
+
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            sampling_params_list[0].max_tokens = request.max_new_tokens
+        return sampling_params_list

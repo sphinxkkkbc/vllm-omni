@@ -145,6 +145,7 @@ class TTSModelAdapter(ABC):
         self,
         sampling_params_list: list,
         request: "OpenAICreateSpeechRequest",
+        prompt: dict[str, Any] | None = None,
     ) -> list:
         """Apply model-specific sampling mutations.
 
