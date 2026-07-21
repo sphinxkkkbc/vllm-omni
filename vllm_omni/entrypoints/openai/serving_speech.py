@@ -3077,7 +3077,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Some TTS model defaults come from deploy YAML. Their AR
         # generation length is controlled by SamplingParams.max_tokens, so only
         # override it when the caller explicitly requests max_new_tokens.
-        if (adapter := self._get_tts_adapter()) is not None:
+        if sampling_params_list and (adapter := self._get_tts_adapter()) is not None:
             sampling_params_list = adapter.apply_sampling_overrides(sampling_params_list, request, prompt)
 
         if request.seed is not None and sampling_params_list:
