@@ -70,12 +70,14 @@ class MingTTSAdapter(ARTTSAdapter):
     ) -> list:
         import copy
 
+        server = self.ctx.server
+
         from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
             MOE_TEXT_EOS_TOKEN_ID,
             TEXT_EOS_TOKEN_ID,
         )
 
-        hf_config = self.engine_client.model_config.hf_config
+        hf_config = server.engine_client.model_config.hf_config
         is_moe = getattr(hf_config, "model_type", "") == "bailingmm"
         stop_token_id = MOE_TEXT_EOS_TOKEN_ID if is_moe else TEXT_EOS_TOKEN_ID
 
