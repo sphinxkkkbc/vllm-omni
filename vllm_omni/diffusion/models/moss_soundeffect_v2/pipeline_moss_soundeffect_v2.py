@@ -1,14 +1,82 @@
 import json
 import os
-from dataclasses import dataclass
-from pathlib import Path
+from collections.abc import Iterable
+from typing import ClassVar
 
 import torch
-from tqdm import tqdm
+from vllm.logger import init_logger
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .wan_audio_pipeline import WanAudioPipeline
+
+logger = init_logger(__name__)
+
+_DIT_PREFIX = "engine.dit."
+_HF_DIT_BLOCK_RENAME = {
+    "attn1.norm_k.weight": "self_attn.norm_k.weight",
+    "attn1.norm_q.weight": "self_attn.norm_q.weight",
+    "attn1.to_k.bias": "self_attn.k.bias",
+    "attn1.to_k.weight": "self_attn.k.weight",
+    "attn1.to_out.0.bias": "self_attn.o.bias",
+    "attn1.to_out.0.weight": "self_attn.o.weight",
+    "attn1.to_q.bias": "self_attn.q.bias",
+    "attn1.to_q.weight": "self_attn.q.weight",
+    "attn1.to_v.bias": "self_attn.v.bias",
+    "attn1.to_v.weight": "self_attn.v.weight",
+    "attn2.norm_k.weight": "cross_attn.norm_k.weight",
+    "attn2.norm_q.weight": "cross_attn.norm_q.weight",
+    "attn2.to_k.bias": "cross_attn.k.bias",
+    "attn2.to_k.weight": "cross_attn.k.weight",
+    "attn2.to_out.0.bias": "cross_attn.o.bias",
+    "attn2.to_out.0.weight": "cross_attn.o.weight",
+    "attn2.to_q.bias": "cross_attn.q.bias",
+    "attn2.to_q.weight": "cross_attn.q.weight",
+    "attn2.to_v.bias": "cross_attn.v.bias",
+    "attn2.to_v.weight": "cross_attn.v.weight",
+    "ffn.net.0.proj.bias": "ffn.0.bias",
+    "ffn.net.0.proj.weight": "ffn.0.weight",
+    "ffn.net.2.bias": "ffn.2.bias",
+    "ffn.net.2.weight": "ffn.2.weight",
+    "norm2.bias": "norm3.bias",
+    "norm2.weight": "norm3.weight",
+    "scale_shift_table": "modulation",
+}
+
+
+_HF_DIT_GLOBAL_RENAME = {
+    "condition_embedder.text_embedder.linear_1.bias": "text_embedding.0.bias",
+    "condition_embedder.text_embedder.linear_1.weight": "text_embedding.0.weight",
+    "condition_embedder.text_embedder.linear_2.bias": "text_embedding.2.bias",
+    "condition_embedder.text_embedder.linear_2.weight": "text_embedding.2.weight",
+    "condition_embedder.time_embedder.linear_1.bias": "time_embedding.0.bias",
+    "condition_embedder.time_embedder.linear_1.weight": "time_embedding.0.weight",
+    "condition_embedder.time_embedder.linear_2.bias": "time_embedding.2.bias",
+    "condition_embedder.time_embedder.linear_2.weight": "time_embedding.2.weight",
+    "condition_embedder.time_proj.bias": "time_projection.1.bias",
+    "condition_embedder.time_proj.weight": "time_projection.1.weight",
+    "scale_shift_table": "head.modulation",
+    "proj_out.bias": "head.head.bias",
+    "proj_out.weight": "head.head.weight",
+    "patch_embedding.bias": "patch_embedding.bias",
+    "patch_embedding.weight": "patch_embedding.weight",
+}
+
+
+def _rename_dit_weight(name: str) -> str:
+    relative_name = name.removeprefix(_DIT_PREFIX)
+    if relative_name in _HF_DIT_GLOBAL_RENAME:
+        return f"{_DIT_PREFIX}{_HF_DIT_GLOBAL_RENAME[relative_name]}"
+
+    for source_suffix, target_suffix in _HF_DIT_BLOCK_RENAME.items():
+        if relative_name.endswith(source_suffix):
+            prefix = relative_name[: -len(source_suffix)]
+            return f"{_DIT_PREFIX}{prefix}{target_suffix}"
+    return name
 
 
 def get_moss_soundeffect_post_process_func(od_config: OmniDiffusionConfig):
@@ -27,15 +95,6 @@ def get_moss_soundeffect_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-@dataclass
-class MossSoundEffectPipelineOutput:
-    """Container returned by :meth:`MossSoundEffectPipeline.__call__`."""
-
-    audios: torch.Tensor
-    sample_rate: int
-    prompts: list[str]
-
-
 class MossSoundEffectPipeline(torch.nn.Module):
     r"""Text-to-audio diffusion pipeline (diffusers-style API).
 
@@ -44,87 +103,53 @@ class MossSoundEffectPipeline(torch.nn.Module):
     plus a standard ``from_pretrained`` workflow reading ``model_index.json``.
     """
 
+    support_audio_output: ClassVar[bool] = True
+    audio_sample_rate: ClassVar[int] = 48000
+
     def __init__(
         self,
-        engine: WanAudioPipeline,
+        od_config: OmniDiffusionConfig | None = None,
         sample_rate: int = 48000,
         max_inference_seconds: int = 30,
     ):
         super().__init__()
-        self.engine = engine
-        self.sample_rate = int(sample_rate)
-        self.max_inference_seconds = int(max_inference_seconds)
+        self.od_config = od_config
+        model = od_config.model
+        if os.path.isdir(model):
+            model_root = model
+        else:
+            from huggingface_hub import snapshot_download
 
-    @staticmethod
-    def _normalize_device(device: str | torch.device) -> str:
-        requested = str(device)
-        if requested == "auto":
-            return "cuda" if torch.cuda.is_available() else "cpu"
-        if requested.startswith("cuda") and not torch.cuda.is_available():
-            print(
-                f"[Warning] Requested device '{requested}' but CUDA is unavailable. Falling back to CPU.",
-                flush=True,
+            model_root = snapshot_download(
+                repo_id=model,
+                revision=od_config.revision,
             )
-            return "cpu"
-        return requested
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str | os.PathLike,
-        torch_dtype: torch.dtype = torch.bfloat16,
-        device: str | torch.device = "cuda",
-        **kwargs,
-    ) -> "MossSoundEffectPipeline":
-        """Load a pipeline from a local diffusers-style dir or a HF hub repo id."""
-        model_dir = Path(cls._resolve_local_dir(pretrained_model_name_or_path, kwargs))
-        resolved_device = cls._normalize_device(device)
-
-        engine = WanAudioPipeline.from_pretrained(
-            str(model_dir),
-            device=resolved_device,
-            torch_dtype=torch_dtype,
-        )
-
-        sample_rate = 48000
-        max_inference_seconds = 30
-        index_path = model_dir / "model_index.json"
-        if index_path.is_file():
-            with open(index_path) as f:
-                index = json.load(f)
-            sample_rate = int(index.get("sample_rate", sample_rate))
-            max_inference_seconds = int(index.get("max_inference_seconds", max_inference_seconds))
-
-        return cls(
-            engine=engine,
-            sample_rate=sample_rate,
-            max_inference_seconds=max_inference_seconds,
-        )
-
-    @staticmethod
-    def _resolve_local_dir(
-        pretrained_model_name_or_path: str | os.PathLike,
-        kwargs: dict,
-    ) -> str:
-        path = str(pretrained_model_name_or_path)
-        if os.path.isdir(path):
-            return path
-        from huggingface_hub import snapshot_download
-
-        return snapshot_download(
-            repo_id=path,
-            cache_dir=kwargs.get("cache_dir"),
-            revision=kwargs.get("revision"),
-            token=kwargs.get("token"),
-            local_files_only=kwargs.get("local_files_only", False),
-        )
+        self.device = get_local_device()
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="transformer",
+                revision=None,
+                prefix="engine.dit.",
+                fall_back_to_pt=True,
+            ),
+        ]
+        scheduler_path = os.path.join(model_root, "scheduler/scheduler_config.json")
+        with open(scheduler_path) as f:
+            sched_cfg = json.load(f)
+        self.engine = WanAudioPipeline(model_dir=model_root, flow_shift=sched_cfg.get("shift", 5.0))
+        index_path = os.path.join(model_root, "model_index.json")
+        with open(index_path) as f:
+            index = json.load(f)
+        self.sample_rate = int(index.get("sample_rate", sample_rate))
+        self.max_inference_seconds = int(index.get("max_inference_seconds", max_inference_seconds))
 
     @torch.no_grad()
-    def __call__(
+    def forward(
         self,
         prompt: str | list[str],
         seconds: float = 10.0,
-        num_inference_steps: int = 100,
+        num_inference_steps: int = 10,
         cfg_scale: float = 4.0,
         sigma_shift: float = 5.0,
         seed: int = 0,
@@ -132,9 +157,7 @@ class MossSoundEffectPipeline(torch.nn.Module):
         append_duration_suffix: bool = True,
         num_channels: int = 1,
         max_inference_seconds: int | None = None,
-        return_dict: bool = False,
-        progress_bar_cmd=tqdm,
-    ) -> torch.Tensor | MossSoundEffectPipelineOutput:
+    ) -> DiffusionOutput:
         """Run denoising and return a waveform of shape ``(B, C, T)``.
 
         Args:
@@ -151,7 +174,7 @@ class MossSoundEffectPipeline(torch.nn.Module):
                 each prompt (matches training-time convention).
             num_channels: Output channels (DAC is mono → 1).
             max_inference_seconds: Override of the configured upper bound.
-            return_dict: If True, return :class:`MossSoundEffectPipelineOutput`.
+            return_dict: If True, return :class:`DiffusionOutput`.
         """
         seconds = round(float(seconds), 1)
         if seconds <= 0:
@@ -160,8 +183,11 @@ class MossSoundEffectPipeline(torch.nn.Module):
         if seconds > full_seconds:
             raise ValueError(f"seconds={seconds} exceeds max_inference_seconds={full_seconds}")
 
-        def _format(p: str) -> str:
-            p = p.strip()
+        def _format(p: DiffusionRequestBatch) -> str:
+            # logger.info(f"p: {p}")
+            for _, request in enumerate(p.requests):
+                prompt = request.prompt["prompt"]
+                p = prompt.strip()
             return f"{p} duration: {seconds:.1f}s" if append_duration_suffix else p
 
         if isinstance(prompt, (list, tuple)):
@@ -170,7 +196,7 @@ class MossSoundEffectPipeline(torch.nn.Module):
             prompts = [_format(prompt)]
 
         num_samples_full = self.sample_rate * full_seconds
-        device_type = self.device.type
+        device_type = str(self.device)
         with torch.autocast(device_type, dtype=torch.bfloat16):
             audio = self.engine(
                 prompt=prompts if len(prompts) > 1 else prompts[0],
@@ -181,36 +207,22 @@ class MossSoundEffectPipeline(torch.nn.Module):
                 num_inference_steps=int(num_inference_steps),
                 num_samples=num_samples_full,
                 num_channels=int(num_channels),
-                progress_bar_cmd=progress_bar_cmd,
             )
 
         output_samples = int(self.sample_rate * seconds)
         audio = audio[:, :, :output_samples]
+        return DiffusionOutput(output=audio)
 
-        if return_dict:
-            return MossSoundEffectPipelineOutput(
-                audios=audio,
-                sample_rate=self.sample_rate,
-                prompts=prompts,
-            )
-        return audio
-
-    def save_audio(
-        self,
-        audio: torch.Tensor,
-        output_path: str | Path,
-        sample_rate: int | None = None,
-    ) -> str:
-        import torchaudio
-
-        sr = int(sample_rate or self.sample_rate)
-        wav = audio.detach().cpu()
-        if wav.ndim == 3:
-            wav = wav[0]
-        elif wav.ndim == 1:
-            wav = wav.unsqueeze(0)
-        wav = wav.to(torch.float32)
-        output_path = str(Path(output_path).expanduser().resolve())
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        torchaudio.save(output_path, wav, sr)
-        return output_path
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        params_dict = dict(self.engine.dit.named_parameters())
+        loaded_params: set[str] = set()
+        for name, loaded_weight in weights:
+            full_param_name = _rename_dit_weight(name)
+            param_name = full_param_name.removeprefix(_DIT_PREFIX)
+            if param_name not in params_dict:
+                continue
+            param = params_dict[param_name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(full_param_name)
+        return loaded_params

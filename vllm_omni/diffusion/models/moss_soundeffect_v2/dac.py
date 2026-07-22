@@ -473,15 +473,9 @@ class ResidualVectorQuantize(nn.Module):
 
         if n_quantizers is None:
             n_quantizers = self.n_codebooks
-        if self.training:
-            n_quantizers = torch.ones((z.shape[0],)) * self.n_codebooks + 1
-            dropout = torch.randint(1, self.n_codebooks + 1, (z.shape[0],))
-            n_dropout = int(z.shape[0] * self.quantizer_dropout)
-            n_quantizers[:n_dropout] = dropout[:n_dropout]
-            n_quantizers = n_quantizers.to(z.device)
 
         for i, quantizer in enumerate(self.quantizers):
-            if self.training is False and i >= n_quantizers:
+            if i >= n_quantizers:
                 break
 
             z_q_i, commitment_loss_i, codebook_loss_i, indices_i, z_e_i = quantizer(residual)
