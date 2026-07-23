@@ -450,7 +450,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Cached per process: the CosyVoice3 Qwen tokenizer + resolved model
         # path used for dynamic-token sizing. Without this, every request
         # re-ran snapshot_download + reloaded the tokenizer (~100 ms on the
-        # TTFP critical path) in _apply_cosyvoice3_dynamic_tokens.
+        # TTFP critical path) in the CosyVoice3 adapter's sampling override.
         self._cosyvoice3_tokenizer = None
 
         self._is_cosyvoice3 = (
@@ -504,9 +504,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Resolve the per-model serving adapter (RFC #4327), keyed on the
         # detected model-type. Every dedicated TTS model has an adapter; the
-        # adapter owns request validation + prompt/param building. Sampling
-        # overrides and the model-type label remain in the orchestrator tail
-        # (keyed on ``_tts_model_type``) during this incremental migration.
+        # adapter owns request validation, prompt/param building, and sampling
+        # overrides; the model-type label remains available for compatibility.
         self._adapter = None
         if self._tts_stage is not None:
             adapter_cls = resolve_adapter(self._tts_model_type)
@@ -2998,9 +2997,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Build prompt + tts_params via the per-model adapter (RFC #4327). Every
         # dedicated TTS model resolves to an adapter that owns its validation,
-        # uploaded-speaker handling, and prompt/param building. Sampling
-        # overrides and the model-type label remain in the orchestrator tail
-        # below (keyed on ``_tts_model_type``) during this incremental migration.
+        # uploaded-speaker handling, prompt/param building, and sampling
+        # overrides. The model-type label remains available for compatibility.
         # Non-TTS deployments (no adapter) fall through to the rejection below.
         # Capture inline-ref-audio status BEFORE validate(): several adapters
         # apply uploaded speakers inside validate(), which sets request.ref_audio
