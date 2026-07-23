@@ -39,6 +39,21 @@ def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: di
     return _conditioning_cache_salt_fn(request, tts_params)
 
 
+def apply_max_new_tokens(
+    sampling_params_list: list,
+    request: "OpenAICreateSpeechRequest",
+) -> list:
+    """Apply a request-level ``max_new_tokens`` limit."""
+    if request.max_new_tokens is None:
+        return sampling_params_list
+
+    import copy
+
+    sampling_params_list = copy.deepcopy(sampling_params_list)
+    sampling_params_list[0].max_tokens = request.max_new_tokens
+    return sampling_params_list
+
+
 @dataclass
 class OutputPolicy:
     """How the orchestrator aggregates engine output for a model.

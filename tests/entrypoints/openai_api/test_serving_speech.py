@@ -45,7 +45,7 @@ from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
     build_fish_voice_clone_prompt_ids,
 )
-from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
+from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM, TEXT_EOS_TOKEN_ID
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -3575,11 +3575,15 @@ class TestMingTTSServing:
             input="Hello",
             ref_audio="data:audio/wav;base64,abc",
             ref_text="Reference text",
+            max_new_tokens=7,
         )
         asyncio.run(ming_tts_server._prepare_speech_generation(request))
 
         assert ming_tts_server._tts_model_type == "ming_tts"
         ming_tts_server._adapter.build.assert_awaited_once()
+        sampling_params = ming_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+        assert sampling_params.stop_token_ids == [TEXT_EOS_TOKEN_ID]
+        assert sampling_params.max_tokens == 8
 
 
 class TestTTSAsyncOffloading:

@@ -4,7 +4,12 @@
 from typing import TYPE_CHECKING, Any
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, conditioning_cache_salt
+from vllm_omni.entrypoints.openai.tts_adapters.base import (
+    ARTTSAdapter,
+    PreparedRequest,
+    apply_max_new_tokens,
+    conditioning_cache_salt,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -60,9 +65,4 @@ class FishSpeechAdapter(ARTTSAdapter):
         request: "OpenAICreateSpeechRequest",
         prompt: dict[str, Any] | None = None,
     ) -> list:
-        if request.max_new_tokens is not None:
-            import copy
-
-            sampling_params_list = copy.deepcopy(sampling_params_list)
-            sampling_params_list[0].max_tokens = request.max_new_tokens
-        return sampling_params_list
+        return apply_max_new_tokens(sampling_params_list, request)

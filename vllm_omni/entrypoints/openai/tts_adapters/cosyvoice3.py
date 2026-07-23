@@ -52,8 +52,6 @@ class CosyVoice3Adapter(ARTTSAdapter):
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
         prompt = await self.ctx.server._build_cosyvoice3_prompt(request, has_inline_ref_audio=has_inline_ref_audio)
-        # NOTE: CosyVoice3 dynamic-token sampling stays in the orchestrator tail
-        # (keyed on _tts_model_type) during this incremental migration.
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="cosyvoice3")
 
     def apply_sampling_overrides(
@@ -62,10 +60,11 @@ class CosyVoice3Adapter(ARTTSAdapter):
         request: "OpenAICreateSpeechRequest",
         prompt: dict[str, Any] | None = None,
     ) -> list:
-        # CosyVoice3: set dynamic min/max tokens based on text length.
-        # The official model requires min_token_text_ratio to prevent early
-        # EOS and max_token_text_ratio to cap generation length.
-        """Set min/max tokens from tokenized text length (ratios target tokens, not chars)."""
+        """Set dynamic min/max tokens based on tokenized text length.
+
+        The official model uses ``min_token_text_ratio`` to prevent early EOS
+        and ``max_token_text_ratio`` to cap the generated token count.
+        """
         import copy
 
         from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer

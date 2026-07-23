@@ -14,7 +14,7 @@ from vllm.inputs import tokens_input
 from vllm.utils import random_uuid
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -221,12 +221,7 @@ class IndexTTS2Adapter(ARTTSAdapter):
         request: OpenAICreateSpeechRequest,
         prompt: dict[str, Any] | None = None,
     ) -> list:
-        if request.max_new_tokens is not None:
-            import copy
-
-            sampling_params_list = copy.deepcopy(sampling_params_list)
-            sampling_params_list[0].max_tokens = request.max_new_tokens
-        return sampling_params_list
+        return apply_max_new_tokens(sampling_params_list, request)
 
     async def _build_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
         server = self.ctx.server

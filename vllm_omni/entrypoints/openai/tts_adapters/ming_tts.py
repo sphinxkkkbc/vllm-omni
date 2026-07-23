@@ -92,7 +92,6 @@ class MingTTSAdapter(ARTTSAdapter):
             logger.debug("Speaker cache STORE for Ming-TTS speaker '%s'", voice_lower)
         prompt = server._build_ming_dense_prompt(request, ref_audio_data=ref_audio_data)
         tts_params = prompt.get("additional_information", {})
-        # Ming stop-token / max_tokens sampling stays in the orchestrator tail.
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="ming_tts")
 
     def apply_sampling_overrides(
