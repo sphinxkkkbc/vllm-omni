@@ -93,11 +93,9 @@ def get_moss_soundeffect_post_process_func(od_config: OmniDiffusionConfig):
 
 
 class MossSoundEffectPipeline(torch.nn.Module):
-    r"""Text-to-audio diffusion pipeline (diffusers-style API).
-
-    Wraps :class:`WanAudioPipeline` (DiT + DAC VAE + Qwen3 text encoder +
-    flow-match scheduler) and exposes a ``seconds``-oriented call signature
-    plus a standard ``from_pretrained`` workflow reading ``model_index.json``.
+    r"""
+    Text-to-audio diffusion pipeline. Wraps :class:`WanAudioPipeline`
+    (DiT + DAC VAE + Qwen3 text encoder + flow-match scheduler).
     """
 
     support_audio_output: ClassVar[bool] = True
