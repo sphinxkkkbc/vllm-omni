@@ -48,7 +48,6 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
         This endpoint is designed for audio generation models as
         opposed to TTS models that specifically generate speech.
         """
-        logger.info(f"request: {request}")
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -143,7 +142,11 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
                 return self.create_error_response("Audio generation model did not produce audio output.")
 
             audio_tensor = audio_output[audio_key]
-            sample_rate = audio_output.get("sr", default_sr)
+            sample_rate = audio_output.get("audio_sample_rate")
+            if sample_rate is None:
+                sample_rate = audio_output.get("sample_rate")
+            if sample_rate is None:
+                sample_rate = audio_output.get("sr", default_sr)
             if hasattr(sample_rate, "item"):
                 sample_rate = sample_rate.item()
 
