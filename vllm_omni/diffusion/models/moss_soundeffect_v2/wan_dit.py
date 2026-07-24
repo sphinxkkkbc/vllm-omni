@@ -5,7 +5,7 @@ from einops import rearrange
 from torch.nn import RMSNorm
 
 
-def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int):
+def forward_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int):
     q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
     k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
     v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
@@ -41,7 +41,7 @@ class AttentionModule(nn.Module):
         self.num_heads = num_heads
 
     def forward(self, q, k, v):
-        x = flash_attention(q=q, k=k, v=v, num_heads=self.num_heads)
+        x = forward_attention(q=q, k=k, v=v, num_heads=self.num_heads)
         return x
 
 
@@ -105,7 +105,7 @@ class CrossAttention(nn.Module):
         if self.has_image_input:
             k_img = self.norm_k_img(self.k_img(img))
             v_img = self.v_img(img)
-            y = flash_attention(q, k_img, v_img, num_heads=self.num_heads)
+            y = forward_attention(q, k_img, v_img, num_heads=self.num_heads)
             x = x + y
         return self.o(x)
 

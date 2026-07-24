@@ -6,13 +6,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM
-from vllm.logger import init_logger
+
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 
 from .dac import DAC
 from .modeling_wan_audio import WanAudioModel, WanPrompter, sinusoidal_embedding_1d
-from .utils import BasePipeline, PipelineUnit, PipelineUnitRunner
-
-logger = init_logger(__name__)
+from .utils import PipelineUnit, PipelineUnitRunner
 
 
 class Qwen3TextEncoder(nn.Module):
@@ -22,11 +21,11 @@ class Qwen3TextEncoder(nn.Module):
     as text embeddings. Interface matches WanTextEncoder.forward(ids, mask).
     """
 
-    def __init__(self, model_path, torch_dtype=torch.bfloat16):
+    def __init__(self, model_path, dtype=torch.bfloat16):
         super().__init__()
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch_dtype,
+            dtype=dtype,
             output_hidden_states=True,
         )
         self.model.eval()
@@ -155,24 +154,18 @@ class FlowMatchScheduler:
         return mu
 
 
-class WanAudioPipeline(BasePipeline):
-    def __init__(self, model_dir, device="cuda", torch_dtype=torch.bfloat16, flow_shift=5.0):
-        super().__init__(
-            device=device,
-            torch_dtype=torch_dtype,
-            height_division_factor=16,
-            width_division_factor=16,
-            time_division_factor=4,
-            time_division_remainder=1,
-        )
+class WanAudioPipeline(nn.Module, ProgressBarMixin):
+    def __init__(self, model_dir, device="cuda", dtype=torch.bfloat16, flow_shift=5.0):
+        super().__init__()
+        self.device = torch.device(device)
+        self.torch_dtype = dtype
         self.scheduler = FlowMatchScheduler(shift=flow_shift, sigma_min=0.0, extra_one_step=True)
 
         te_path = os.path.join(model_dir, "text_encoder")
-        self.text_encoder = Qwen3TextEncoder(te_path, torch_dtype=torch_dtype)
+        self.text_encoder = Qwen3TextEncoder(te_path, dtype=dtype)
         self.text_encoder.to(device)
         tok_path = os.path.join(model_dir, "tokenizer")
-        self.prompter = WanPrompter(tokenizer_path=tok_path)
-        self.prompter.fetch_models(self.text_encoder)
+        self.prompter = WanPrompter(tokenizer_path=tok_path, text_encoder=self.text_encoder)
 
         with open(os.path.join(model_dir, "transformer", "config.json")) as f:
             dit_cfg = json.load(f)
@@ -191,8 +184,7 @@ class WanAudioPipeline(BasePipeline):
             vae_type=dit_cfg.get("vae_type", "dac"),
         )
 
-        self.vae = DAC.load(os.path.join(model_dir, "vae/vae_128d_48k.pth"))
-        self.in_iteration_models = ("dit",)
+        self.vae = DAC.load(os.path.join(model_dir, "vae/vae_128d_48k.pth")).to(device)
         self.unit_runner = PipelineUnitRunner()
         self.units = [
             WanAudioUnit_ShapeChecker(),
@@ -203,12 +195,32 @@ class WanAudioPipeline(BasePipeline):
         self.audio_latent_dim = dit_cfg["in_dim"]
         self.num_samples_division_factor = self.vae.hop_length
 
+    def to(self, *args, **kwargs):
+        device, dtype, _, _ = torch._C._nn._parse_to(*args, **kwargs)
+        if device is not None:
+            self.device = device
+        if dtype is not None:
+            self.torch_dtype = dtype
+        return super().to(*args, **kwargs)
+
+    def generate_noise(
+        self,
+        shape,
+        seed=None,
+        rand_device="cpu",
+        rand_torch_dtype=torch.float32,
+        device=None,
+        dtype=None,
+    ):
+        generator = None if seed is None else torch.Generator(rand_device).manual_seed(seed)
+        noise = torch.randn(shape, generator=generator, device=rand_device, dtype=rand_torch_dtype)
+        return noise.to(dtype=dtype or self.torch_dtype, device=device or self.device)
+
     def check_resize_num_channels_num_samples(self, num_channels, num_samples):
         # Shape check
         self.num_samples_division_factor = np.prod(self.vae.encoder_rates)
         if num_samples % self.num_samples_division_factor != 0:
             num_samples = num_samples // self.num_samples_division_factor * self.num_samples_division_factor
-            # print(f"num_samples % {self.num_samples_division_factor} != 0. We round it down to {num_samples}.")
         return num_channels, num_samples
 
     @torch.no_grad()
@@ -260,29 +272,31 @@ class WanAudioPipeline(BasePipeline):
                 unit, self, inputs_shared, inputs_posi, inputs_nega
             )
 
-        # Denoise
-        for i, timestep in enumerate(self.scheduler.timesteps):
-            # Timestep
-            timestep = timestep.unsqueeze(0).to(device=self.device)
+        with self.progress_bar(total=len(self.scheduler.timesteps)) as pbar:
+            # Denoise
+            for i, timestep in enumerate(self.scheduler.timesteps):
+                # Timestep
+                timestep = timestep.unsqueeze(0).to(device=self.device)
 
-            # Inference
-            torch.compiler.cudagraph_mark_step_begin()
-            noise_pred_posi = self._forward(**inputs_shared, **inputs_posi, timestep=timestep)
-            if cfg_scale != 1.0:
-                noise_pred_posi = noise_pred_posi.clone()
-                noise_pred_nega = self._forward(**inputs_shared, **inputs_nega, timestep=timestep)
-                noise_pred_posi = noise_pred_posi.float()
-                noise_pred_nega = noise_pred_nega.float()
-                noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
-            else:
-                noise_pred = noise_pred_posi
+                # Inference
+                torch.compiler.cudagraph_mark_step_begin()
+                noise_pred_posi = self._forward(**inputs_shared, **inputs_posi, timestep=timestep)
+                if cfg_scale != 1.0:
+                    noise_pred_posi = noise_pred_posi.clone()
+                    noise_pred_nega = self._forward(**inputs_shared, **inputs_nega, timestep=timestep)
+                    noise_pred_posi = noise_pred_posi.float()
+                    noise_pred_nega = noise_pred_nega.float()
+                    noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
+                else:
+                    noise_pred = noise_pred_posi
 
-            # Scheduler
-            inputs_shared["latents"] = self.scheduler.step(
-                noise_pred, self.scheduler.timesteps[i], inputs_shared["latents"]
-            )
-            if "first_frame_latents" in inputs_shared:
-                inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
+                # Scheduler
+                inputs_shared["latents"] = self.scheduler.step(
+                    noise_pred, self.scheduler.timesteps[i], inputs_shared["latents"]
+                )
+                if "first_frame_latents" in inputs_shared:
+                    inputs_shared["latents"][:, :, 0:1] = inputs_shared["first_frame_latents"]
+                pbar.update()
 
         # Decode
         latents = inputs_shared["latents"]

@@ -1,50 +1,16 @@
 import html
 import math
 import string
-from typing import Any, Literal
+from typing import Literal
 
 import ftfy
 import regex as re
 import torch
 import torch.nn as nn
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
 from transformers import AutoTokenizer
 
 from .wan_dit import DiTBlock
-
-
-class BasePrompter:
-    def __init__(self):
-        self.refiners = []
-        self.extenders = []
-
-    def load_prompt_refiners(self, model_manager: Any, refiner_classes=[]):
-        for refiner_class in refiner_classes:
-            refiner = refiner_class.from_model_manager(model_manager)
-            self.refiners.append(refiner)
-
-    def load_prompt_extenders(self, model_manager: Any, extender_classes=[]):
-        for extender_class in extender_classes:
-            extender = extender_class.from_model_manager(model_manager)
-            self.extenders.append(extender)
-
-    @torch.no_grad()
-    def process_prompt(self, prompt, positive=True):
-        if isinstance(prompt, list):
-            prompt = [self.process_prompt(prompt_, positive=positive) for prompt_ in prompt]
-        else:
-            for refiner in self.refiners:
-                prompt = refiner(prompt, positive=positive)
-        return prompt
-
-    @torch.no_grad()
-    def extend_prompt(self, prompt: str, positive=True):
-        extended_prompt = dict(prompt=prompt)
-        for extender in self.extenders:
-            extended_prompt = extender(extended_prompt)
-        return extended_prompt
 
 
 def basic_clean(text):
@@ -116,23 +82,14 @@ class HuggingfaceTokenizer:
         return text
 
 
-class WanPrompter(BasePrompter):
-    def __init__(self, tokenizer_path=None, text_len=512):
+class WanPrompter:
+    def __init__(self, tokenizer_path, text_encoder, text_len=512):
         super().__init__()
         self.text_len = text_len
-        self.text_encoder = None
-        self.fetch_tokenizer(tokenizer_path)
-
-    def fetch_tokenizer(self, tokenizer_path=None):
-        if tokenizer_path is not None:
-            self.tokenizer = HuggingfaceTokenizer(name=tokenizer_path, seq_len=self.text_len, clean="whitespace")
-
-    def fetch_models(self, text_encoder=None):
         self.text_encoder = text_encoder
+        self.tokenizer = HuggingfaceTokenizer(name=tokenizer_path, seq_len=self.text_len, clean="whitespace")
 
     def encode_prompt(self, prompt, positive=True, device="cuda"):
-        prompt = self.process_prompt(prompt, positive=positive)
-
         ids, mask = self.tokenizer(prompt, return_mask=True, add_special_tokens=True)
         ids = ids.to(device)
         mask = mask.to(device)
@@ -143,12 +100,6 @@ class WanPrompter(BasePrompter):
         for i, v in enumerate(seq_lens.tolist()):
             prompt_emb[i, v:] = 0
         return prompt_emb
-
-
-def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
-    # x is fp32 after layer norm
-    # print(f"{shift.dtype = }")
-    return (x * (1 + scale) + shift).to(shift.dtype)
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -240,8 +191,7 @@ class Head(nn.Module):
         return x
 
 
-class WanAudioModel(ModelMixin, ConfigMixin):
-    @register_to_config
+class WanAudioModel(nn.Module):
     def __init__(
         self,
         dim: int,

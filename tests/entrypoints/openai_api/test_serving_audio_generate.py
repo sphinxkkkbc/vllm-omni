@@ -327,6 +327,23 @@ class TestParameterWiring:
         assert sp.extra_args["audio_end_in_s"] == 5.0
 
     @pytest.mark.asyncio
+    async def test_extra_params_merged_into_extra_args(self, server_and_engine):
+        server, engine = server_and_engine
+        req = OpenAICreateAudioGenerateRequest(
+            input="test",
+            audio_length=5.0,
+            extra_params={"sigma_shift": 3.0},
+        )
+        await server.create_audio_generate(req)
+
+        sp = engine.generate.call_args[1]["sampling_params_list"][0]
+        assert sp.extra_args == {
+            "audio_start_in_s": 0.0,
+            "audio_end_in_s": 5.0,
+            "sigma_shift": 3.0,
+        }
+
+    @pytest.mark.asyncio
     async def test_no_audio_length_skips_extra_args(self, server_and_engine):
         server, engine = server_and_engine
         req = OpenAICreateAudioGenerateRequest(input="test")

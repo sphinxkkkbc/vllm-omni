@@ -4,7 +4,6 @@ from collections.abc import Iterable
 from typing import ClassVar
 
 import torch
-from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -13,8 +12,6 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from .wan_audio_pipeline import WanAudioPipeline
-
-logger = init_logger(__name__)
 
 _DIT_PREFIX = "engine.dit."
 _HF_DIT_BLOCK_RENAME = {
@@ -105,6 +102,7 @@ class MossSoundEffectPipeline(torch.nn.Module):
 
     support_audio_output: ClassVar[bool] = True
     audio_sample_rate: ClassVar[int] = 48000
+    supports_request_batch = False
 
     def __init__(
         self,
@@ -127,7 +125,7 @@ class MossSoundEffectPipeline(torch.nn.Module):
         self.device = get_local_device()
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
+                model_or_path=model_root,
                 subfolder="transformer",
                 revision=None,
                 prefix="engine.dit.",
@@ -137,7 +135,7 @@ class MossSoundEffectPipeline(torch.nn.Module):
         scheduler_path = os.path.join(model_root, "scheduler/scheduler_config.json")
         with open(scheduler_path) as f:
             sched_cfg = json.load(f)
-        self.engine = WanAudioPipeline(model_dir=model_root, flow_shift=sched_cfg.get("shift", 5.0))
+        self.engine = WanAudioPipeline(model_dir=model_root, device=self.device, flow_shift=sched_cfg.get("shift", 5.0))
         index_path = os.path.join(model_root, "model_index.json")
         with open(index_path) as f:
             index = json.load(f)
@@ -145,59 +143,48 @@ class MossSoundEffectPipeline(torch.nn.Module):
         self.max_inference_seconds = int(index.get("max_inference_seconds", max_inference_seconds))
 
     @torch.no_grad()
-    def forward(
-        self,
-        prompt: str | list[str],
-        seconds: float = 10.0,
-        num_inference_steps: int = 10,
-        cfg_scale: float = 4.0,
-        sigma_shift: float = 5.0,
-        seed: int = 0,
-        negative_prompt: str = "",
-        append_duration_suffix: bool = True,
-        num_channels: int = 1,
-        max_inference_seconds: int | None = None,
-    ) -> DiffusionOutput:
-        """Run denoising and return a waveform of shape ``(B, C, T)``.
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        """Run denoising for one request and return ``(B, C, T)`` audio.
 
         Args:
-            prompt: A single prompt or a batch of prompts.
-            seconds: Output duration. The pipeline always denoises a fixed-size
-                latent (``max_inference_seconds`` seconds) and the returned
-                tensor is cropped to ``seconds`` worth of samples.
-            num_inference_steps: Number of diffusion solver steps.
-            cfg_scale: Classifier-free guidance weight.
-            sigma_shift: Flow-match shift override applied to the scheduler.
-            seed: RNG seed for the noise initializer.
-            negative_prompt: CFG negative prompt.
-            append_duration_suffix: If True, append ``" duration: <X>s"`` to
-                each prompt (matches training-time convention).
-            num_channels: Output channels (DAC is mono → 1).
-            max_inference_seconds: Override of the configured upper bound.
-            return_dict: If True, return :class:`DiffusionOutput`.
+            req: Request batch containing the prompt and sampling parameters.
         """
-        seconds = round(float(seconds), 1)
-        if seconds <= 0:
-            raise ValueError(f"seconds must be > 0, got {seconds}")
-        full_seconds = int(max_inference_seconds or self.max_inference_seconds)
-        if seconds > full_seconds:
-            raise ValueError(f"seconds={seconds} exceeds max_inference_seconds={full_seconds}")
+        request = req.requests[0]
+        prompt = request.prompt["prompt"]
+        negative_prompt = request.prompt.get("negative_prompt", "")
+        end_s = request.sampling_params.extra_args.get("audio_end_in_s", 10.0)
+        start_s = request.sampling_params.extra_args.get("audio_start_in_s", 0.0)
+        if request.sampling_params.num_inference_steps is not None:
+            num_inference_steps = request.sampling_params.num_inference_steps
+        else:
+            num_inference_steps = 10
+        if request.sampling_params.guidance_scale_provided:
+            cfg_scale = request.sampling_params.guidance_scale
+        else:
+            cfg_scale = 5.0
+        seed = request.sampling_params.seed
+        sigma_shift = request.sampling_params.extra_args.get("sigma_shift", 5.0)
 
-        def _format(p: DiffusionRequestBatch) -> str:
-            # logger.info(f"p: {p}")
-            for _, request in enumerate(p.requests):
-                prompt = request.prompt["prompt"]
-                p = prompt.strip()
-            return f"{p} duration: {seconds:.1f}s" if append_duration_suffix else p
+        end_s = round(float(end_s), 1)
+        if start_s < 0:
+            raise ValueError(f"start_s must be >= 0, got {start_s}")
+        if end_s <= 0:
+            raise ValueError(f"end_s must be > 0, got {end_s}")
+        if end_s <= start_s:
+            raise ValueError(f"end_s={end_s} must be greater than start_s={start_s}")
+        if end_s > self.max_inference_seconds:
+            raise ValueError(f"end_s={end_s} exceeds max_inference_seconds={self.max_inference_seconds}")
+
+        def _format(value: str) -> str:
+            return f"{value.strip()} duration: {end_s:.1f}s"
 
         if isinstance(prompt, (list, tuple)):
             prompts = [_format(p) for p in prompt]
         else:
             prompts = [_format(prompt)]
 
-        num_samples_full = self.sample_rate * full_seconds
-        device_type = str(self.device)
-        with torch.autocast(device_type, dtype=torch.bfloat16):
+        num_samples_full = self.sample_rate * self.max_inference_seconds
+        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
             audio = self.engine(
                 prompt=prompts if len(prompts) > 1 else prompts[0],
                 negative_prompt=negative_prompt,
@@ -206,11 +193,11 @@ class MossSoundEffectPipeline(torch.nn.Module):
                 sigma_shift=float(sigma_shift),
                 num_inference_steps=int(num_inference_steps),
                 num_samples=num_samples_full,
-                num_channels=int(num_channels),
+                num_channels=1,
             )
-
-        output_samples = int(self.sample_rate * seconds)
-        audio = audio[:, :, :output_samples]
+        start_samples = int(self.sample_rate * start_s)
+        end_samples = int(self.sample_rate * end_s)
+        audio = audio[:, :, start_samples:end_samples]
         return DiffusionOutput(output=audio)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

@@ -48,7 +48,7 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
         This endpoint is designed for audio generation models as
         opposed to TTS models that specifically generate speech.
         """
-
+        logger.info(f"request: {request}")
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
@@ -90,10 +90,18 @@ class OmniOpenAIServingAudioGenerate(OpenAIServing, AudioMixin):
                 audio_length = request.audio_length
                 audio_start = request.audio_start if request.audio_start is not None else 0.0
                 audio_end_in_s = audio_start + audio_length
-                sampling_params_list[0].extra_args = {
-                    "audio_start_in_s": audio_start,
-                    "audio_end_in_s": audio_end_in_s,
-                }
+                sampling_params_list[0].extra_args.update(
+                    {
+                        "audio_start_in_s": audio_start,
+                        "audio_end_in_s": audio_end_in_s,
+                    }
+                )
+
+            if request.extra_params is not None:
+                sampling_params_list[0].extra_args.update(request.extra_params)
+
+            if request.seed is not None:
+                sampling_params_list[0].seed = request.seed
 
             logger.info(
                 "Audio generation request %s: prompt=%r",
