@@ -54,15 +54,11 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     serving.engine_client = engine
     serving.model_config = SimpleNamespace(async_chunk=True)
     serving._tts_model_type = "higgs_audio_v3"
-    serving._is_tts = True
     serving._get_tts_adapter = lambda: Adapter()
     serving._track_ref_audio_artifact_warmup = lambda *args, **kwargs: None
 
     _, stage_sampling_params, _ = asyncio.run(serving._prepare_speech_generation(request, request_id="speech-test"))
     stage0_params = stage_sampling_params[0]
-    assert stage0_params.temperature == requested["temperature"]
-    assert stage0_params.top_p == requested["top_p"]
-    assert stage0_params.top_k == requested["top_k"]
 
     monkeypatch.setattr(gpu_input_batch, "PIN_MEMORY", False)
     input_batch = InputBatch(
@@ -94,7 +90,7 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
         skips_model_sampler_output_token_history=True,
-        sample=lambda logits, metadata: received.append((logits, metadata)) or "model-sampler",
+        sample=lambda logits, metadata: received.append(metadata) or "model-sampler",
     )
     runner.sampler = SimpleNamespace()
     logits = torch.zeros((1, 4))
@@ -103,7 +99,7 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
 
     assert output == "model-sampler"
     assert len(received) == 1
-    sampling_metadata = received[0][1]
+    sampling_metadata = received[0]
     torch.testing.assert_close(sampling_metadata.temperature, torch.tensor([requested["temperature"]]))
     torch.testing.assert_close(sampling_metadata.top_p, torch.tensor([requested["top_p"]]))
     assert sampling_metadata.top_k.tolist() == [requested["top_k"]]

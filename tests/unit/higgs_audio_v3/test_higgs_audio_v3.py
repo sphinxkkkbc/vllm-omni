@@ -339,24 +339,12 @@ class TestSamplerMethods:
         assert result.shape == (2,)
         assert result[1].item() == 42
 
-    def test_sampling_metadata_temperature_is_expanded_per_request_and_codebook(self, monkeypatch):
+    def test_sampling_metadata_invalid_temperature_is_sanitized(self, monkeypatch):
         t = self._make_minimal_talker()
         seen = []
         monkeypatch.setattr(
             torch, "multinomial", lambda probs, num_samples: seen.append(probs) or probs.argmax(-1, True)
         )
-        cb_logits = torch.tensor([[[2.0, 1.0]] * 2] * 2)  # [2 requests, 2 VQs, 2 vocab]
-        logits = cb_logits.reshape(-1, cb_logits.shape[-1])
-
-        t._sample_audio_codes(logits, self._sampling_metadata(torch.tensor([0.5, 1.0])), num_codebooks=2)
-
-        assert len(seen) == 1
-        torch.testing.assert_close(seen[0][0], seen[0][1])
-        torch.testing.assert_close(seen[0][2], seen[0][3])
-        assert not torch.allclose(seen[0][0], seen[0][2])
-
-    def test_sampling_metadata_invalid_temperature_is_sanitized(self):
-        t = self._make_minimal_talker()
         logits = torch.tensor([[0.0, 2.0], [3.0, 0.0]])
 
         result = t._sample_audio_codes(
@@ -365,9 +353,11 @@ class TestSamplerMethods:
             num_codebooks=1,
         )
 
-        assert result.shape == (2,)
+        assert len(seen) == 1
+        assert torch.isfinite(seen[0]).all()
+        assert result.tolist() == [1, 0]
 
-    def test_sampling_metadata_top_k_and_top_p_are_expanded_per_vq(self, monkeypatch):
+    def test_sampling_metadata_is_expanded_per_request_and_vq(self, monkeypatch):
         t = self._make_minimal_talker()
         seen = []
         monkeypatch.setattr(
@@ -376,13 +366,17 @@ class TestSamplerMethods:
         cb_logits = torch.tensor([[[4.0, 3.0, 2.0, 1.0]] * 2] * 2)  # [2 requests, 2 VQs, 4 vocab]
         logits = cb_logits.reshape(-1, cb_logits.shape[-1])
         metadata = self._sampling_metadata(
-            temperature=torch.tensor([1.0, 1.0]),
+            temperature=torch.tensor([0.5, 1.0]),
             top_k=torch.tensor([1, 4]),
             top_p=torch.tensor([1.0, 0.8]),
         )
 
+        temperatures, top_ks, top_ps = t._expand_audio_sampling_params(metadata, logits, num_codebooks=2)
         t._sample_audio_codes(logits, metadata, num_codebooks=2)
 
+        torch.testing.assert_close(temperatures, torch.tensor([0.5, 0.5, 1.0, 1.0]))
+        assert top_ks.tolist() == [1, 1, 4, 4]
+        torch.testing.assert_close(top_ps, torch.tensor([1.0, 1.0, 0.8, 0.8]))
         assert len(seen) == 1
         torch.testing.assert_close(seen[0][0], seen[0][1])
         torch.testing.assert_close(seen[0][2], seen[0][3])
