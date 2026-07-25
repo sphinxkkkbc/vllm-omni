@@ -339,6 +339,28 @@ class TestSamplerMethods:
         assert result.shape == (2,)
         assert result[1].item() == 42
 
+    def test_top_k_minus_one_disables_top_k_filtering(self, monkeypatch):
+        t = self._make_minimal_talker()
+        seen_probs = []
+
+        def fake_multinomial(probs, num_samples):
+            seen_probs.append(probs.clone())
+            return probs.argmax(dim=-1, keepdim=True)
+
+        monkeypatch.setattr(torch, "multinomial", fake_multinomial)
+
+        logits = torch.tensor([[4.0, 3.0, 2.0, 1.0]])
+        metadata = self._sampling_metadata(
+            temperature=1.0,
+            top_k=-1,
+            top_p=1.0,
+        )
+
+        t._sample_audio_codes(logits, metadata, num_codebooks=1)
+
+        assert len(seen_probs) == 1
+        assert torch.count_nonzero(seen_probs[0][0]).item() == 4
+
     def test_sampling_metadata_invalid_temperature_is_sanitized(self, monkeypatch):
         t = self._make_minimal_talker()
         seen = []

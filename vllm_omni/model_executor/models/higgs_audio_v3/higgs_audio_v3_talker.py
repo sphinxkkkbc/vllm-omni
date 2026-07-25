@@ -1370,7 +1370,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         """Replicate upstream sampling: temperature → top-k → top-p → multinomial."""
         x = logits_2d.float()
         temperatures, top_ks, top_ps = self._expand_audio_sampling_params(sampling_metadata, x, num_codebooks)
-        top_ks = top_ks.clamp(min=1, max=x.shape[-1])
+        top_ks = torch.where(top_ks <= 0, torch.full_like(top_ks, x.shape[-1]), top_ks)
+        top_ks = top_ks.clamp(max=x.shape[-1])
         top_ps = top_ps.clamp(min=0.0, max=1.0)
         temperatures = torch.where(torch.isfinite(temperatures), temperatures, torch.ones_like(temperatures))
         top_ps = torch.where(torch.isfinite(top_ps), top_ps, torch.ones_like(top_ps))
