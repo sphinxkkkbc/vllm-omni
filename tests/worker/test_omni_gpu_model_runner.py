@@ -99,7 +99,7 @@ class CaptureTalkerMTP(torch.nn.Module):
 
 
 class CaptureSamplingNoiseTalkerMTP(torch.nn.Module):
-    """A fake talker_mtp module that snapshots graph-safe sampling noise."""
+    """A fake talker_mtp module that records graph-safe sampling noise."""
 
     def __init__(self):
         super().__init__()
@@ -125,8 +125,6 @@ class CaptureSamplingNoiseTalkerMTP(torch.nn.Module):
                 "generator": generator,
                 "generators": generators,
                 "sampling_noise": sampling_noise,
-                # The runner reuses and overwrites this buffer on every step.
-                "sampling_noise_snapshot": None if sampling_noise is None else sampling_noise.clone(),
             }
         )
         codes = torch.zeros((req_embeds.shape[0], 1), dtype=torch.int64)
@@ -391,9 +389,9 @@ def test_talker_mtp_forward_batch_seeds_graph_sampling_noise_per_row(monkeypatch
     assert call["generator"] is None
     assert call["generators"] is None
 
-    noise = call["sampling_noise_snapshot"]
-    replay_noise = replay_runner.talker_mtp.calls[0]["sampling_noise_snapshot"]
-    changed_row_noise = changed_row_runner.talker_mtp.calls[0]["sampling_noise_snapshot"]
+    noise = call["sampling_noise"]
+    replay_noise = replay_runner.talker_mtp.calls[0]["sampling_noise"]
+    changed_row_noise = changed_row_runner.talker_mtp.calls[0]["sampling_noise"]
     assert torch.equal(noise, replay_noise)
     assert torch.equal(noise[0], changed_row_noise[0])
     assert not torch.equal(noise[1], changed_row_noise[1])
