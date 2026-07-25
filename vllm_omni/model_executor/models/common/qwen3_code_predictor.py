@@ -664,7 +664,8 @@ class CodePredictorWrapper(nn.Module):
     ) -> torch.Tensor:
         """Sample logits using pre-generated exponential noise or a generator."""
         if sampling_noise is not None:
-            return sample_with_exponential_noise(logits, sampling_noise)
+            scores = logits.float() - sampling_noise.log()
+            return scores.argmax(dim=-1).view(-1)
 
         # Sampling logits via gumbel-max
         row_generators = cls._normalize_generators(generator, int(logits.shape[0]))
