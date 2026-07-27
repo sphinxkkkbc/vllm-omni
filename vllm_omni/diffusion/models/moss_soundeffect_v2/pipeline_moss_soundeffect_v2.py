@@ -365,6 +365,8 @@ class MossSoundEffectPipeline(torch.nn.Module, ProgressBarMixin):
             num_heads=dit_cfg["num_heads"],
             num_layers=dit_cfg["num_layers"],
             vae_type=dit_cfg.get("vae_type", "dac"),
+            quant_config=od_config.quantization_config,
+            prefix=_DIT_PREFIX.rstrip("."),
         )
         index_path = os.path.join(model_root, "model_index.json")
         with open(index_path) as f:
@@ -498,17 +500,15 @@ class MossSoundEffectPipeline(torch.nn.Module, ProgressBarMixin):
                 negative_prompt = [negative_prompt] * batch_size
             negative_context = self._encode_prompt(prompt=negative_prompt, positive=False)
 
+        timesteps = self.scheduler.timesteps.to(device=self.device)
         with self.progress_bar(total=len(self.scheduler.timesteps)) as pbar:
             # Denoise
-            for i, timestep in enumerate(self.scheduler.timesteps):
-                # Timestep
-                timestep = timestep.unsqueeze(0).to(device=self.device)
+            for i, timestep in enumerate(timesteps):
+                timestep = timestep.unsqueeze(0)
 
                 # Inference
-                torch.compiler.cudagraph_mark_step_begin()
                 noise_pred_posi = self._denoise_step(latents=latents, context=context, timestep=timestep)
                 if cfg_scale != 1.0:
-                    noise_pred_posi = noise_pred_posi.clone()
                     noise_pred_nega = self._denoise_step(
                         latents=latents,
                         context=negative_context,
@@ -526,7 +526,6 @@ class MossSoundEffectPipeline(torch.nn.Module, ProgressBarMixin):
 
         return self._decode_audio(latents)
 
-    @torch.compile(options={"triton.cudagraphs": True}, fullgraph=True)
     def _denoise_step(
         self,
         latents: torch.Tensor = None,
@@ -570,20 +569,12 @@ class MossSoundEffectPipeline(torch.nn.Module, ProgressBarMixin):
             x = torch.concat([reference_latents, x], dim=1)
             f += 1
 
-        # freqs is now a registered buffer (moves with model.to(device)). Do not
-        # write Python attributes here so torch.compile can trace through.
-        audio_freqs = dit.freqs
-        freqs = torch.cat(
-            [
-                audio_freqs[0][:f].view(f, -1).expand(f, -1),
-                audio_freqs[1][:f].view(f, -1).expand(f, -1),
-                audio_freqs[2][:f].view(f, -1).expand(f, -1),
-            ],
-            dim=-1,
-        ).reshape(f, 1, -1)
+        # Keep RoPE caches real-valued for the fused rotary kernel.
+        cos = dit.rope_cos_cache[:f].reshape(f, 1, -1)
+        sin = dit.rope_sin_cache[:f].reshape(f, 1, -1)
 
         for block in dit.blocks:
-            x = block(x, context, t_mod, freqs)
+            x = block(x, context, t_mod, (cos, sin))
 
         x = dit.head(x, t)
 
@@ -597,13 +588,44 @@ class MossSoundEffectPipeline(torch.nn.Module, ProgressBarMixin):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.dit.named_parameters())
         loaded_params: set[str] = set()
+        stacked_params_mapping = (
+            (".self_attn.to_qkv", ".self_attn.q", "q"),
+            (".self_attn.to_qkv", ".self_attn.k", "k"),
+            (".self_attn.to_qkv", ".self_attn.v", "v"),
+        )
+        merged_params_mapping = (
+            (".cross_attn.kv", ".cross_attn.k", 0),
+            (".cross_attn.kv", ".cross_attn.v", 1),
+        )
         for name, loaded_weight in weights:
             full_param_name = _rename_dit_weight(name)
             param_name = full_param_name.removeprefix(_DIT_PREFIX)
-            if param_name not in params_dict:
-                continue
-            param = params_dict[param_name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(full_param_name)
+            for fused_name, source_name, shard_id in stacked_params_mapping:
+                if source_name not in param_name:
+                    continue
+                fused_param_name = param_name.replace(source_name, fused_name)
+                if fused_param_name not in params_dict:
+                    continue
+                param = params_dict[fused_param_name]
+                param.weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(f"{_DIT_PREFIX}{fused_param_name}")
+                break
+            else:
+                for merged_name, source_name, shard_id in merged_params_mapping:
+                    if source_name not in param_name:
+                        continue
+                    merged_param_name = param_name.replace(source_name, merged_name)
+                    if merged_param_name not in params_dict:
+                        continue
+                    param = params_dict[merged_param_name]
+                    param.weight_loader(param, loaded_weight, shard_id)
+                    loaded_params.add(f"{_DIT_PREFIX}{merged_param_name}")
+                    break
+                else:
+                    if param_name not in params_dict:
+                        continue
+                    param = params_dict[param_name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(full_param_name)
         return loaded_params
