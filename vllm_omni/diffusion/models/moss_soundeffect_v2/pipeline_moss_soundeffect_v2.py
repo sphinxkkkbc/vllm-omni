@@ -120,7 +120,7 @@ class Qwen3TextEncoder(nn.Module):
         self.dim = self.model.config.hidden_size  # 2048 for Qwen3-1.7B
 
     @torch.no_grad()
-    def forward(self, ids, mask=None):
+    def forward(self, ids: torch.Tensor, mask: torch.Tensor | None = None):
         """
         Args:
             ids:  [batch, seq_len] token ids
