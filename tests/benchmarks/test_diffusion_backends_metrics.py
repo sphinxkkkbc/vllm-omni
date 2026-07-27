@@ -1,7 +1,5 @@
 import io
-import sys
 import wave
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,9 +12,7 @@ from benchmarks.diffusion.backends import (
     endpoint_filename_token,
     normalize_endpoint,
 )
-
-sys.path.insert(0, str(Path(__file__).parents[2] / "benchmarks" / "diffusion"))
-from diffusion_benchmark_serving import (  # noqa: E402
+from benchmarks.diffusion.diffusion_benchmark_serving import (
     _compute_expected_latency_ms_from_base,
     _infer_slo_base_time_ms_from_warmups,
     calculate_metrics,
@@ -45,7 +41,7 @@ class _MockResponse:
 
 
 class _MockSession:
-    def __init__(self, payload):
+    def __init__(self, payload: dict):
         self._payload = payload
         self.last_json = None
 

@@ -100,14 +100,15 @@ from typing import Any
 import aiohttp
 import numpy as np
 import requests
-from backends import (
+from PIL import Image
+from tqdm.asyncio import tqdm
+
+from .backends import (
     RequestFuncInput,
     RequestFuncOutput,
     backends_function_mapping,
     normalize_endpoint,
 )
-from PIL import Image
-from tqdm.asyncio import tqdm
 
 logger = logging.getLogger(__name__)
 
