@@ -3096,6 +3096,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 state.prev_feat_embed = None
                 state.curr_prefix_feat_cond = None
                 state.is_stopping = False
+                state.prompt_cache = None
+                state.prefill_embeds = None
+                state.prefill_masks = None
 
             # Voice clone / continuation
             ref_audio = info_dict.get("reference_audio") or info_dict.get("ref_audio")
