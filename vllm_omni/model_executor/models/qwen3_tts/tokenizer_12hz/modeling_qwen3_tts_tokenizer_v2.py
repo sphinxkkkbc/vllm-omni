@@ -26,9 +26,9 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import MimiConfig, MimiModel
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache, DynamicCache
 from transformers.integrations import use_kernel_forward_from_hub
-from transformers.masking_utils import create_sliding_window_causal_mask
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -521,63 +521,14 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         self.norm = Qwen3TTSTokenizerV2DecoderRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3TTSTokenizerV2DecoderRotatoryEmbedding(config=config)
         self.gradient_checkpointing = False
+        self.has_sliding_layers = "sliding_attention" in self.config.layer_types
         self.window_size = config.sliding_window
 
         self.input_proj = nn.Linear(config.latent_dim, config.hidden_size)
         self.output_proj = nn.Linear(config.hidden_size, config.latent_dim)
 
-        # Code2Wav is cache-free and every decoder layer uses sliding attention.
-        # Cache an exact, compact mask per warmup shape instead of retaining a
-        # max_position_embeddings square buffer. CUDA Graph warmup populates
-        # these entries before capture, and dtype/device are part of the key.
-        self._sliding_attention_mask_cache: dict[tuple[int, torch.dtype, torch.device, str], torch.Tensor | None] = {}
-
         # Initialize weights and apply final processing
         self.post_init()
-
-    def _apply(self, fn, recurse=True):
-        # Cached masks are keyed by dtype/device and should not retain storage
-        # from the model's previous placement.
-        self._sliding_attention_mask_cache.clear()
-        return super()._apply(fn, recurse=recurse)
-
-    def _get_sliding_attention_mask(self, inputs_embeds: torch.Tensor) -> torch.Tensor | None:
-        sequence_length = int(inputs_embeds.shape[1])
-        max_position_embeddings = int(self.config.max_position_embeddings)
-        if sequence_length > max_position_embeddings:
-            raise ValueError(
-                f"Input length {sequence_length} exceeds max_position_embeddings {max_position_embeddings}"
-            )
-
-        attention_implementation = str(self.config._attn_implementation)
-        cache_key = (
-            sequence_length,
-            inputs_embeds.dtype,
-            inputs_embeds.device,
-            attention_implementation,
-        )
-        if cache_key not in self._sliding_attention_mask_cache:
-            # A batch-one mask broadcasts across requests and avoids caching a
-            # duplicate tensor for every batch size.
-            mask_inputs = inputs_embeds[:1]
-            mask_kwargs = {
-                "config": self.config,
-                "attention_mask": None,
-                "past_key_values": None,
-                "position_ids": None,
-            }
-            sig = inspect.signature(create_sliding_window_causal_mask)
-            if "input_embeds" in sig.parameters:
-                mask_kwargs["input_embeds"] = mask_inputs
-                mask_kwargs["cache_position"] = torch.arange(sequence_length, device=inputs_embeds.device)
-            else:
-                mask_kwargs["inputs_embeds"] = mask_inputs
-            sliding_attention_mask = create_sliding_window_causal_mask(**mask_kwargs)
-            if sliding_attention_mask is not None:
-                sliding_attention_mask = sliding_attention_mask.contiguous()
-            self._sliding_attention_mask_cache[cache_key] = sliding_attention_mask
-
-        return self._sliding_attention_mask_cache[cache_key]
 
     # Note: @check_model_inputs decorator removed for vLLM compatibility
     # The decorator causes "unexpected keyword argument 'inputs_embeds'" error
@@ -601,48 +552,44 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
             raise ValueError("input_ids is not expected")
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-        if use_cache:
-            raise ValueError("Code2Wav sliding-mask caching does not support use_cache=True")
-        if past_key_values is not None:
-            raise ValueError("Code2Wav sliding-mask caching does not support past_key_values")
-        if attention_mask is not None and not isinstance(attention_mask, dict):
-            raise ValueError("Code2Wav cached masks require attention_mask to be None or a prepared mask mapping")
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
         inputs_embeds = self.input_proj(inputs_embeds)
 
-        sequence_length = inputs_embeds.shape[1]
-        expected_cache_position = torch.arange(sequence_length, device=inputs_embeds.device)
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
 
         if cache_position is None:
-            cache_position = expected_cache_position
-        elif attention_mask is None and (
-            cache_position.shape != expected_cache_position.shape
-            or cache_position.device != expected_cache_position.device
-            or not torch.equal(cache_position, expected_cache_position)
-        ):
-            raise ValueError("Cached Code2Wav masks require contiguous zero-based cache_position")
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + inputs_embeds.shape[1],
+                device=inputs_embeds.device,
+            )
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
-        elif attention_mask is None:
-            expected_position_ids = expected_cache_position.unsqueeze(0)
-            if (
-                position_ids.ndim != 2
-                or position_ids.shape[-1] != sequence_length
-                or position_ids.device != expected_position_ids.device
-                or not torch.equal(position_ids, expected_position_ids.expand_as(position_ids))
-            ):
-                raise ValueError("Cached Code2Wav masks require contiguous zero-based position_ids")
 
         hidden_states = inputs_embeds
 
-        if isinstance(attention_mask, dict):
-            sliding_attention_mask = attention_mask["sliding_attention"]
-        else:
-            sliding_attention_mask = self._get_sliding_attention_mask(inputs_embeds)
+        if not isinstance(causal_mask_mapping := attention_mask, dict):
+            mask_kwargs = {
+                "config": self.config,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            sig = inspect.signature(create_causal_mask)
+            if "input_embeds" in sig.parameters:
+                mask_kwargs["input_embeds"] = inputs_embeds
+                mask_kwargs["cache_position"] = cache_position
+            else:
+                mask_kwargs["inputs_embeds"] = inputs_embeds
+            causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
+            if self.has_sliding_layers:
+                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -650,7 +597,7 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states = decoder_layer(
                 hidden_states,
-                attention_mask=sliding_attention_mask,
+                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
@@ -663,7 +610,7 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         hidden_states = self.output_proj(hidden_states)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=None,
+            past_key_values=past_key_values if use_cache else None,
         )
 
 
@@ -943,7 +890,8 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         decode_chunk_size: int = 300,
         decode_left_context: int = 25,
     ):
-        from ..cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
+        # from ..cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
+        from ..segmented_graph_wrapper import CUDAGraphDecoderWrapper
 
         if device is None:
             device = next(self.parameters()).device
@@ -955,26 +903,18 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             decoder=self,
             capture_sizes=capture_sizes,
             capture_batch_sizes=capture_batch_sizes,
-            extra_capture_shapes=extra_capture_shapes,
-            compile_shapes=compile_shapes,
             num_quantizers=self.config.num_quantizers,
             enabled=True,
         )
         self._cudagraph_wrapper.warmup(
             device,
             dtype=torch.long,
-            codec_chunk_frames=codec_chunk_frames,
-            codec_left_context_frames=codec_left_context_frames,
-            decode_chunk_size=decode_chunk_size,
-            decode_left_context=decode_left_context,
         )
         self._cudagraph_enabled = True
         logger.info(
-            "CUDA Graph enabled for decoder: batch_sizes=%s seq_lens=%s extra_shapes=%s compile_shapes=%s",
+            "CUDA Graph enabled for decoder: batch_sizes=%s seq_lens=%s",
             self._cudagraph_wrapper.capture_batch_sizes,
             self._cudagraph_wrapper.capture_sizes,
-            self._cudagraph_wrapper.extra_capture_shapes,
-            self._cudagraph_wrapper.compile_shapes,
         )
 
     def _forward_exact(self, codes):
@@ -992,7 +932,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             wav = block(wav)
         return wav.clamp(min=-1, max=1)
 
-    def _decode_icl_first_chunk(self, codes, caches, prefix_frames):
+    def _decode_icl_first_chunk(self, codes, caches, prefix_frames, prefix_cache=None):
         hidden = self.quantizer.decode(codes)
         caches.update({"ref_hidden": hidden[:, :, :prefix_frames]})
 
@@ -1006,6 +946,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             )
         prefix_result = self.pre_transformer(
             inputs_embeds=hidden[:, :prefix_frames, :],
+            past_key_values=prefix_cache,
             use_cache=True,
         )
 
@@ -1046,7 +987,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
     def _decode_cached(self, codes, caches, prefix_frames):
         ref_hidden = caches["ref_hidden"]
-        suffix_codes = codes[:, :, prefix_frames:]
+        suffix_codes = codes
         suffix_frames = suffix_codes.shape[-1]
         quantizer_dummy_frames = max(0, _QUANTIZER_EXACT_LENGTH - suffix_frames) if _QUANTIZER_EXACT_LENGTH > 0 else 0
         suffix_codes = F.pad(
@@ -1129,6 +1070,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         if "ref_wav" not in caches:
             return self._decode_icl_first_chunk(codes, caches, prefix_frames)
         else:
+            codes = codes[:, :, prefix_frames:]
             return self._decode_cached(codes, caches, prefix_frames)
 
     def chunked_decode(
@@ -1140,7 +1082,12 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
     ):
         # Use CUDA graph if enabled
         if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
-            return self._cudagraph_wrapper.chunked_decode_with_cudagraph(codes, chunk_size, left_context_size)
+            return self._cudagraph_wrapper.chunked_decode_with_cudagraph(
+                codes,
+                caches=caches,
+                chunk_size=chunk_size,
+                left_context_size=left_context_size,
+            )
 
         # Original implementation (eager mode)
         wavs = []
@@ -1162,7 +1109,11 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         left_context_size=25,
         max_batch_size=0,
     ):
-        if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
+        if (
+            self._cudagraph_enabled
+            and self._cudagraph_wrapper is not None
+            and hasattr(self._cudagraph_wrapper, "batched_chunked_decode_with_cudagraph")
+        ):
             return self._cudagraph_wrapper.batched_chunked_decode_with_cudagraph(
                 codes,
                 lengths,
