@@ -1033,7 +1033,21 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         caches["ref_conv"] = hidden[:, :0, :]
         caches["suffix_conv"] = hidden
 
-        empty_prefix_cache = DynamicCache(config=self.config)
+        empty_prefix_cache = caches.get("past_key_values")
+        if empty_prefix_cache is None:
+            empty_prefix_cache = DynamicCache(config=self.config)
+            head_dim = getattr(
+                self.config,
+                "head_dim",
+                self.config.hidden_size // self.config.num_attention_heads,
+            )
+            empty_prefix_cache.early_initialization(
+                batch_size=int(codes.shape[0]),
+                num_heads=self.config.num_key_value_heads,
+                head_dim=head_dim,
+                dtype=hidden.dtype,
+                device=hidden.device,
+            )
         working_cache = copy.deepcopy(empty_prefix_cache)
         suffix_hidden = self.pre_transformer(
             inputs_embeds=hidden,

@@ -68,6 +68,10 @@ class CUDAGraphDecoderWrapper:
         self.prefix_attention_masks: dict[int, torch.Tensor] = {}
         self.suffix_attention_masks: dict[int, torch.Tensor] = {}
         self.prefix_static_caches: dict[int, dict] = {}
+        self.xvec_prefix_graphs: dict[int, CUDAGraph] = {}
+        self.xvec_prefix_static_inputs: dict[int, torch.Tensor] = {}
+        self.xvec_prefix_static_outputs: dict[int, torch.Tensor] = {}
+        self.xvec_prefix_static_caches: dict[int, dict] = {}
 
         self._device = None
         self.prefix_length = int(getattr(self.decoder.config, "sliding_window", 0) or 0)
@@ -132,7 +136,7 @@ class CUDAGraphDecoderWrapper:
 
     def _derive_xvec_suffix_transitions(self) -> dict[int, int]:
         transitions: dict[int, int] = {}
-        previous = self.codec_chunk_frames
+        previous = self.initial_chunk_frames
         while previous < self.prefix_length:
             target = previous + self.codec_chunk_frames
             transitions[target] = previous
@@ -142,6 +146,13 @@ class CUDAGraphDecoderWrapper:
 
     def _transitions_for_mode(self, mode: str) -> dict[int, int]:
         return self._xvec_previous_frames_by_target if mode == "xvec" else self._previous_frames_by_target
+
+    def _cached_conv_frames(self, mode: str, previous_frames: int) -> int:
+        capacity = self.prefix_length - 2
+        if mode != "xvec" or previous_frames == self.initial_chunk_frames:
+            return min(previous_frames, capacity)
+        missing_initial_context = max(0, 2 - self.initial_chunk_frames)
+        return min(previous_frames - missing_initial_context, capacity)
 
     def _record_graph_hit(self, phase: str, batch_size: int, request_count: int) -> None:
         if not getattr(self, "_stats_enabled", False):
@@ -272,12 +283,25 @@ class CUDAGraphDecoderWrapper:
     ) -> dict:
         config = self.decoder.config
         boundary_frames = 2 if previous_frames >= self.prefix_length else 0
+        head_dim = getattr(
+            config,
+            "head_dim",
+            config.hidden_size // config.num_attention_heads,
+        )
+        empty_prefix_cache = DynamicCache(config=config)
+        empty_prefix_cache.early_initialization(
+            batch_size=batch_size,
+            num_heads=config.num_key_value_heads,
+            head_dim=head_dim,
+            dtype=model_dtype,
+            device=device,
+        )
         return {
             "ref_hidden": torch.zeros(
                 batch_size, config.codebook_dim, boundary_frames, device=device, dtype=model_dtype
             ),
             "ref_conv": torch.zeros(batch_size, 0, config.latent_dim, device=device, dtype=model_dtype),
-            "past_key_values": DynamicCache(config=config),
+            "past_key_values": empty_prefix_cache,
             "prefix_hidden": torch.zeros(batch_size, 0, config.latent_dim, device=device, dtype=model_dtype),
             "ref_upsample": torch.zeros(batch_size, config.latent_dim, 0, device=device, dtype=model_dtype),
             "ref_wav": torch.zeros(batch_size, 1, 0, device=device, dtype=model_dtype),
@@ -308,6 +332,11 @@ class CUDAGraphDecoderWrapper:
                 logger.info("  Captured prefix CUDA Graph for batch=%d", batch_size)
             except Exception:
                 logger.warning("  Failed to capture prefix CUDA Graph for batch=%d", batch_size, exc_info=True)
+            try:
+                self._capture_xvec_prefix(batch_size, device, dtype)
+                logger.info("  Captured xvec prefix CUDA Graph for batch=%d", batch_size)
+            except Exception:
+                logger.warning("  Failed to capture xvec prefix CUDA Graph for batch=%d", batch_size, exc_info=True)
 
         logger.info(
             "Starting CUDA Graph warmup for %d shapes: batch_sizes=%s seq_lens=%s",
@@ -344,7 +373,7 @@ class CUDAGraphDecoderWrapper:
                         exc_info=True,
                     )
 
-        self._warmed_up = bool(self.prefix_graphs) or bool(self.combined_graphs)
+        self._warmed_up = bool(self.prefix_graphs) or bool(self.xvec_prefix_graphs) or bool(self.combined_graphs)
 
     def _run_combined_suffix(
         self,
@@ -393,7 +422,7 @@ class CUDAGraphDecoderWrapper:
         )
         static_conv = torch.zeros(
             batch_size,
-            min(previous_frames, self.prefix_length - 2),
+            self._cached_conv_frames(mode, previous_frames),
             self.decoder.config.latent_dim,
             dtype=model_dtype,
             device=device,
@@ -500,6 +529,44 @@ class CUDAGraphDecoderWrapper:
         self.suffix_attention_masks[batch_size] = suffix_attention_mask
         self.prefix_static_caches[batch_size] = caches
 
+    def _capture_xvec_prefix(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> None:
+        static_input = torch.zeros(
+            batch_size,
+            self.num_quantizers,
+            self.initial_chunk_frames,
+            dtype=dtype,
+            device=device,
+        )
+        with torch.no_grad():
+            _ = self.decoder._decode_xvec_first_chunk(static_input, {})
+        torch.accelerator.synchronize(device)
+
+        config = self.decoder.config
+        model_dtype = next(self.decoder.parameters()).dtype
+        head_dim = getattr(
+            config,
+            "head_dim",
+            config.hidden_size // config.num_attention_heads,
+        )
+        prefix_cache = DynamicCache(config=config)
+        prefix_cache.early_initialization(
+            batch_size=batch_size,
+            num_heads=config.num_key_value_heads,
+            head_dim=head_dim,
+            dtype=model_dtype,
+            device=device,
+        )
+        caches: dict = {"past_key_values": prefix_cache}
+        graph = CUDAGraph()
+        with torch.no_grad():
+            with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+                static_output = self.decoder._decode_xvec_first_chunk(static_input, caches)
+
+        self.xvec_prefix_graphs[batch_size] = graph
+        self.xvec_prefix_static_inputs[batch_size] = static_input
+        self.xvec_prefix_static_outputs[batch_size] = static_output
+        self.xvec_prefix_static_caches[batch_size] = caches
+
     def _decode_icl_prefix(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
         batch_size = int(codes.shape[0])
         if batch_size != 1 or batch_size not in self.prefix_graphs or torch.cuda.is_current_stream_capturing():
@@ -576,6 +643,10 @@ class CUDAGraphDecoderWrapper:
             request_kv.layers,
             strict=True,
         ):
+            if request_layer.keys is None or request_layer.values is None:
+                if static_layer.keys.numel() == 0 and static_layer.values.numel() == 0:
+                    continue
+                raise RuntimeError("Uninitialized request KV cache cannot populate a non-empty graph cache")
             static_layer.keys.copy_(request_layer.keys)
             static_layer.values.copy_(request_layer.values)
 
@@ -590,6 +661,10 @@ class CUDAGraphDecoderWrapper:
                 request_cache["past_key_values"].layers,
                 strict=True,
             ):
+                if request_layer.keys is None or request_layer.values is None:
+                    if static_layer.keys.numel() == 0 and static_layer.values.numel() == 0:
+                        continue
+                    raise RuntimeError("Uninitialized request KV cache cannot populate a non-empty graph cache")
                 static_layer.keys[row : row + 1].copy_(request_layer.keys)
                 static_layer.values[row : row + 1].copy_(request_layer.values)
 
@@ -625,6 +700,9 @@ class CUDAGraphDecoderWrapper:
         available = set(self.prefix_graphs)
         if torch.cuda.is_current_stream_capturing():
             self._record_graph_fallback("prefix:capture", len(codes_list))
+            return None
+        if not available:
+            self._record_graph_fallback("prefix:no_graph", len(codes_list))
             return None
         if len(codes_list) > max(available, default=0):
             outputs: list[torch.Tensor] = []
@@ -688,6 +766,60 @@ class CUDAGraphDecoderWrapper:
             outputs.append(self.prefix_static_outputs[batch_size][row : row + 1, :, start:].clone())
         return outputs
 
+    def _decode_xvec_prefix_batch(
+        self,
+        codes_list: list[torch.Tensor],
+        request_caches: list[dict],
+    ) -> list[torch.Tensor] | None:
+        available = set(getattr(self, "xvec_prefix_graphs", {}))
+        if not available:
+            self._record_graph_fallback("xvec_prefix:no_graph", len(codes_list))
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            self._record_graph_fallback("xvec_prefix:capture", len(codes_list))
+            return None
+        if any(int(codes.shape[-1]) != self.initial_chunk_frames for codes in codes_list):
+            self._record_graph_fallback("xvec_prefix:shape", len(codes_list))
+            return None
+        if len(codes_list) > max(available, default=0):
+            outputs: list[torch.Tensor] = []
+            for start, end in self._split_for_graph_buckets(len(codes_list), available):
+                chunk_outputs = self._decode_xvec_prefix_batch(
+                    codes_list[start:end],
+                    request_caches[start:end],
+                )
+                if chunk_outputs is None:
+                    return None
+                outputs.extend(chunk_outputs)
+            return outputs
+
+        batch_size = self._select_batch_bucket(len(codes_list), available)
+        if batch_size is None:
+            self._record_graph_fallback("xvec_prefix:no_graph", len(codes_list))
+            return None
+
+        static_input = self.xvec_prefix_static_inputs[batch_size]
+        static_input.zero_()
+        for row, codes in enumerate(codes_list):
+            static_input[row].copy_(codes[0])
+
+        self.xvec_prefix_graphs[batch_size].replay()
+        self._record_graph_hit("xvec_prefix", batch_size, len(codes_list))
+        static_caches = self.xvec_prefix_static_caches[batch_size]
+        outputs: list[torch.Tensor] = []
+        tensor_keys = ("ref_hidden", "ref_conv", "prefix_hidden", "ref_upsample", "ref_wav")
+        for row, cache in enumerate(request_caches):
+            for key in tensor_keys:
+                cache[key] = static_caches[key][row : row + 1].clone()
+            cache["past_key_values"] = self._slice_dynamic_cache(static_caches["past_key_values"], row)
+            cache["decoder_prefix_frames"] = 0
+            cache["suffix_quantized"] = static_caches["suffix_quantized"][row : row + 1].clone()
+            cache["suffix_conv"] = static_caches["suffix_conv"][row : row + 1].clone()
+            cache["suffix_frames"] = self.initial_chunk_frames
+            self._ensure_suffix_buffers(cache)
+            outputs.append(self.xvec_prefix_static_outputs[batch_size][row : row + 1].clone())
+        return outputs
+
     def _decode_suffix_batch(
         self,
         mode: str,
@@ -703,6 +835,9 @@ class CUDAGraphDecoderWrapper:
         }
         if torch.cuda.is_current_stream_capturing():
             self._record_graph_fallback(f"suffix_{target_frames}:capture", len(codes_list))
+            return None
+        if not available:
+            self._record_graph_fallback(f"suffix_{target_frames}:no_graph", len(codes_list))
             return None
         if len(codes_list) > max(available, default=0):
             outputs: list[torch.Tensor] = []
@@ -839,6 +974,8 @@ class CUDAGraphDecoderWrapper:
             group_outputs: list[torch.Tensor] | None = None
             if phase == "prefix":
                 group_outputs = self._decode_prefix_batch(group_codes, group_caches)
+            elif phase == "xvec_first":
+                group_outputs = self._decode_xvec_prefix_batch(group_codes, group_caches)
             elif phase.startswith("suffix:"):
                 mode = phase.removeprefix("suffix:")
                 suffix_codes = [
