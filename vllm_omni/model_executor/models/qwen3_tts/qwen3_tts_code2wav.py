@@ -451,6 +451,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 pass
 
         wav_tensors: list[torch.Tensor | None] = [None] * len(valid_codes_qf)
+        wav_is_incremental: list[bool] = [False] * len(valid_codes_qf)
 
         def _decode_group_chunks(
             group_chunks: list[list[tuple[int, torch.Tensor]]], states: dict[str, Any] | None
@@ -516,6 +517,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                     )
                 for row, (j, _) in enumerate(group_chunk):
                     wav_tensors[j] = wav_rows[row]
+                    wav_is_incremental[j] = bool(states and states.get("_last_output_incremental_audio", False))
 
         # Group by configured frame buckets instead of only exact lengths.
         # For ordinary async streaming windows this is the real batching
@@ -555,9 +557,13 @@ class Qwen3TTSCode2Wav(nn.Module):
             ctx_frames, actual_frames = parsed[idx]
             wav = wav_tensors[j]
             assert wav is not None
-            # Slice on exact codec-frame boundaries instead of proportionally.
-            start = max(0, ctx_frames * upsample)
-            end = max(start, actual_frames * upsample)
+            if wav_is_incremental[j]:
+                start = 0
+                end = max(0, (actual_frames - ctx_frames) * upsample)
+            else:
+                # Slice on exact codec-frame boundaries instead of proportionally.
+                start = max(0, ctx_frames * upsample)
+                end = max(start, actual_frames * upsample)
             if start >= wav.shape[0]:
                 logger.warning(
                     "Context trim start %d >= decoded length %d; returning empty audio.",

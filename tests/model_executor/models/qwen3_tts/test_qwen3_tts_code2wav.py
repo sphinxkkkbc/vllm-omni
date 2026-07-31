@@ -183,6 +183,32 @@ def test_forward_trims_trailing_padding_without_context():
     torch.testing.assert_close(audio, expected)
 
 
+def test_forward_does_not_retrim_incremental_decoder_output():
+    model = _make_model()
+
+    def _incremental_decode(codes, *, caches, **_kwargs):
+        caches["_last_output_incremental_audio"] = True
+        return torch.arange(16, dtype=torch.float32).view(1, 1, -1)
+
+    model.decoder.chunked_decode = _incremental_decode
+    out = model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),
+        runtime_additional_information=[
+            {
+                "meta": {
+                    "left_context_size": 2,
+                    "ref_context_size": 2,
+                    "ref_context_request_id": "rid",
+                    "ref_context_included": True,
+                }
+            }
+        ],
+    )
+
+    audio = out.multimodal_outputs["model_outputs"][0]
+    torch.testing.assert_close(audio, torch.arange(8, dtype=torch.float32))
+
+
 def test_forward_reuses_cached_ref_context_for_followup_chunk():
     model = _make_model()
 
