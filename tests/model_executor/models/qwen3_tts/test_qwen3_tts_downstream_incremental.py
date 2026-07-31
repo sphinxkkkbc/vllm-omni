@@ -63,6 +63,7 @@ def test_segmented_capture_sizes_are_derived_from_decoder_and_chunk_config():
     assert wrapper.prefix_length == 10
     assert wrapper.capture_sizes == [6, 10, 14]
     assert wrapper._previous_frames_by_target == {6: 2, 10: 6, 14: 10}
+    assert wrapper._xvec_previous_frames_by_target == {8: 4, 12: 8, 14: 10}
 
 
 def test_graph_prefix_cache_keeps_physical_prefix_length(monkeypatch):
@@ -95,6 +96,7 @@ def test_batched_chunked_decode_groups_exact_phases(monkeypatch):
     wrapper.initial_chunk_frames = 1
     wrapper.codec_chunk_frames = 25
     wrapper._previous_frames_by_target = {26: 1, 51: 26, 76: 51, 97: 72}
+    wrapper._xvec_previous_frames_by_target = {50: 25, 75: 50, 97: 72}
     wrapper.decoder = SimpleNamespace(_is_suffix_cache_rolling=lambda previous, cached: previous >= 72 and cached == 72)
     calls: list[tuple[str, int, int]] = []
 
@@ -102,8 +104,8 @@ def test_batched_chunked_decode_groups_exact_phases(monkeypatch):
         calls.append(("prefix", 0, len(codes)))
         return [torch.full((1, 1, 1), 1.0) for _ in codes]
 
-    def _suffix(target, codes, caches, new_frames):
-        calls.append(("suffix", target, len(codes)))
+    def _suffix(mode, target, codes, caches, new_frames):
+        calls.append((f"suffix:{mode}", target, len(codes)))
         return [torch.full((1, 1, 1), float(target)) for _ in codes]
 
     monkeypatch.setattr(wrapper, "_decode_prefix_batch", _prefix)
@@ -143,10 +145,10 @@ def test_batched_chunked_decode_groups_exact_phases(monkeypatch):
 
     assert calls == [
         ("prefix", 0, 1),
-        ("suffix", 26, 1),
-        ("suffix", 51, 1),
-        ("suffix", 76, 1),
-        ("suffix", 97, 1),
+        ("suffix:icl", 26, 1),
+        ("suffix:icl", 51, 1),
+        ("suffix:icl", 76, 1),
+        ("suffix:icl", 97, 1),
     ]
     assert [int(output.item()) for output in outputs] == [1, 26, 51, 76, 97]
     assert [cache["_last_output_incremental_audio"] for cache in caches] == [False, True, True, True, True]
@@ -163,13 +165,15 @@ def test_batched_suffix_graph_updates_ping_pong_buffers(monkeypatch):
     wrapper.prefix_length = 72
     wrapper.codec_chunk_frames = 25
     wrapper._previous_frames_by_target = {26: 1, 51: 26, 76: 51, 97: 72}
+    wrapper._xvec_previous_frames_by_target = {50: 25, 75: 50, 97: 72}
     wrapper.capture_batch_sizes = [1, 2]
-    wrapper.combined_graphs = {(2, 26): type("_Graph", (), {"replay": lambda self: None})()}
-    wrapper.combined_static_codes = {(2, 26): torch.zeros(2, 2, 25)}
-    wrapper.combined_static_quantized = {(2, 26): torch.zeros(2, 2, 1)}
-    wrapper.combined_static_conv = {(2, 26): torch.zeros(2, 1, 3)}
-    wrapper.combined_static_masks = {(2, 26): torch.ones(2, 98, dtype=torch.bool)}
-    wrapper.combined_static_caches = {(2, 26): {}}
+    key = ("icl", 2, 26)
+    wrapper.combined_graphs = {key: type("_Graph", (), {"replay": lambda self: None})()}
+    wrapper.combined_static_codes = {key: torch.zeros(2, 2, 25)}
+    wrapper.combined_static_quantized = {key: torch.zeros(2, 2, 1)}
+    wrapper.combined_static_conv = {key: torch.zeros(2, 1, 3)}
+    wrapper.combined_static_masks = {key: torch.ones(2, 98, dtype=torch.bool)}
+    wrapper.combined_static_caches = {key: {}}
     graph_output = torch.stack(
         [
             torch.arange(50, dtype=torch.float32).view(1, -1),
@@ -178,7 +182,7 @@ def test_batched_suffix_graph_updates_ping_pong_buffers(monkeypatch):
     )
     graph_next_quantized = torch.stack([torch.full((2, 26), 1.0), torch.full((2, 26), 2.0)])
     graph_next_conv = torch.stack([torch.full((26, 3), 3.0), torch.full((26, 3), 4.0)])
-    wrapper.combined_static_outputs = {(2, 26): (graph_output, graph_next_quantized, graph_next_conv)}
+    wrapper.combined_static_outputs = {key: (graph_output, graph_next_quantized, graph_next_conv)}
     wrapper.decoder = type("_Decoder", (), {"total_upsample": 2})()
     monkeypatch.setattr(wrapper, "_copy_request_caches_to_batch", lambda caches, static: None)
 
@@ -192,7 +196,7 @@ def test_batched_suffix_graph_updates_ping_pong_buffers(monkeypatch):
     ]
     codes = [torch.zeros(1, 2, 26) for _ in range(2)]
 
-    outputs = wrapper._decode_suffix_batch(26, codes, caches, [25, 25])
+    outputs = wrapper._decode_suffix_batch("icl", 26, codes, caches, [25, 25])
 
     assert outputs is not None
     assert [cache["_suffix_buffer_index"] for cache in caches] == [1, 1]
@@ -202,6 +206,38 @@ def test_batched_suffix_graph_updates_ping_pong_buffers(monkeypatch):
     torch.testing.assert_close(caches[1]["suffix_quantized"], torch.full((1, 2, 26), 2.0))
     torch.testing.assert_close(caches[0]["suffix_conv"], torch.full((1, 26, 3), 3.0))
     torch.testing.assert_close(caches[1]["suffix_conv"], torch.full((1, 26, 3), 4.0))
+
+
+def test_xvec_first_chunk_uses_prefixless_initializer(monkeypatch):
+    wrapper = CUDAGraphDecoderWrapper.__new__(CUDAGraphDecoderWrapper)
+    wrapper.prefix_length = 72
+    wrapper.initial_chunk_frames = 1
+    wrapper.codec_chunk_frames = 25
+    wrapper._previous_frames_by_target = {26: 1}
+    wrapper._xvec_previous_frames_by_target = {50: 25}
+    calls = []
+    wrapper.decoder = SimpleNamespace(
+        _decode_xvec_first_chunk=lambda codes, cache: calls.append("xvec") or codes[:, :1, :],
+    )
+
+    output = wrapper._batched_request_decode(
+        [torch.zeros(1, 2, 25)],
+        [{"prefix_frames": 0}],
+    )
+
+    assert calls == ["xvec"]
+    assert output[0].shape == (1, 1, 25)
+
+
+def test_xvec_boundary_is_saved_before_suffix_cache_rolls():
+    wrapper = CUDAGraphDecoderWrapper.__new__(CUDAGraphDecoderWrapper)
+    wrapper.prefix_length = 72
+    cached = torch.arange(72, dtype=torch.float32).view(1, 1, 72)
+
+    boundary = wrapper._get_xvec_boundary({"suffix_quantized": cached}, cached_frames=51, new_frames=25)
+
+    assert boundary is not None
+    torch.testing.assert_close(boundary, cached[:, :, 2:4])
 
 
 def test_incremental_downstream_matches_full_decode_tail():
@@ -235,3 +271,40 @@ def test_incremental_downstream_matches_full_decode_tail():
         actual = decoder._decode_downstream_incremental(hidden, new_frames)
 
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_xvec_prefixless_incremental_matches_full_decode_tail():
+    torch.manual_seed(1)
+    config = Qwen3TTSTokenizerV2DecoderConfig(
+        codebook_size=32,
+        hidden_size=16,
+        latent_dim=16,
+        codebook_dim=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_quantizers=2,
+        decoder_dim=32,
+        upsample_rates=(8, 5, 4, 3),
+        upsampling_ratios=(2, 2),
+        sliding_window=72,
+    )
+    decoder = Qwen3TTSTokenizerV2Decoder(config).eval()
+    codes = torch.randint(0, config.codebook_size, (1, config.num_quantizers, 50))
+    caches = {"prefix_frames": 0}
+
+    with torch.no_grad():
+        first = decoder(codes[..., :25], caches=caches)
+        incremental = decoder(codes, caches=caches)
+        full = decoder._forward_exact(codes)
+
+    assert first.shape[-1] == 25 * decoder.total_upsample
+    assert caches["decoder_prefix_frames"] == 0
+    assert caches["suffix_frames"] == 50
+    torch.testing.assert_close(
+        incremental,
+        full[..., -25 * decoder.total_upsample :],
+        atol=1e-5,
+        rtol=1e-4,
+    )

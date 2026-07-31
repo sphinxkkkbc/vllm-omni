@@ -231,6 +231,7 @@ def talker2code2wav_async_chunk(
     )
 
     meta = MetaStruct(
+        request_id=request_id,
         left_context_size=left_context_size,
         finished=torch.tensor(finished, dtype=torch.bool),
     )

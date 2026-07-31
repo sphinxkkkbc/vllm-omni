@@ -326,6 +326,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
         ref_context_size = [0] * len(request_ids_list)
+        request_state_ids: list[str | None] = [None] * len(request_ids_list)
         ref_context_request_ids: list[str | None] = [None] * len(request_ids_list)
         ref_context_included = [False] * len(request_ids_list)
         finished_flags = [False] * len(request_ids_list)
@@ -364,6 +365,8 @@ class Qwen3TTSCode2Wav(nn.Module):
                     ref_context_size[i] = _meta_int(meta["ref_context_size"])
                 if "ref_context_request_id" in meta:
                     ref_context_request_ids[i] = _meta_str(meta["ref_context_request_id"])
+                if "request_id" in meta:
+                    request_state_ids[i] = _meta_str(meta["request_id"])
                 if "ref_context_included" in meta:
                     ref_context_included[i] = _meta_bool(meta["ref_context_included"])
                 if "finished" in meta:
@@ -395,6 +398,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             # [q*F] -> [Q, F] for direct decoder call (decoder expects [B, Q, F])
             codes_qf = flat.reshape(q, frames)
             ref_req_id = ref_context_request_ids[i]
+            state_req_id = request_state_ids[i] or ref_req_id
             if ref_req_id is not None and ref_ctx_frames > 0:
                 if ref_context_included[i]:
                     if frames < ref_ctx_frames:
@@ -414,11 +418,15 @@ class Qwen3TTSCode2Wav(nn.Module):
                     codes_qf = torch.cat((cached_ref, codes_qf), dim=1)
                     frames = int(codes_qf.shape[1])
             parsed.append((ctx_frames, frames))
-            valid_codes_qf.append((ref_req_id, codes_qf))
-            if ref_req_id is not None:
-                state = self._decoder_state_cache.setdefault(ref_req_id, {})
+            valid_codes_qf.append((state_req_id, codes_qf))
+            if state_req_id is not None:
+                state = self._decoder_state_cache.setdefault(state_req_id, {})
+                state.setdefault("prefix_frames", 0)
                 if ref_ctx_frames > 0:
                     cached_prefix_frames = state.setdefault("prefix_frames", ref_ctx_frames)
+                    if cached_prefix_frames == 0:
+                        state["prefix_frames"] = ref_ctx_frames
+                        cached_prefix_frames = ref_ctx_frames
                     if cached_prefix_frames != ref_ctx_frames:
                         raise ValueError(
                             "Qwen3-TTS ref context size changed within request "
@@ -616,9 +624,17 @@ class Qwen3TTSCode2Wav(nn.Module):
                 # Decoder already runs in fp32, so the .to(float32) is a redundant dispatch.
                 audios[idx] = (wav if wav.dtype == torch.float32 else wav.to(torch.float32)).reshape(-1)
 
-        for req_id, finished in zip(ref_context_request_ids, finished_flags, strict=False):
-            if req_id is not None and finished:
-                self._pop_ref_context(req_id)
+        for req_id, ref_req_id, finished in zip(
+            request_state_ids,
+            ref_context_request_ids,
+            finished_flags,
+            strict=False,
+        ):
+            state_req_id = req_id or ref_req_id
+            if state_req_id is not None and finished:
+                self._decoder_state_cache.pop(state_req_id, None)
+            if ref_req_id is not None and finished:
+                self._pop_ref_context(ref_req_id)
 
         return OmniOutput(
             text_hidden_states=None,

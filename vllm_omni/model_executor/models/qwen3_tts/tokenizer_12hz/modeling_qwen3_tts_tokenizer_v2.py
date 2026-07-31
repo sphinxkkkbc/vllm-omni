@@ -1022,6 +1022,40 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             boundary_conv = boundary_conv[:, :, _CONV_CONTEXT_FRAME:].transpose(1, 2)
         return new_quantized, new_conv, boundary_conv
 
+    def _decode_xvec_first_chunk(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
+        """Initialize prefixless incremental state from the first codec chunk."""
+        hidden = self.quantizer.decode(codes)
+        caches["decoder_prefix_frames"] = 0
+        caches["ref_hidden"] = hidden[:, :, :0]
+        caches["suffix_quantized"] = hidden
+
+        hidden = self.pre_conv(hidden).transpose(1, 2)
+        caches["ref_conv"] = hidden[:, :0, :]
+        caches["suffix_conv"] = hidden
+
+        empty_prefix_cache = DynamicCache(config=self.config)
+        working_cache = copy.deepcopy(empty_prefix_cache)
+        suffix_hidden = self.pre_transformer(
+            inputs_embeds=hidden,
+            past_key_values=working_cache,
+            use_cache=True,
+        ).last_hidden_state
+        caches["past_key_values"] = empty_prefix_cache
+        caches["prefix_hidden"] = suffix_hidden[:, :0, :]
+
+        hidden = suffix_hidden.permute(0, 2, 1)
+        for blocks in self.upsample:
+            for block in blocks:
+                hidden = block(hidden)
+        caches["ref_upsample"] = hidden[:, :, :0]
+
+        wav = hidden
+        for block in self.decoder:
+            wav = block(wav)
+        caches["ref_wav"] = wav[:, :, :0]
+        caches["suffix_frames"] = int(codes.shape[-1])
+        return wav.clamp(min=-1, max=1)
+
     def _decode_suffix_incremental(
         self,
         new_codes: torch.Tensor,
@@ -1132,6 +1166,14 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             device=codes.device,
         )
         attention_mask[:, : int(caches.get("prefix_pad_frames", 0))] = 0
+        xvec_boundary = None
+        if prefix_frames == 0:
+            combined_frames = cached_frames + new_frames
+            boundary_start = combined_frames - suffix_cache_length - _CONV_CONTEXT_FRAME
+            if boundary_start >= 0 and boundary_start + _CONV_CONTEXT_FRAME <= cached_frames:
+                xvec_boundary = caches["suffix_quantized"][
+                    :, :, boundary_start : boundary_start + _CONV_CONTEXT_FRAME
+                ].clone()
         output, next_quantized, next_conv = self._decode_suffix_incremental(
             codes[:, :, -new_frames:],
             caches["suffix_quantized"],
@@ -1144,6 +1186,8 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         )
         caches["suffix_quantized"] = next_quantized
         caches["suffix_conv"] = next_conv
+        if xvec_boundary is not None:
+            caches["ref_hidden"] = xvec_boundary
         caches["suffix_frames"] = retained_frames + new_frames
         return output
 
@@ -1156,12 +1200,14 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             return wav
 
         prefix_frames = int(caches["prefix_frames"])
-        if prefix_frames <= 0 or codes.shape[-1] < prefix_frames:
+        if prefix_frames < 0 or codes.shape[-1] < prefix_frames:
             raise ValueError(
                 "Qwen3-TTS ICL prefix cache received invalid frame counts: "
                 f"prefix_frames={prefix_frames}, total_frames={codes.shape[-1]}"
             )
 
+        if "ref_wav" not in caches and prefix_frames == 0:
+            return self._decode_xvec_first_chunk(codes, caches)
         if "ref_wav" not in caches:
             return self._decode_icl_first_chunk(codes, caches, prefix_frames)
         else:
