@@ -229,6 +229,24 @@ def test_forward_does_not_retrim_incremental_decoder_output():
     torch.testing.assert_close(audio, torch.arange(8, dtype=torch.float32))
 
 
+def test_request_aware_forward_passes_only_delta_frames_to_decoder():
+    model = _make_model()
+
+    model.forward(
+        input_ids=torch.arange(6, dtype=torch.long),
+        runtime_additional_information=[{"meta": {"request_id": "rid", "left_context_size": 0}}],
+    )
+    model.forward(
+        input_ids=torch.arange(4, dtype=torch.long),
+        runtime_additional_information=[{"meta": {"request_id": "rid", "left_context_size": 0}}],
+    )
+
+    assert [tuple(codes.shape) for codes in model.decoder.decode_codes[-2:]] == [
+        (1, _NUM_QUANTIZERS, 3),
+        (1, _NUM_QUANTIZERS, 2),
+    ]
+
+
 def test_forward_reuses_cached_ref_context_for_followup_chunk():
     model = _make_model()
 
@@ -652,10 +670,7 @@ def test_decode_chunking_override_is_passed_to_cudagraph():
     _load_weights_noop(model)
 
     assert model.decoder.cudagraph_calls[-1] == {
-        "capture_sizes": None,
         "capture_batch_sizes": None,
-        "extra_capture_shapes": None,
-        "compile_shapes": None,
         "device": torch.device("cuda"),
         "codec_chunk_frames": 25,
         "codec_left_context_frames": 72,
@@ -665,7 +680,7 @@ def test_decode_chunking_override_is_passed_to_cudagraph():
     }
 
 
-def test_cudagraph_capture_shapes_can_be_configured():
+def test_cudagraph_shape_config_is_ignored_but_batch_config_is_preserved():
     model = _make_model(
         async_chunk=True,
         device=torch.device("cuda"),
@@ -681,12 +696,12 @@ def test_cudagraph_capture_shapes_can_be_configured():
     _load_weights_noop(model)
 
     call = model.decoder.cudagraph_calls[-1]
-    assert call["capture_sizes"] == [97, 325]
     assert call["capture_batch_sizes"] == [1, 2, 4, 8]
-    assert call["extra_capture_shapes"] == [(3, 325), (5, 325)]
+    assert "capture_sizes" not in call
+    assert "extra_capture_shapes" not in call
 
 
-def test_decode_compile_shapes_can_be_configured():
+def test_decode_compile_shapes_are_ignored():
     model = _make_model(
         async_chunk=True,
         device=torch.device("cuda"),
@@ -700,7 +715,7 @@ def test_decode_compile_shapes_can_be_configured():
     _load_weights_noop(model)
 
     call = model.decoder.cudagraph_calls[-1]
-    assert call["compile_shapes"] == [(1, 73), (1, 325)]
+    assert "compile_shapes" not in call
 
 
 def test_decode_tf32_can_be_configured():

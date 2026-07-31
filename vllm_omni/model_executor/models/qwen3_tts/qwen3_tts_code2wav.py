@@ -147,10 +147,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         codec_chunk_frames: int,
         codec_left_context_frames: int,
         initial_codec_chunk_frames: int,
-        decode_cudagraph_capture_sizes: list[int] | None,
         decode_cudagraph_batch_sizes: list[int] | None,
-        decode_cudagraph_extra_capture_shapes: list[tuple[int, int]] | None,
-        decode_compile_shapes: list[tuple[int, int]] | None,
     ) -> None:
         """Enable inner Code2Wav CUDA graph unless stage is enforce_eager."""
         if not hasattr(self.decoder, "enable_cudagraph") or device.type != "cuda":
@@ -179,10 +176,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             )
 
         self.decoder.enable_cudagraph(
-            capture_sizes=decode_cudagraph_capture_sizes,
             capture_batch_sizes=decode_cudagraph_batch_sizes,
-            extra_capture_shapes=decode_cudagraph_extra_capture_shapes,
-            compile_shapes=decode_compile_shapes,
             device=device,
             codec_chunk_frames=codec_chunk_frames,
             codec_left_context_frames=codec_left_context_frames,
@@ -399,7 +393,8 @@ class Qwen3TTSCode2Wav(nn.Module):
             codes_qf = flat.reshape(q, frames)
             ref_req_id = ref_context_request_ids[i]
             state_req_id = request_state_ids[i] or ref_req_id
-            if ref_req_id is not None and ref_ctx_frames > 0:
+            is_delta = request_state_ids[i] is not None
+            if not is_delta and ref_req_id is not None and ref_ctx_frames > 0:
                 if ref_context_included[i]:
                     if frames < ref_ctx_frames:
                         raise ValueError(
@@ -436,6 +431,17 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         num_req = len(request_ids_list)
         if not valid_codes_qf:
+            for req_id, ref_req_id, finished in zip(
+                request_state_ids,
+                ref_context_request_ids,
+                finished_flags,
+                strict=False,
+            ):
+                if finished:
+                    if req_id is not None:
+                        self._decoder_state_cache.pop(req_id, None)
+                    if ref_req_id is not None:
+                        self._pop_ref_context(ref_req_id)
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
@@ -805,10 +811,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 )
             self._decode_chunk_frames = decode_chunk_frames
             self._decode_left_context_frames = decode_left_context_frames
-            decode_cudagraph_capture_sizes = _get_int_list_config("decode_cudagraph_capture_sizes")
             decode_cudagraph_batch_sizes = _get_int_list_config("decode_cudagraph_batch_sizes")
-            decode_cudagraph_extra_capture_shapes = _get_int_pair_list_config("decode_cudagraph_extra_capture_shapes")
-            decode_compile_shapes = _get_int_pair_list_config("decode_compile_shapes")
             decode_batch_bucket_frames = _get_int_list_config("decode_batch_bucket_frames")
             if decode_batch_bucket_frames is not None:
                 self._decode_batch_bucket_frames = decode_batch_bucket_frames
@@ -831,10 +834,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             codec_chunk_frames = 0
             codec_left_context_frames = 0
             initial_codec_chunk_frames = 1
-            decode_cudagraph_capture_sizes = None
             decode_cudagraph_batch_sizes = None
-            decode_cudagraph_extra_capture_shapes = None
-            decode_compile_shapes = None
             decode_enable_tf32 = False
 
         if decode_enable_tf32 and device.type == "cuda":
@@ -859,10 +859,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                     codec_chunk_frames=codec_chunk_frames,
                     codec_left_context_frames=codec_left_context_frames,
                     initial_codec_chunk_frames=initial_codec_chunk_frames,
-                    decode_cudagraph_capture_sizes=decode_cudagraph_capture_sizes,
                     decode_cudagraph_batch_sizes=decode_cudagraph_batch_sizes,
-                    decode_cudagraph_extra_capture_shapes=decode_cudagraph_extra_capture_shapes,
-                    decode_compile_shapes=decode_compile_shapes,
                 )
             except Exception:
                 logger.warning(

@@ -33,11 +33,9 @@ connectors:
       # initial_codec_chunk_frames (including the per-request API field).
       # Example:
       #   codec_chunk_ramp: [4, 4, 8, 16, 25]
-      # Common Stage1 decode buckets:
-          #   no-ref first/steady chunks: 25 / 97 frames
-          #   Base ref-context first/steady chunks: 73 / 169 frames
-          #   decoder internal non-streaming chunks: 325 frames
-      decode_cudagraph_capture_sizes: [25, 73, 97, 169, 325]
+      # Stage 1 receives only newly emitted codec frames after the first chunk;
+      # the decoder derives all reachable CUDA-graph shape buckets from these
+      # chunk settings. Only graph batch-size buckets are configured here.
 
 stages:
   - stage_id: 0

@@ -28,7 +28,7 @@ class CUDAGraphDecoderWrapper:
     and replays them during inference to reduce kernel launch overhead.
 
     Usage:
-        wrapper = CUDAGraphDecoderWrapper(decoder, capture_sizes=[25, 50, 100, 200, 300])
+        wrapper = CUDAGraphDecoderWrapper(decoder)
         wrapper.warmup(device)
 
         # During inference:
@@ -38,7 +38,6 @@ class CUDAGraphDecoderWrapper:
     def __init__(
         self,
         decoder: torch.nn.Module,
-        capture_sizes: list[int] | None = None,
         capture_batch_sizes: list[int] | None = None,
         num_quantizers: int = 8,
         enabled: bool = True,
@@ -46,7 +45,6 @@ class CUDAGraphDecoderWrapper:
         codec_chunk_frames: int = 25,
     ):
         self.decoder = decoder
-        self._configured_capture_sizes = sorted(set(capture_sizes or []))
         self.capture_batch_sizes = sorted(set(capture_batch_sizes or [1, 2, 4, 8]))
         self.num_quantizers = num_quantizers
         self.enabled = enabled
@@ -86,23 +84,7 @@ class CUDAGraphDecoderWrapper:
             )
         self._previous_frames_by_target = self._derive_suffix_transitions()
         self._xvec_previous_frames_by_target = self._derive_xvec_suffix_transitions()
-        derived_capture_sizes = sorted(self._previous_frames_by_target)
-        if self._configured_capture_sizes:
-            configured = set(self._configured_capture_sizes)
-            self.capture_sizes = [size for size in derived_capture_sizes if size in configured]
-            ignored = sorted(configured - set(derived_capture_sizes))
-            if ignored:
-                logger.warning(
-                    "Ignoring unreachable segmented Code2Wav capture sizes %s; valid sizes for "
-                    "initial_chunk_frames=%d codec_chunk_frames=%d sliding_window=%d are %s",
-                    ignored,
-                    self.initial_chunk_frames,
-                    self.codec_chunk_frames,
-                    self.prefix_length,
-                    derived_capture_sizes,
-                )
-        else:
-            self.capture_sizes = derived_capture_sizes
+        self.capture_sizes = sorted(self._previous_frames_by_target)
         self._stats_enabled = os.environ.get(
             "VLLM_OMNI_QWEN3_CODE2WAV_CUDAGRAPH_STATS",
             "",
@@ -946,15 +928,12 @@ class CUDAGraphDecoderWrapper:
             if decoder_prefix != expected_kv_length or request_kv.get_seq_length() != expected_kv_length:
                 groups.setdefault(("eager", 0), []).append(index)
                 continue
-            logical_prefix = int(cache["prefix_frames"])
-            suffix_frames = int(codes.shape[-1]) - logical_prefix
             previous = int(cache.get("suffix_frames", cache["suffix_quantized"].shape[-1]))
             rolling = self.decoder._is_suffix_cache_rolling(
                 previous,
                 int(cache["suffix_quantized"].shape[-1]),
             )
-            retained = self.prefix_length if rolling else previous
-            new_frames = suffix_frames - retained
+            new_frames = int(codes.shape[-1])
             target = (
                 self.prefix_length + self.codec_chunk_frames
                 if rolling
@@ -978,20 +957,8 @@ class CUDAGraphDecoderWrapper:
                 group_outputs = self._decode_xvec_prefix_batch(group_codes, group_caches)
             elif phase.startswith("suffix:"):
                 mode = phase.removeprefix("suffix:")
-                suffix_codes = [
-                    codes[:, :, int(cache["prefix_frames"]) :]
-                    for codes, cache in zip(group_codes, group_caches, strict=True)
-                ]
-                new_frames = []
-                for codes, cache in zip(suffix_codes, group_caches, strict=True):
-                    previous = int(cache.get("suffix_frames", cache["suffix_quantized"].shape[-1]))
-                    rolling = self.decoder._is_suffix_cache_rolling(
-                        previous,
-                        int(cache["suffix_quantized"].shape[-1]),
-                    )
-                    retained = self.prefix_length if rolling else previous
-                    new_frames.append(int(codes.shape[-1]) - retained)
-                group_outputs = self._decode_suffix_batch(mode, target, suffix_codes, group_caches, new_frames)
+                new_frames = [int(codes.shape[-1]) for codes in group_codes]
+                group_outputs = self._decode_suffix_batch(mode, target, group_codes, group_caches, new_frames)
                 if group_outputs is not None:
                     for index in indices:
                         incremental[index] = True
@@ -1007,8 +974,7 @@ class CUDAGraphDecoderWrapper:
                         else:
                             group_outputs.append(self._decode_icl_prefix(codes, cache))
                     else:
-                        suffix_codes = codes[:, :, int(cache["prefix_frames"]) :]
-                        group_outputs.append(self._decode_eager(suffix_codes, cache))
+                        group_outputs.append(self._decode_eager(codes, cache, delta=True))
                         incremental[index] = True
             for index, output in zip(indices, group_outputs, strict=True):
                 outputs[index] = output
@@ -1049,7 +1015,7 @@ class CUDAGraphDecoderWrapper:
             padded[row, :, : output.shape[-1]].copy_(output[0])
         return padded
 
-    def _decode_eager(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
+    def _decode_eager(self, codes: torch.Tensor, caches: dict, *, delta: bool = False) -> torch.Tensor:
         for key in (
             "_suffix_quantized_buffers",
             "_suffix_conv_buffers",
@@ -1057,6 +1023,8 @@ class CUDAGraphDecoderWrapper:
         ):
             caches.pop(key, None)
         decoder_prefix_frames = int(caches.get("decoder_prefix_frames", caches["prefix_frames"]))
+        if delta:
+            return self.decoder._decode_delta_incremental(codes, caches, decoder_prefix_frames)
         return self.decoder._decode_cached_incremental(codes, caches, decoder_prefix_frames)
 
     def _decode(

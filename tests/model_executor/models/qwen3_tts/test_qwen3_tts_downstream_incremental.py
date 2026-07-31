@@ -133,13 +133,13 @@ def test_batched_chunked_decode_groups_exact_phases(monkeypatch):
     prefix_frames = 48
     codes_list = [torch.zeros(1, 2, prefix_frames + 1)]
     caches = [{"prefix_frames": prefix_frames}]
-    for previous, suffix_frames, cached_frames in (
+    for previous, _suffix_frames, cached_frames in (
         (1, 26, 1),
         (26, 51, 26),
         (51, 76, 51),
         (76, 97, 72),
     ):
-        codes_list.append(torch.zeros(1, 2, prefix_frames + suffix_frames))
+        codes_list.append(torch.zeros(1, 2, 25))
         caches.append(
             {
                 "prefix_frames": prefix_frames,
@@ -200,8 +200,8 @@ def test_xvec_delta_chunks_route_through_all_reachable_graph_phases(monkeypatch)
         }
         for previous, cached_frames in ((1, 1), (26, 26), (51, 51), (76, 72))
     ]
-    lengths = [26, 51, 76, 97]
-    codes = torch.zeros(4, 2, max(lengths))
+    lengths = [25, 25, 25, 25]
+    codes = torch.zeros(4, 2, 25)
 
     wrapper.batched_chunked_decode_with_cudagraph(codes, lengths, caches=caches)
 
@@ -438,7 +438,7 @@ def test_xvec_prefixless_incremental_matches_full_decode_tail():
 
     with torch.no_grad():
         first = decoder(codes[..., :25], caches=caches)
-        incremental = decoder(codes, caches=caches)
+        incremental = decoder(codes[..., 25:], caches=caches)
         full = decoder._forward_exact(codes)
 
     assert first.shape[-1] == 25 * decoder.total_upsample
