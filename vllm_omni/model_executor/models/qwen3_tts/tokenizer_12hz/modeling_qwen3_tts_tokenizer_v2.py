@@ -1209,6 +1209,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         self,
         codes,
         lengths,
+        caches=None,
         chunk_size=300,
         left_context_size=25,
         max_batch_size=0,
@@ -1221,10 +1222,31 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             return self._cudagraph_wrapper.batched_chunked_decode_with_cudagraph(
                 codes,
                 lengths,
+                caches=caches,
                 chunk_size=chunk_size,
                 left_context_size=left_context_size,
                 max_batch_size=max_batch_size,
             )
+
+        if caches is not None:
+            outputs = []
+            for row, (length, cache) in enumerate(zip(lengths, caches, strict=True)):
+                output = self.chunked_decode(
+                    codes[row : row + 1, :, :length],
+                    caches=cache,
+                    chunk_size=chunk_size,
+                    left_context_size=left_context_size,
+                )
+                cache["_last_output_audio_length"] = int(output.shape[-1])
+                outputs.append(output)
+            max_length = max((int(output.shape[-1]) for output in outputs), default=0)
+            padded = codes.new_zeros(
+                (len(outputs), 1, max_length),
+                dtype=outputs[0].dtype if outputs else torch.float32,
+            )
+            for row, output in enumerate(outputs):
+                padded[row, :, : output.shape[-1]].copy_(output[0])
+            return padded
 
         from ..cuda_graph_decoder_wrapper import _batched_chunked_decode
 

@@ -452,6 +452,42 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         wav_tensors: list[torch.Tensor | None] = [None] * len(valid_codes_qf)
         wav_is_incremental: list[bool] = [False] * len(valid_codes_qf)
+        request_aware_indices = [
+            index for index, (ref_req_id, _) in enumerate(valid_codes_qf) if ref_req_id is not None
+        ]
+        handled_request_aware: set[int] = set()
+        if request_aware_indices and hasattr(decoder, "batched_chunked_decode"):
+            request_lengths = [int(valid_codes_qf[index][1].shape[-1]) for index in request_aware_indices]
+            max_request_length = max(request_lengths)
+            request_codes = valid_codes_qf[0][1].new_zeros((len(request_aware_indices), q, max_request_length))
+            for row, index in enumerate(request_aware_indices):
+                codes_qf = valid_codes_qf[index][1]
+                request_codes[row, :, : codes_qf.shape[-1]] = codes_qf
+            request_states = [self._decoder_state_cache[valid_codes_qf[index][0]] for index in request_aware_indices]
+            request_wavs = decoder.batched_chunked_decode(
+                request_codes,
+                request_lengths,
+                caches=request_states,
+                chunk_size=self._decode_chunk_frames,
+                left_context_size=self._decode_left_context_frames,
+                max_batch_size=self._decode_batch_max_size,
+            )
+            if request_wavs.shape[0] != len(request_aware_indices):
+                raise ValueError(
+                    "Qwen3-TTS batched request decoder returned "
+                    f"{request_wavs.shape[0]} outputs for {len(request_aware_indices)} requests"
+                )
+            for row, (index, state) in enumerate(zip(request_aware_indices, request_states, strict=True)):
+                wav = request_wavs[row]
+                if wav.dim() == 3 and wav.shape[:2] == (1, 1):
+                    wav = wav[0, 0]
+                elif wav.dim() == 2 and wav.shape[0] == 1:
+                    wav = wav[0]
+                else:
+                    raise ValueError(f"Qwen3-TTS batched request decoder returned unexpected shape {tuple(wav.shape)}")
+                wav_tensors[index] = wav[: int(state.get("_last_output_audio_length", wav.shape[-1]))]
+                wav_is_incremental[index] = bool(state.get("_last_output_incremental_audio", False))
+                handled_request_aware.add(index)
 
         def _decode_group_chunks(
             group_chunks: list[list[tuple[int, torch.Tensor]]], states: dict[str, Any] | None
@@ -460,11 +496,10 @@ class Qwen3TTSCode2Wav(nn.Module):
                 actual_frames = [int(codes_qf.shape[1]) for _, codes_qf in group_chunk]
                 target_frames = max(actual_frames)
                 is_equal_length_batch = all(frames == target_frames for frames in actual_frames)
-                use_variable_length_batch = (
+                use_batched_decode = (
                     len(group_chunk) > 1
-                    and not is_equal_length_batch
-                    and target_frames >= self._decode_variable_chunk_batch_min_frames
                     and hasattr(decoder, "batched_chunked_decode")
+                    and (is_equal_length_batch or target_frames >= self._decode_variable_chunk_batch_min_frames)
                 )
                 if len(group_chunk) == 1:
                     codes_bqf = group_chunk[0][1].unsqueeze(0)
@@ -481,10 +516,11 @@ class Qwen3TTSCode2Wav(nn.Module):
                     actual_frames=actual_frames,
                 )
                 try:
-                    if use_variable_length_batch:
+                    if use_batched_decode:
                         wav_batch = decoder.batched_chunked_decode(
                             codes_bqf,
                             actual_frames,
+                            caches=None,
                             chunk_size=self._decode_chunk_frames,
                             left_context_size=self._decode_left_context_frames,
                             max_batch_size=self._decode_batch_max_size,
@@ -525,6 +561,8 @@ class Qwen3TTSCode2Wav(nn.Module):
         # longer inputs where repeated full chunks can amortize its overhead.
         grouped_codes: dict[tuple[str, int], list[tuple[int, torch.Tensor]]] = {}
         for j, (ref_req_id, codes_qf) in enumerate(valid_codes_qf):
+            if j in handled_request_aware:
+                continue
             bucket = self._get_decode_batch_bucket_frames(int(codes_qf.shape[1]))
             grouped_codes.setdefault(
                 (ref_req_id, bucket),

@@ -24,7 +24,7 @@ class _FakeDecoder(nn.Module):
         super().__init__()
         self.total_upsample = total_upsample
         self.decode_calls: list[dict[str, int]] = []
-        self.batched_decode_calls: list[dict[str, int]] = []
+        self.batched_decode_calls: list[dict[str, object]] = []
         self.decode_codes: list[torch.Tensor] = []
         self.cudagraph_calls: list[dict[str, int | torch.device]] = []
 
@@ -35,6 +35,7 @@ class _FakeDecoder(nn.Module):
         self,
         codes: torch.Tensor,
         *,
+        caches=None,
         chunk_size: int = 300,
         left_context_size: int = 25,
     ) -> torch.Tensor:
@@ -58,6 +59,7 @@ class _FakeDecoder(nn.Module):
         codes: torch.Tensor,
         lengths: list[int],
         *,
+        caches=None,
         chunk_size: int = 300,
         left_context_size: int = 25,
         max_batch_size: int = 0,
@@ -69,8 +71,26 @@ class _FakeDecoder(nn.Module):
                 "max_batch_size": max_batch_size,
                 "codes_shape": tuple(codes.shape),
                 "lengths": tuple(lengths),
+                "caches": caches,
             }
         )
+        if caches is not None:
+            outputs = []
+            for row, (length, cache) in enumerate(zip(lengths, caches, strict=True)):
+                output = self.chunked_decode(
+                    codes[row : row + 1, :, :length],
+                    caches=cache,
+                    chunk_size=chunk_size,
+                    left_context_size=left_context_size,
+                )
+                cache["_last_output_audio_length"] = int(output.shape[-1])
+                outputs.append(output)
+            max_length = max(output.shape[-1] for output in outputs)
+            padded = outputs[0].new_zeros(len(outputs), 1, max_length)
+            for row, output in enumerate(outputs):
+                padded[row, :, : output.shape[-1]] = output[0]
+            return padded
+
         batch = codes.shape[0]
         frames = codes.shape[-1]
         wav_len = frames * self.total_upsample + 6
@@ -429,16 +449,58 @@ def test_forward_batches_equal_length_requests_in_one_decoder_call():
         ],
     )
 
-    assert model.decoder.decode_calls == [
+    assert model.decoder.decode_calls == []
+    assert model.decoder.batched_decode_calls == [
         {
             "chunk_size": 300,
             "left_context_size": 25,
+            "max_batch_size": 0,
             "codes_shape": (2, _NUM_QUANTIZERS, 3),
+            "lengths": (3, 3),
+            "caches": None,
         }
     ]
     audios = out.multimodal_outputs["model_outputs"]
     torch.testing.assert_close(audios[0], torch.arange(12, dtype=torch.float32))
     torch.testing.assert_close(audios[1], torch.arange(1004, 1012, dtype=torch.float32))
+
+
+def test_forward_batches_request_aware_decoder_states():
+    model = _make_model()
+    calls = []
+
+    def _batched_chunked_decode(codes, lengths, caches, **kwargs):
+        calls.append((codes, lengths, caches))
+        for cache in caches:
+            cache["_last_output_incremental_audio"] = False
+            cache["_last_output_audio_length"] = 16
+        return torch.stack([torch.arange(16, dtype=torch.float32).view(1, -1) + row * 100 for row in range(2)])
+
+    model.decoder.batched_chunked_decode = _batched_chunked_decode
+    per_request = torch.tensor([9, 8, 1, 2, 9, 8, 3, 4], dtype=torch.long)
+    out = model.forward(
+        input_ids=torch.cat([per_request, per_request]),
+        seq_token_counts=[8, 8],
+        runtime_additional_information=[
+            {
+                "meta": {
+                    "left_context_size": 2,
+                    "ref_context_size": 2,
+                    "ref_context_request_id": request_id,
+                    "ref_context_included": True,
+                }
+            }
+            for request_id in ("a", "b")
+        ],
+    )
+
+    assert len(calls) == 1
+    assert tuple(calls[0][0].shape) == (2, 2, 4)
+    assert calls[0][1] == [4, 4]
+    assert [cache["prefix_frames"] for cache in calls[0][2]] == [2, 2]
+    audios = out.multimodal_outputs["model_outputs"]
+    torch.testing.assert_close(audios[0], torch.arange(8, 16, dtype=torch.float32))
+    torch.testing.assert_close(audios[1], torch.arange(108, 116, dtype=torch.float32))
 
 
 def test_forward_uses_variable_length_chunk_batching_for_long_bucket_group():
@@ -463,6 +525,7 @@ def test_forward_uses_variable_length_chunk_batching_for_long_bucket_group():
             "max_batch_size": 0,
             "codes_shape": (2, _NUM_QUANTIZERS, 4),
             "lengths": (2, 4),
+            "caches": None,
         }
     ]
     audios = out.multimodal_outputs["model_outputs"]
@@ -596,6 +659,7 @@ def test_decode_chunking_override_is_passed_to_cudagraph():
         "device": torch.device("cuda"),
         "codec_chunk_frames": 25,
         "codec_left_context_frames": 72,
+        "initial_codec_chunk_frames": 1,
         "decode_chunk_size": 400,
         "decode_left_context": 17,
     }
