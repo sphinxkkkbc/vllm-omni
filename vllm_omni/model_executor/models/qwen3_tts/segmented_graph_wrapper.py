@@ -42,9 +42,11 @@ class CUDAGraphDecoderWrapper:
         capture_batch_sizes: list[int] | None = None,
         num_quantizers: int = 8,
         enabled: bool = True,
+        initial_chunk_frames: int = 1,
+        codec_chunk_frames: int = 25,
     ):
         self.decoder = decoder
-        self.capture_sizes = sorted(capture_sizes) if capture_sizes else []
+        self._configured_capture_sizes = sorted(set(capture_sizes or []))
         self.capture_batch_sizes = sorted(set(capture_batch_sizes or [1, 2, 4, 8]))
         self.num_quantizers = num_quantizers
         self.enabled = enabled
@@ -68,8 +70,34 @@ class CUDAGraphDecoderWrapper:
         self.prefix_static_caches: dict[int, dict] = {}
 
         self._device = None
-        self.prefix_length = 72
-        self.suffix_length = [26, 51, 76, 97]
+        self.prefix_length = int(getattr(self.decoder.config, "sliding_window", 0) or 0)
+        self.initial_chunk_frames = int(initial_chunk_frames)
+        self.codec_chunk_frames = int(codec_chunk_frames)
+        if self.prefix_length <= 2:
+            raise ValueError(f"decoder sliding_window must be greater than 2, got {self.prefix_length}")
+        if self.initial_chunk_frames <= 0 or self.codec_chunk_frames <= 0:
+            raise ValueError(
+                "initial_chunk_frames and codec_chunk_frames must be positive, "
+                f"got {self.initial_chunk_frames} and {self.codec_chunk_frames}"
+            )
+        self._previous_frames_by_target = self._derive_suffix_transitions()
+        derived_capture_sizes = sorted(self._previous_frames_by_target)
+        if self._configured_capture_sizes:
+            configured = set(self._configured_capture_sizes)
+            self.capture_sizes = [size for size in derived_capture_sizes if size in configured]
+            ignored = sorted(configured - set(derived_capture_sizes))
+            if ignored:
+                logger.warning(
+                    "Ignoring unreachable segmented Code2Wav capture sizes %s; valid sizes for "
+                    "initial_chunk_frames=%d codec_chunk_frames=%d sliding_window=%d are %s",
+                    ignored,
+                    self.initial_chunk_frames,
+                    self.codec_chunk_frames,
+                    self.prefix_length,
+                    derived_capture_sizes,
+                )
+        else:
+            self.capture_sizes = derived_capture_sizes
         self._stats_enabled = os.environ.get(
             "VLLM_OMNI_QWEN3_CODE2WAV_CUDAGRAPH_STATS",
             "",
@@ -90,6 +118,16 @@ class CUDAGraphDecoderWrapper:
         self._stats_fallback_requests = 0
         self._stats_replays: Counter[tuple[str, int, int]] = Counter()
         self._stats_fallbacks: Counter[tuple[str, int]] = Counter()
+
+    def _derive_suffix_transitions(self) -> dict[int, int]:
+        transitions: dict[int, int] = {}
+        previous = self.initial_chunk_frames
+        while previous < self.prefix_length:
+            target = previous + self.codec_chunk_frames
+            transitions[target] = previous
+            previous = target
+        transitions[self.prefix_length + self.codec_chunk_frames] = self.prefix_length
+        return transitions
 
     def _record_graph_hit(self, phase: str, batch_size: int, request_count: int) -> None:
         if not getattr(self, "_stats_enabled", False):
@@ -223,12 +261,11 @@ class CUDAGraphDecoderWrapper:
         self.decoder.eval()
 
         if not self.capture_sizes:
-            raise ValueError("capture_sizes must be provided")
+            raise ValueError("No reachable segmented capture sizes were configured")
 
         self.capture_batch_sizes = [bs for bs in self.capture_batch_sizes if bs > 0]
         if not self.capture_batch_sizes:
             self.capture_batch_sizes = [1]
-        self.capture_sizes = self.suffix_length
         capture_shapes = self._get_capture_shapes()
 
         for batch_size in self.capture_batch_sizes:
@@ -269,15 +306,16 @@ class CUDAGraphDecoderWrapper:
         target_frames: int,
         attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        previous_frames_by_target = {26: 1, 51: 26, 76: 51, 97: 97}
+        previous_frames = self._previous_frames_by_target[target_frames]
+        rolling = self.decoder._is_suffix_cache_rolling(previous_frames, int(old_quantized.shape[-1]))
         return self.decoder._decode_suffix_incremental(
             codes,
             old_quantized,
             old_conv,
             caches,
             self.prefix_length,
-            previous_frames_by_target[target_frames],
-            25,
+            self.codec_chunk_frames,
+            rolling,
             attention_mask=attention_mask,
         )
 
@@ -289,11 +327,12 @@ class CUDAGraphDecoderWrapper:
         device: torch.device,
         code_dtype: torch.dtype,
     ) -> None:
-        previous_frames_by_target = {26: 1, 51: 26, 76: 51, 97: 72}
-        previous_frames = previous_frames_by_target[target_frames]
+        previous_frames = self._previous_frames_by_target[target_frames]
         model_dtype = next(self.decoder.parameters()).dtype
         key = (batch_size, target_frames)
-        static_codes = torch.zeros(batch_size, self.num_quantizers, 25, dtype=code_dtype, device=device)
+        static_codes = torch.zeros(
+            batch_size, self.num_quantizers, self.codec_chunk_frames, dtype=code_dtype, device=device
+        )
         static_quantized = torch.zeros(
             batch_size,
             self.decoder.config.codebook_dim,
@@ -342,7 +381,7 @@ class CUDAGraphDecoderWrapper:
         self.combined_static_outputs[key] = outputs
 
     def _capture_icl_prefix(self, batch_size: int, device: torch.device, dtype: torch.dtype):
-        size = self.prefix_length + 1
+        size = self.prefix_length + self.initial_chunk_frames
         caches: dict = {}
         static_input = torch.zeros(batch_size, self.num_quantizers, size, dtype=dtype, device=device)
         with torch.no_grad():
@@ -394,8 +433,8 @@ class CUDAGraphDecoderWrapper:
                     prefix_attention_mask=prefix_attention_mask,
                     suffix_attention_mask=suffix_attention_mask,
                 )
-                suffix_quantized[:, :, :1].copy_(caches["suffix_quantized"])
-                suffix_conv[:, :1, :].copy_(caches["suffix_conv"])
+                suffix_quantized[:, :, : self.initial_chunk_frames].copy_(caches["suffix_quantized"])
+                suffix_conv[:, : self.initial_chunk_frames, :].copy_(caches["suffix_conv"])
 
         self.prefix_graphs[batch_size] = graph
         self.prefix_static_inputs[batch_size] = static_input
@@ -414,7 +453,7 @@ class CUDAGraphDecoderWrapper:
 
         actual_prefix_frames = int(caches["prefix_frames"])
         suffix_frames = int(codes.shape[-1]) - actual_prefix_frames
-        if not 0 < actual_prefix_frames <= self.prefix_length or suffix_frames != 1:
+        if not 0 < actual_prefix_frames <= self.prefix_length or suffix_frames != self.initial_chunk_frames:
             return self.decoder._decode_icl_first_chunk(codes, caches, actual_prefix_frames)
 
         prefix_static_input = self.prefix_static_inputs[batch_size]
@@ -435,8 +474,8 @@ class CUDAGraphDecoderWrapper:
         self.prefix_graphs[batch_size].replay()
         caches.update(self.prefix_static_caches[batch_size])
         caches["prefix_pad_frames"] = prefix_pad_frames
-        caches["suffix_quantized"] = self.prefix_suffix_quantized[batch_size][:, :, :1]
-        caches["suffix_conv"] = self.prefix_suffix_conv[batch_size][:, :1, :]
+        caches["suffix_quantized"] = self.prefix_suffix_quantized[batch_size][:, :, : self.initial_chunk_frames]
+        caches["suffix_conv"] = self.prefix_suffix_conv[batch_size][:, : self.initial_chunk_frames, :]
         self._ensure_suffix_buffers(caches)
         return self.prefix_static_outputs[batch_size][..., prefix_pad_frames * self.decoder.total_upsample :]
 
@@ -563,7 +602,7 @@ class CUDAGraphDecoderWrapper:
         for row, (codes, cache) in enumerate(zip(codes_list, request_caches, strict=True)):
             prefix_frames = int(cache["prefix_frames"])
             suffix_frames = int(codes.shape[-1]) - prefix_frames
-            if not 0 < prefix_frames <= self.prefix_length or suffix_frames != 1:
+            if not 0 < prefix_frames <= self.prefix_length or suffix_frames != self.initial_chunk_frames:
                 return None
             prefix_pad = self.prefix_length - prefix_frames
             prefix_pads.append(prefix_pad)
@@ -584,9 +623,13 @@ class CUDAGraphDecoderWrapper:
             cache["past_key_values"] = self._slice_dynamic_cache(static_caches["past_key_values"], row)
             cache["decoder_prefix_frames"] = self.prefix_length
             cache["prefix_pad_frames"] = prefix_pad
-            cache["suffix_quantized"] = self.prefix_suffix_quantized[batch_size][row : row + 1, :, :1].clone()
-            cache["suffix_conv"] = self.prefix_suffix_conv[batch_size][row : row + 1, :1, :].clone()
-            cache["suffix_frames"] = 1
+            cache["suffix_quantized"] = self.prefix_suffix_quantized[batch_size][
+                row : row + 1, :, : self.initial_chunk_frames
+            ].clone()
+            cache["suffix_conv"] = self.prefix_suffix_conv[batch_size][
+                row : row + 1, : self.initial_chunk_frames, :
+            ].clone()
+            cache["suffix_frames"] = self.initial_chunk_frames
             start = prefix_pad * self.decoder.total_upsample
             outputs.append(self.prefix_static_outputs[batch_size][row : row + 1, :, start:].clone())
         return outputs
@@ -642,14 +685,15 @@ class CUDAGraphDecoderWrapper:
         graph_output, graph_next_quantized, graph_next_conv = self.combined_static_outputs[key]
         outputs: list[torch.Tensor] = []
         for row, (cache, new_frames) in enumerate(zip(request_caches, new_frames_list, strict=True)):
-            actual_suffix_frames = (self.prefix_length if target_frames == 97 else target_frames - 25) + new_frames
+            previous_frames = self._previous_frames_by_target[target_frames]
+            actual_suffix_frames = previous_frames + new_frames
             output = self._trim_replay_output(
                 graph_output[row : row + 1],
                 actual_suffix_frames,
                 target_frames,
             ).clone()
             outputs.append(output)
-            if new_frames == 25:
+            if new_frames == self.codec_chunk_frames:
                 current_index = int(cache["_suffix_buffer_index"])
                 next_index = 1 - current_index
                 next_quantized = cache["_suffix_quantized_buffers"][next_index]
@@ -676,7 +720,11 @@ class CUDAGraphDecoderWrapper:
             if "ref_wav" not in cache:
                 prefix_frames = int(cache["prefix_frames"])
                 suffix_frames = int(codes.shape[-1]) - prefix_frames
-                phase = "prefix" if 0 < prefix_frames <= self.prefix_length and suffix_frames == 1 else "eager"
+                phase = (
+                    "prefix"
+                    if 0 < prefix_frames <= self.prefix_length and suffix_frames == self.initial_chunk_frames
+                    else "eager"
+                )
                 groups.setdefault((phase, 0), []).append(index)
                 continue
             request_kv = cache["past_key_values"]
@@ -689,11 +737,21 @@ class CUDAGraphDecoderWrapper:
             logical_prefix = int(cache["prefix_frames"])
             suffix_frames = int(codes.shape[-1]) - logical_prefix
             previous = int(cache.get("suffix_frames", cache["suffix_quantized"].shape[-1]))
-            rolling = previous >= 76 and int(cache["suffix_quantized"].shape[-1]) == self.prefix_length
+            rolling = self.decoder._is_suffix_cache_rolling(
+                previous,
+                int(cache["suffix_quantized"].shape[-1]),
+            )
             retained = self.prefix_length if rolling else previous
             new_frames = suffix_frames - retained
-            target = 97 if rolling else {1: 26, 26: 51, 51: 76}.get(previous)
-            if target is None or not 0 < new_frames <= 25:
+            target = (
+                self.prefix_length + self.codec_chunk_frames
+                if rolling
+                else next(
+                    (target for target, source in self._previous_frames_by_target.items() if source == previous),
+                    None,
+                )
+            )
+            if target is None or not 0 < new_frames <= self.codec_chunk_frames:
                 groups.setdefault(("eager", 0), []).append(index)
             else:
                 groups.setdefault(("suffix", target), []).append(index)
@@ -712,7 +770,11 @@ class CUDAGraphDecoderWrapper:
                 new_frames = []
                 for codes, cache in zip(suffix_codes, group_caches, strict=True):
                     previous = int(cache.get("suffix_frames", cache["suffix_quantized"].shape[-1]))
-                    retained = self.prefix_length if target == 97 else previous
+                    rolling = self.decoder._is_suffix_cache_rolling(
+                        previous,
+                        int(cache["suffix_quantized"].shape[-1]),
+                    )
+                    retained = self.prefix_length if rolling else previous
                     new_frames.append(int(codes.shape[-1]) - retained)
                 group_outputs = self._decode_suffix_batch(target, suffix_codes, group_caches, new_frames)
                 if group_outputs is not None:
@@ -813,12 +875,22 @@ class CUDAGraphDecoderWrapper:
 
         previous_suffix_frames = int(caches["suffix_frames"])
         cached_frames = int(old_quantized.shape[-1])
-        rolling = previous_suffix_frames >= 76 and cached_frames == self.prefix_length
+        rolling = self.decoder._is_suffix_cache_rolling(previous_suffix_frames, cached_frames)
         new_frames = suffix_frames - (self.prefix_length if rolling else previous_suffix_frames)
-        target_frames_by_previous = {1: 26, 26: 51, 51: 76}
-        target_frames = 97 if rolling else target_frames_by_previous.get(previous_suffix_frames)
+        target_frames = (
+            self.prefix_length + self.codec_chunk_frames
+            if rolling
+            else next(
+                (
+                    target
+                    for target, source in self._previous_frames_by_target.items()
+                    if source == previous_suffix_frames
+                ),
+                None,
+            )
+        )
         graph_key = (int(codes.shape[0]), target_frames) if target_frames is not None else None
-        if graph_key is None or not 0 < new_frames <= 25 or graph_key not in self.combined_graphs:
+        if graph_key is None or not 0 < new_frames <= self.codec_chunk_frames or graph_key not in self.combined_graphs:
             return self._decode_eager(codes, caches), True
 
         request_kv = caches["past_key_values"]
@@ -833,7 +905,7 @@ class CUDAGraphDecoderWrapper:
 
         new_codes = codes[:, :, -new_frames:]
         static_codes = self.combined_static_codes[graph_key]
-        if new_frames == 25:
+        if new_frames == self.codec_chunk_frames:
             static_codes.copy_(new_codes)
         else:
             static_codes.zero_()
@@ -851,7 +923,7 @@ class CUDAGraphDecoderWrapper:
         self.combined_graphs[graph_key].replay()
 
         output, graph_next_quantized, graph_next_conv = self.combined_static_outputs[graph_key]
-        if new_frames == 25:
+        if new_frames == self.codec_chunk_frames:
             current_index = int(caches["_suffix_buffer_index"])
             next_index = 1 - current_index
             next_quantized = caches["_suffix_quantized_buffers"][next_index]

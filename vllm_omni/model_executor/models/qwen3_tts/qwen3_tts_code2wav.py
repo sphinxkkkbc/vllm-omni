@@ -146,6 +146,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         device: torch.device,
         codec_chunk_frames: int,
         codec_left_context_frames: int,
+        initial_codec_chunk_frames: int,
         decode_cudagraph_capture_sizes: list[int] | None,
         decode_cudagraph_batch_sizes: list[int] | None,
         decode_cudagraph_extra_capture_shapes: list[tuple[int, int]] | None,
@@ -185,6 +186,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             device=device,
             codec_chunk_frames=codec_chunk_frames,
             codec_left_context_frames=codec_left_context_frames,
+            initial_codec_chunk_frames=initial_codec_chunk_frames,
             decode_chunk_size=self._decode_chunk_frames,
             decode_left_context=self._decode_left_context_frames,
         )
@@ -773,6 +775,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         if isinstance(extra_cfg, dict):
             codec_chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
             codec_left_context_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
+            initial_codec_chunk_frames = int(extra_cfg.get("initial_codec_chunk_frames") or 1)
             decode_chunk_frames = _get_int_config("decode_chunk_frames", self._decode_chunk_frames)
             decode_left_context_frames = _get_int_config(
                 "decode_left_context_frames",
@@ -809,6 +812,9 @@ class Qwen3TTSCode2Wav(nn.Module):
             self._decode_variable_chunk_batch_min_frames = decode_variable_chunk_batch_min_frames
             decode_enable_tf32 = _get_bool_config("decode_enable_tf32", False)
         else:
+            codec_chunk_frames = 0
+            codec_left_context_frames = 0
+            initial_codec_chunk_frames = 1
             decode_cudagraph_capture_sizes = None
             decode_cudagraph_batch_sizes = None
             decode_cudagraph_extra_capture_shapes = None
@@ -836,6 +842,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                     device=device,
                     codec_chunk_frames=codec_chunk_frames,
                     codec_left_context_frames=codec_left_context_frames,
+                    initial_codec_chunk_frames=initial_codec_chunk_frames,
                     decode_cudagraph_capture_sizes=decode_cudagraph_capture_sizes,
                     decode_cudagraph_batch_sizes=decode_cudagraph_batch_sizes,
                     decode_cudagraph_extra_capture_shapes=decode_cudagraph_extra_capture_shapes,

@@ -873,6 +873,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         device: torch.device | None = None,
         codec_chunk_frames: int = 0,
         codec_left_context_frames: int = 0,
+        initial_codec_chunk_frames: int = 1,
         decode_chunk_size: int = 300,
         decode_left_context: int = 25,
     ):
@@ -891,7 +892,10 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             capture_batch_sizes=capture_batch_sizes,
             num_quantizers=self.config.num_quantizers,
             enabled=True,
+            initial_chunk_frames=initial_codec_chunk_frames,
+            codec_chunk_frames=codec_chunk_frames or 25,
         )
+        self._incremental_chunk_frames = codec_chunk_frames or 25
         self._cudagraph_wrapper.warmup(
             device,
             dtype=torch.long,
@@ -1025,14 +1029,13 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         old_conv: torch.Tensor,
         caches: dict,
         prefix_frames: int,
-        previous_suffix_frames: int,
         new_frames: int,
+        rolling: bool,
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         ref_hidden = caches["ref_hidden"]
         conv_context = torch.cat([ref_hidden, old_quantized], dim=-1)[:, :, -_CONV_CONTEXT_FRAME:]
-        suffix_cache_length = 72
-        rolling = previous_suffix_frames >= 76 and int(old_quantized.shape[-1]) == suffix_cache_length
+        suffix_cache_length = int(self.config.sliding_window)
         if rolling:
             boundary_input = torch.cat(
                 [ref_hidden[:, :, -_CONV_CONTEXT_FRAME:], old_quantized[:, :, :_CONV_CONTEXT_FRAME]],
@@ -1062,6 +1065,10 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             attention_mask=attention_mask,
         )
         return wav, next_quantized, next_conv
+
+    def _is_suffix_cache_rolling(self, previous_suffix_frames: int, cached_frames: int) -> bool:
+        suffix_cache_length = int(self.config.sliding_window)
+        return previous_suffix_frames >= suffix_cache_length and cached_frames == suffix_cache_length
 
     def _decode_downstream_incremental(
         self,
@@ -1107,12 +1114,14 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         suffix_frames = int(codes.shape[-1])
         previous_suffix_frames = int(caches.get("suffix_frames", caches["suffix_quantized"].shape[-1]))
         cached_frames = int(caches["suffix_quantized"].shape[-1])
-        rolling = previous_suffix_frames >= 76 and cached_frames == 72
-        retained_frames = 72 if rolling else previous_suffix_frames
+        suffix_cache_length = int(self.config.sliding_window)
+        rolling = self._is_suffix_cache_rolling(previous_suffix_frames, cached_frames)
+        retained_frames = suffix_cache_length if rolling else previous_suffix_frames
         new_frames = suffix_frames - retained_frames
-        if not 0 < new_frames <= 25:
+        max_new_frames = int(getattr(self, "_incremental_chunk_frames", 25))
+        if not 0 < new_frames <= max_new_frames:
             raise ValueError(
-                "Qwen3-TTS incremental decode expected 1..25 new frames, "
+                f"Qwen3-TTS incremental decode expected 1..{max_new_frames} new frames, "
                 f"got suffix_frames={suffix_frames}, retained_frames={retained_frames}"
             )
 
@@ -1129,8 +1138,8 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             caches["suffix_conv"],
             caches,
             prefix_frames,
-            previous_suffix_frames,
             new_frames,
+            rolling,
             attention_mask=attention_mask,
         )
         caches["suffix_quantized"] = next_quantized

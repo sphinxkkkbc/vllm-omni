@@ -95,9 +95,7 @@ def test_batched_chunked_decode_groups_exact_phases(monkeypatch):
     wrapper.initial_chunk_frames = 1
     wrapper.codec_chunk_frames = 25
     wrapper._previous_frames_by_target = {26: 1, 51: 26, 76: 51, 97: 72}
-    wrapper.decoder = SimpleNamespace(
-        _is_suffix_cache_rolling=lambda previous, cached: previous >= 72 and cached == 72
-    )
+    wrapper.decoder = SimpleNamespace(_is_suffix_cache_rolling=lambda previous, cached: previous >= 72 and cached == 72)
     calls: list[tuple[str, int, int]] = []
 
     def _prefix(codes, caches):
