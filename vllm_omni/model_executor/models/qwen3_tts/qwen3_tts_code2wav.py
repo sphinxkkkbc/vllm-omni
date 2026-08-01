@@ -300,7 +300,6 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._batch_stats_forwards += 1
         decoder = self.decoder
         q = int(self._num_quantizers)
-        upsample = int(self._total_upsample)
         sr_val = int(self._output_sample_rate)
         sr_tensor = torch.tensor(sr_val, dtype=torch.int32)
         empty = torch.zeros((0,), dtype=torch.float32)
@@ -315,10 +314,8 @@ class Qwen3TTSCode2Wav(nn.Module):
         ids = input_ids.reshape(-1).to(dtype=torch.long)
         request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
 
-        parsed: list[tuple[int, int]] = []
         valid_codes_qf: list[tuple[str, torch.Tensor]] = []
         valid_indices: list[int] = []
-        left_context_size = [0] * len(request_ids_list)
         ref_context_size = [0] * len(request_ids_list)
         request_state_ids: list[str | None] = [None] * len(request_ids_list)
         ref_context_request_ids: list[str | None] = [None] * len(request_ids_list)
@@ -348,13 +345,11 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         if runtime_infos:
             for i, info in enumerate(runtime_infos):
-                if i >= len(left_context_size):
+                if i >= len(ref_context_size):
                     break
                 if not isinstance(info, dict):
                     continue
                 meta = info.get("meta", {})
-                if "left_context_size" in meta:
-                    left_context_size[i] = _meta_int(meta["left_context_size"])
                 if "ref_context_size" in meta:
                     ref_context_size[i] = _meta_int(meta["ref_context_size"])
                 if "ref_context_request_id" in meta:
@@ -369,9 +364,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             runtime_info = runtime_infos[i] if i < len(runtime_infos) else None
             req_ids = _codec_ids_from_payload_or_input(req_ids, runtime_info)
             if req_ids.numel() < 1:
-                parsed.append((0, 0))
                 continue
-            ctx_frames = left_context_size[i]
             ref_ctx_frames = ref_context_size[i]
             flat = req_ids
             n = flat.numel()
@@ -386,7 +379,6 @@ class Qwen3TTSCode2Wav(nn.Module):
                             n,
                             q,
                         )
-                parsed.append((0, 0))
                 continue
             frames = n // q
             # [q*F] -> [Q, F] for direct decoder call (decoder expects [B, Q, F])
@@ -412,7 +404,6 @@ class Qwen3TTSCode2Wav(nn.Module):
                     cached_ref = cached_ref.to(device=codes_qf.device, dtype=codes_qf.dtype)
                     codes_qf = torch.cat((cached_ref, codes_qf), dim=1)
                     frames = int(codes_qf.shape[1])
-            parsed.append((ctx_frames, frames))
             valid_codes_qf.append((state_req_id, codes_qf))
             if state_req_id is not None:
                 state = self._decoder_state_cache.setdefault(state_req_id, {})
@@ -467,7 +458,6 @@ class Qwen3TTSCode2Wav(nn.Module):
                 pass
 
         wav_tensors: list[torch.Tensor | None] = [None] * len(valid_codes_qf)
-        wav_is_incremental: list[bool] = [False] * len(valid_codes_qf)
         request_aware_indices = [
             index for index, (ref_req_id, _) in enumerate(valid_codes_qf) if ref_req_id is not None
         ]
@@ -502,7 +492,6 @@ class Qwen3TTSCode2Wav(nn.Module):
                 else:
                     raise ValueError(f"Qwen3-TTS batched request decoder returned unexpected shape {tuple(wav.shape)}")
                 wav_tensors[index] = wav[: int(state.get("_last_output_audio_length", wav.shape[-1]))]
-                wav_is_incremental[index] = bool(state.get("_last_output_incremental_audio", False))
                 handled_request_aware.add(index)
 
         def _decode_group_chunks(
@@ -569,7 +558,6 @@ class Qwen3TTSCode2Wav(nn.Module):
                     )
                 for row, (j, _) in enumerate(group_chunk):
                     wav_tensors[j] = wav_rows[row]
-                    wav_is_incremental[j] = bool(states and states.get("_last_output_incremental_audio", False))
 
         # Group by configured frame buckets instead of only exact lengths.
         # For ordinary async streaming windows this is the real batching
@@ -608,24 +596,10 @@ class Qwen3TTSCode2Wav(nn.Module):
         srs = [sr_tensor] * num_req
 
         for j, idx in enumerate(valid_indices):
-            ctx_frames, actual_frames = parsed[idx]
             wav = wav_tensors[j]
             assert wav is not None
-            if wav_is_incremental[j]:
-                start = 0
-                end = max(0, (actual_frames - ctx_frames) * upsample)
-            else:
-                # Slice on exact codec-frame boundaries instead of proportionally.
-                start = max(0, ctx_frames * upsample)
-                end = max(start, actual_frames * upsample)
-            if start >= wav.shape[0]:
-                logger.warning(
-                    "Context trim start %d >= decoded length %d; returning empty audio.",
-                    start,
-                    wav.shape[0],
-                )
+            if wav.numel() == 0:
                 continue
-            wav = wav[start : min(end, wav.shape[0])]
             if wav.shape[0] > 0:
                 # Decoder already runs in fp32, so the .to(float32) is a redundant dispatch.
                 audios[idx] = (wav if wav.dtype == torch.float32 else wav.to(torch.float32)).reshape(-1)

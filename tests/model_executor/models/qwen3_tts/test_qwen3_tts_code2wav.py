@@ -177,7 +177,7 @@ def _load_weights_noop(model: Qwen3TTSCode2Wav) -> set[str]:
         return model.load_weights(iter(()))
 
 
-def test_forward_trims_context_on_exact_frame_boundaries():
+def test_forward_uses_decoder_audio_contract_on_exact_frame_boundaries():
     model = _make_model()
 
     out = model.forward(
@@ -186,11 +186,11 @@ def test_forward_trims_context_on_exact_frame_boundaries():
     )
 
     audio = out.multimodal_outputs["model_outputs"][0]
-    expected = torch.arange(8, 24, dtype=torch.float32)
+    expected = torch.arange(30, dtype=torch.float32)
     torch.testing.assert_close(audio, expected)
 
 
-def test_forward_trims_trailing_padding_without_context():
+def test_forward_uses_decoder_audio_contract_without_context():
     model = _make_model()
 
     out = model.forward(
@@ -199,15 +199,14 @@ def test_forward_trims_trailing_padding_without_context():
     )
 
     audio = out.multimodal_outputs["model_outputs"][0]
-    expected = torch.arange(24, dtype=torch.float32)
+    expected = torch.arange(30, dtype=torch.float32)
     torch.testing.assert_close(audio, expected)
 
 
-def test_forward_does_not_retrim_incremental_decoder_output():
+def test_forward_does_not_retrim_decoder_output():
     model = _make_model()
 
     def _incremental_decode(codes, *, caches, **_kwargs):
-        caches["_last_output_incremental_audio"] = True
         return torch.arange(16, dtype=torch.float32).view(1, 1, -1)
 
     model.decoder.chunked_decode = _incremental_decode
@@ -226,7 +225,7 @@ def test_forward_does_not_retrim_incremental_decoder_output():
     )
 
     audio = out.multimodal_outputs["model_outputs"][0]
-    torch.testing.assert_close(audio, torch.arange(8, dtype=torch.float32))
+    torch.testing.assert_close(audio, torch.arange(16, dtype=torch.float32))
 
 
 def test_request_aware_forward_passes_only_delta_frames_to_decoder():
@@ -479,8 +478,8 @@ def test_forward_batches_equal_length_requests_in_one_decoder_call():
         }
     ]
     audios = out.multimodal_outputs["model_outputs"]
-    torch.testing.assert_close(audios[0], torch.arange(12, dtype=torch.float32))
-    torch.testing.assert_close(audios[1], torch.arange(1004, 1012, dtype=torch.float32))
+    torch.testing.assert_close(audios[0], torch.arange(18, dtype=torch.float32))
+    torch.testing.assert_close(audios[1], torch.arange(1000, 1018, dtype=torch.float32))
 
 
 def test_forward_batches_request_aware_decoder_states():
@@ -490,7 +489,6 @@ def test_forward_batches_request_aware_decoder_states():
     def _batched_chunked_decode(codes, lengths, caches, **kwargs):
         calls.append((codes, lengths, caches))
         for cache in caches:
-            cache["_last_output_incremental_audio"] = False
             cache["_last_output_audio_length"] = 16
         return torch.stack([torch.arange(16, dtype=torch.float32).view(1, -1) + row * 100 for row in range(2)])
 
@@ -517,8 +515,8 @@ def test_forward_batches_request_aware_decoder_states():
     assert calls[0][1] == [4, 4]
     assert [cache["prefix_frames"] for cache in calls[0][2]] == [2, 2]
     audios = out.multimodal_outputs["model_outputs"]
-    torch.testing.assert_close(audios[0], torch.arange(8, 16, dtype=torch.float32))
-    torch.testing.assert_close(audios[1], torch.arange(108, 116, dtype=torch.float32))
+    torch.testing.assert_close(audios[0], torch.arange(16, dtype=torch.float32))
+    torch.testing.assert_close(audios[1], torch.arange(100, 116, dtype=torch.float32))
 
 
 def test_forward_uses_variable_length_chunk_batching_for_long_bucket_group():
@@ -547,8 +545,8 @@ def test_forward_uses_variable_length_chunk_batching_for_long_bucket_group():
         }
     ]
     audios = out.multimodal_outputs["model_outputs"]
-    torch.testing.assert_close(audios[0], torch.arange(8, dtype=torch.float32))
-    torch.testing.assert_close(audios[1], torch.arange(1008, 1016, dtype=torch.float32))
+    torch.testing.assert_close(audios[0], torch.arange(22, dtype=torch.float32))
+    torch.testing.assert_close(audios[1], torch.arange(1000, 1022, dtype=torch.float32))
 
 
 def test_forward_bucket_batches_different_length_requests_and_trims_rows():
@@ -574,9 +572,9 @@ def test_forward_bucket_batches_different_length_requests_and_trims_rows():
     ]
     assert model.decoder.batched_decode_calls == []
     audios = out.multimodal_outputs["model_outputs"]
-    torch.testing.assert_close(audios[0], torch.arange(8, dtype=torch.float32))
-    torch.testing.assert_close(audios[1], torch.arange(1004, 1012, dtype=torch.float32))
-    torch.testing.assert_close(audios[2], torch.arange(2008, 2016, dtype=torch.float32))
+    torch.testing.assert_close(audios[0], torch.arange(22, dtype=torch.float32))
+    torch.testing.assert_close(audios[1], torch.arange(1000, 1022, dtype=torch.float32))
+    torch.testing.assert_close(audios[2], torch.arange(2000, 2022, dtype=torch.float32))
 
 
 def test_forward_bucket_pads_only_to_group_max_frame_length():
@@ -601,8 +599,8 @@ def test_forward_bucket_pads_only_to_group_max_frame_length():
     ]
     assert model.decoder.batched_decode_calls == []
     audios = out.multimodal_outputs["model_outputs"]
-    torch.testing.assert_close(audios[0], torch.arange(8, dtype=torch.float32))
-    torch.testing.assert_close(audios[1], torch.arange(1000, 1012, dtype=torch.float32))
+    torch.testing.assert_close(audios[0], torch.arange(18, dtype=torch.float32))
+    torch.testing.assert_close(audios[1], torch.arange(1000, 1018, dtype=torch.float32))
 
 
 def test_forward_splits_bucket_groups_by_configured_max_batch_size():

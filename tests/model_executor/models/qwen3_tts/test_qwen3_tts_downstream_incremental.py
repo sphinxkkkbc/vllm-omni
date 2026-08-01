@@ -24,7 +24,7 @@ class _RecordingDecoder(nn.Module):
         self.config = SimpleNamespace(sliding_window=72)
         self.prefix_frames = None
 
-    def _decode_cached_incremental(self, codes, caches, prefix_frames):
+    def decode_suffix(self, codes, caches, prefix_frames):
         self.prefix_frames = prefix_frames
         return codes
 
@@ -34,7 +34,7 @@ def test_eager_fallback_uses_dynamic_decoder_prefix_length():
     wrapper = CUDAGraphDecoderWrapper(decoder, enabled=False)
     codes = torch.zeros(1, 2, 2)
 
-    output, incremental = wrapper._decode(
+    output = wrapper._decode(
         codes,
         {
             "prefix_frames": 48,
@@ -45,7 +45,6 @@ def test_eager_fallback_uses_dynamic_decoder_prefix_length():
     )
 
     assert output is codes
-    assert incremental is True
     assert decoder.prefix_frames == 48
 
 
@@ -164,7 +163,6 @@ def test_batched_chunked_decode_groups_exact_phases(monkeypatch):
         ("suffix:icl", 97, 1),
     ]
     assert [int(output.item()) for output in outputs] == [1, 26, 51, 76, 97]
-    assert [cache["_last_output_incremental_audio"] for cache in caches] == [False, True, True, True, True]
 
 
 def test_xvec_delta_chunks_route_through_all_reachable_graph_phases(monkeypatch):
@@ -368,39 +366,6 @@ def test_xvec_first_chunk_replays_prefix_graph(monkeypatch):
     assert [cache["decoder_prefix_frames"] for cache in caches] == [0, 0]
     assert [cache["suffix_frames"] for cache in caches] == [1, 1]
     assert len(outputs) == 2
-
-
-def test_incremental_downstream_matches_full_decode_tail():
-    torch.manual_seed(0)
-    config = Qwen3TTSTokenizerV2DecoderConfig(
-        codebook_size=32,
-        hidden_size=16,
-        latent_dim=16,
-        codebook_dim=16,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        intermediate_size=32,
-        num_hidden_layers=1,
-        num_quantizers=2,
-        decoder_dim=32,
-        upsample_rates=(8, 5, 4, 3),
-        upsampling_ratios=(2, 2),
-    )
-    decoder = Qwen3TTSTokenizerV2Decoder(config).eval()
-    hidden = torch.randn(1, 97, config.latent_dim)
-    new_frames = 25
-
-    with torch.no_grad():
-        full = hidden.permute(0, 2, 1)
-        for blocks in decoder.upsample:
-            for block in blocks:
-                full = block(full)
-        for block in decoder.decoder:
-            full = block(full)
-        expected = full[..., -new_frames * decoder.total_upsample :].clamp(min=-1, max=1)
-        actual = decoder._decode_downstream_incremental(hidden, new_frames)
-
-    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
 
 
 def test_xvec_prefixless_incremental_matches_full_decode_tail():

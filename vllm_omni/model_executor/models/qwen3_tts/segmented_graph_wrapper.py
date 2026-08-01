@@ -229,27 +229,11 @@ class CUDAGraphDecoderWrapper:
             device=device,
             dtype=model_dtype,
         )
-        dummy_upsample = torch.zeros(
-            batch_size,
-            config.latent_dim,
-            self.prefix_length * self.decoder.upsample_factor,
-            device=device,
-            dtype=model_dtype,
-        )
-        dummy_wav = torch.zeros(
-            batch_size,
-            1,
-            self.prefix_length * self.decoder.total_upsample,
-            device=device,
-            dtype=model_dtype,
-        )
         return {
             "ref_hidden": dummy_hidden,
             "ref_conv": dummy_conv,
             "past_key_values": dummy_kv,
             "prefix_hidden": dummy_prefix_hidden,
-            "ref_upsample": dummy_upsample,
-            "ref_wav": dummy_wav,
         }
 
     def _make_dummy_xvec_cache(
@@ -277,8 +261,6 @@ class CUDAGraphDecoderWrapper:
             "ref_conv": torch.zeros(batch_size, 0, config.latent_dim, device=device, dtype=model_dtype),
             "past_key_values": empty_prefix_cache,
             "prefix_hidden": torch.zeros(batch_size, 0, config.latent_dim, device=device, dtype=model_dtype),
-            "ref_upsample": torch.zeros(batch_size, config.latent_dim, 0, device=device, dtype=model_dtype),
-            "ref_wav": torch.zeros(batch_size, 1, 0, device=device, dtype=model_dtype),
         }
 
     def warmup(
@@ -361,7 +343,7 @@ class CUDAGraphDecoderWrapper:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         previous_frames = self._transitions_for_mode(mode)[target_frames]
         rolling = self.decoder._is_suffix_cache_rolling(previous_frames, int(old_quantized.shape[-1]))
-        return self.decoder._decode_suffix_incremental(
+        return self.decoder._decode_suffix(
             codes,
             old_quantized,
             old_conv,
@@ -544,12 +526,15 @@ class CUDAGraphDecoderWrapper:
     def _decode_icl_prefix(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
         batch_size = int(codes.shape[0])
         if batch_size != 1 or batch_size not in self.prefix_graphs or torch.cuda.is_current_stream_capturing():
-            return self.decoder._decode_icl_first_chunk(codes, caches, int(caches["prefix_frames"]))
+            output = self.decoder._decode_icl_first_chunk(codes, caches, int(caches["prefix_frames"]))
+            prefix_frames = int(caches["prefix_frames"])
+            return output[..., -max(0, codes.shape[-1] - prefix_frames) * self.decoder.total_upsample :]
 
         actual_prefix_frames = int(caches["prefix_frames"])
         suffix_frames = int(codes.shape[-1]) - actual_prefix_frames
         if not 0 < actual_prefix_frames <= self.prefix_length or suffix_frames != self.initial_chunk_frames:
-            return self.decoder._decode_icl_first_chunk(codes, caches, actual_prefix_frames)
+            output = self.decoder._decode_icl_first_chunk(codes, caches, actual_prefix_frames)
+            return output[..., -suffix_frames * self.decoder.total_upsample :]
 
         prefix_static_input = self.prefix_static_inputs[batch_size]
         prefix_hidden_mask = self.prefix_hidden_masks[batch_size]
@@ -572,7 +557,7 @@ class CUDAGraphDecoderWrapper:
         caches["suffix_quantized"] = self.prefix_suffix_quantized[batch_size][:, :, : self.initial_chunk_frames]
         caches["suffix_conv"] = self.prefix_suffix_conv[batch_size][:, : self.initial_chunk_frames, :]
         self._ensure_suffix_buffers(caches)
-        return self.prefix_static_outputs[batch_size][..., prefix_pad_frames * self.decoder.total_upsample :]
+        return self.prefix_static_outputs[batch_size][..., -self.initial_chunk_frames * self.decoder.total_upsample :]
 
     def _ensure_suffix_buffers(self, caches: dict) -> None:
         if "_suffix_quantized_buffers" in caches:
@@ -604,8 +589,6 @@ class CUDAGraphDecoderWrapper:
             "ref_hidden",
             "ref_conv",
             "prefix_hidden",
-            "ref_upsample",
-            "ref_wav",
         }
         for key in tensor_cache_keys:
             static_caches[key].copy_(caches[key])
@@ -625,7 +608,7 @@ class CUDAGraphDecoderWrapper:
             static_layer.values.copy_(request_layer.values)
 
     def _copy_request_caches_to_batch(self, request_caches: list[dict], static_caches: dict) -> None:
-        tensor_cache_keys = ("ref_hidden", "ref_conv", "prefix_hidden", "ref_upsample", "ref_wav")
+        tensor_cache_keys = ("ref_hidden", "ref_conv", "prefix_hidden")
         for row, request_cache in enumerate(request_caches):
             for key in tensor_cache_keys:
                 static_caches[key][row : row + 1].copy_(request_cache[key])
@@ -722,7 +705,7 @@ class CUDAGraphDecoderWrapper:
         self._record_graph_hit("prefix", batch_size, len(codes_list))
         static_caches = self.prefix_static_caches[batch_size]
         outputs: list[torch.Tensor] = []
-        tensor_keys = ("ref_hidden", "ref_conv", "prefix_hidden", "ref_upsample", "ref_wav")
+        tensor_keys = ("ref_hidden", "ref_conv", "prefix_hidden")
         for row, (cache, prefix_pad) in enumerate(zip(request_caches, prefix_pads, strict=True)):
             for key in tensor_keys:
                 cache[key] = static_caches[key][row : row + 1].clone()
@@ -736,8 +719,11 @@ class CUDAGraphDecoderWrapper:
                 row : row + 1, : self.initial_chunk_frames, :
             ].clone()
             cache["suffix_frames"] = self.initial_chunk_frames
-            start = prefix_pad * self.decoder.total_upsample
-            outputs.append(self.prefix_static_outputs[batch_size][row : row + 1, :, start:].clone())
+            outputs.append(
+                self.prefix_static_outputs[batch_size][
+                    row : row + 1, :, -self.initial_chunk_frames * self.decoder.total_upsample :
+                ].clone()
+            )
         return outputs
 
     def _decode_xvec_prefix_batch(
@@ -781,7 +767,7 @@ class CUDAGraphDecoderWrapper:
         self._record_graph_hit("xvec_prefix", batch_size, len(codes_list))
         static_caches = self.xvec_prefix_static_caches[batch_size]
         outputs: list[torch.Tensor] = []
-        tensor_keys = ("ref_hidden", "ref_conv", "prefix_hidden", "ref_upsample", "ref_wav")
+        tensor_keys = ("ref_hidden", "ref_conv", "prefix_hidden")
         for row, cache in enumerate(request_caches):
             for key in tensor_keys:
                 cache[key] = static_caches[key][row : row + 1].clone()
@@ -884,10 +870,9 @@ class CUDAGraphDecoderWrapper:
         request_caches: list[dict],
     ) -> list[torch.Tensor]:
         outputs: list[torch.Tensor | None] = [None] * len(codes_list)
-        incremental: list[bool] = [False] * len(codes_list)
         groups: dict[tuple[str, int], list[int]] = {}
         for index, (codes, cache) in enumerate(zip(codes_list, request_caches, strict=True)):
-            if "ref_wav" not in cache:
+            if "suffix_quantized" not in cache:
                 prefix_frames = int(cache["prefix_frames"])
                 suffix_frames = int(codes.shape[-1]) - prefix_frames
                 if prefix_frames == 0:
@@ -936,26 +921,22 @@ class CUDAGraphDecoderWrapper:
                 mode = phase.removeprefix("suffix:")
                 new_frames = [int(codes.shape[-1]) for codes in group_codes]
                 group_outputs = self._decode_suffix_batch(mode, target, group_codes, group_caches, new_frames)
-                if group_outputs is not None:
-                    for index in indices:
-                        incremental[index] = True
 
             if group_outputs is None:
                 group_outputs = []
                 for index in indices:
                     cache = request_caches[index]
                     codes = codes_list[index]
-                    if "ref_wav" not in cache:
+                    if "suffix_quantized" not in cache:
                         if int(cache["prefix_frames"]) == 0:
                             group_outputs.append(self.decoder._decode_xvec_first_chunk(codes, cache))
                         else:
-                            group_outputs.append(self._decode_icl_prefix(codes, cache))
+                            output = self._decode_icl_prefix(codes, cache)
+                            group_outputs.append(output)
                     else:
-                        group_outputs.append(self._decode_eager(codes, cache, delta=True))
-                        incremental[index] = True
+                        group_outputs.append(self._decode_eager(codes, cache))
             for index, output in zip(indices, group_outputs, strict=True):
                 outputs[index] = output
-                request_caches[index]["_last_output_incremental_audio"] = incremental[index]
                 request_caches[index]["_last_output_audio_length"] = int(output.shape[-1])
 
         return [output for output in outputs if output is not None]
@@ -992,7 +973,7 @@ class CUDAGraphDecoderWrapper:
             padded[row, :, : output.shape[-1]].copy_(output[0])
         return padded
 
-    def _decode_eager(self, codes: torch.Tensor, caches: dict, *, delta: bool = False) -> torch.Tensor:
+    def _decode_eager(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
         for key in (
             "_suffix_quantized_buffers",
             "_suffix_conv_buffers",
@@ -1000,9 +981,7 @@ class CUDAGraphDecoderWrapper:
         ):
             caches.pop(key, None)
         decoder_prefix_frames = int(caches.get("decoder_prefix_frames", caches["prefix_frames"]))
-        if delta:
-            return self.decoder._decode_delta_incremental(codes, caches, decoder_prefix_frames)
-        return self.decoder._decode_cached_incremental(codes, caches, decoder_prefix_frames)
+        return self.decoder.decode_suffix(codes, caches, decoder_prefix_frames)
 
     def _decode(
         self,
@@ -1010,9 +989,9 @@ class CUDAGraphDecoderWrapper:
         caches: dict,
         *,
         clone_graph_output: bool,
-    ) -> tuple[torch.Tensor, bool]:
+    ) -> torch.Tensor:
         if not self.enabled or not self._warmed_up:
-            return self._decode_eager(codes, caches), True
+            return self._decode_eager(codes, caches)
 
         # Inner CUDA graph replay is illegal while an outer stream capture is
         # active (e.g. vLLM's cudagraph_mode=FULL warmup on Stage 1). Fall back
@@ -1021,16 +1000,16 @@ class CUDAGraphDecoderWrapper:
         # outside the startup capture window, so normal inference still hits
         # the graph fast path.
         if torch.cuda.is_current_stream_capturing():
-            return self._decode_eager(codes, caches), True
+            return self._decode_eager(codes, caches)
 
         if int(codes.shape[0]) != 1:
-            return self._decode_eager(codes, caches), True
+            return self._decode_eager(codes, caches)
 
         suffix_frames = int(codes.shape[-1])
         old_quantized = caches.get("suffix_quantized")
         old_conv = caches.get("suffix_conv")
         if old_quantized is None or old_conv is None:
-            return self._decode_eager(codes, caches), True
+            return self._decode_eager(codes, caches)
 
         self._ensure_suffix_buffers(caches)
         old_quantized = caches["suffix_quantized"]
@@ -1056,7 +1035,7 @@ class CUDAGraphDecoderWrapper:
         )
         graph_key = (mode, int(codes.shape[0]), target_frames) if target_frames is not None else None
         if graph_key is None or not 0 < new_frames <= self.codec_chunk_frames or graph_key not in self.combined_graphs:
-            return self._decode_eager(codes, caches), True
+            return self._decode_eager(codes, caches)
 
         request_kv = caches["past_key_values"]
         expected_kv_length = 0 if mode == "xvec" else self.prefix_length
@@ -1067,7 +1046,7 @@ class CUDAGraphDecoderWrapper:
                 expected_kv_length,
                 request_kv.get_seq_length(),
             )
-            return self._decode_eager(codes, caches), True
+            return self._decode_eager(codes, caches)
 
         new_codes = codes[:, :, -new_frames:]
         static_codes = self.combined_static_codes[graph_key]
@@ -1106,8 +1085,8 @@ class CUDAGraphDecoderWrapper:
         actual_suffix_frames = (self.prefix_length if rolling else previous_suffix_frames) + new_frames
         output = self._trim_replay_output(output, actual_suffix_frames, target_frames)
         if clone_graph_output:
-            return output.clone(), True
-        return output, True
+            return output.clone()
+        return output
 
     def _trim_replay_output(self, static_output: torch.Tensor, actual_size: int, padded_size: int) -> torch.Tensor:
         """Trim a graph/compiled replay output to the eager-equivalent length.
@@ -1125,8 +1104,7 @@ class CUDAGraphDecoderWrapper:
         return static_output[..., :actual_out_len]
 
     def decode(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
-        output, _ = self._decode(codes, caches, clone_graph_output=True)
-        return output
+        return self._decode(codes, caches, clone_graph_output=True)
 
     def chunked_decode_with_cudagraph(
         self,
@@ -1139,43 +1117,33 @@ class CUDAGraphDecoderWrapper:
         start_index = 0
         total_len = codes.shape[-1]
         total_upsample = self.decoder.total_upsample
-        incremental_flags: list[bool] = []
-
         while start_index < total_len:
             end_index = min(start_index + chunk_size, total_len)
             context_size = left_context_size if start_index - left_context_size > 0 else start_index
 
             codes_chunk = codes[..., start_index - context_size : end_index]
-            incremental_output = False
             if caches is None or codes_chunk.shape[-1] == 4:
                 wav_chunk = self.decoder._forward_exact(codes_chunk)
-            elif "ref_wav" not in caches:
+            elif "suffix_quantized" not in caches:
                 wav_chunk = self._decode_icl_prefix(codes_chunk, caches)
             else:
                 actual_prefix_frames = int(caches.get("prefix_frames", self.prefix_length))
                 codes_chunk = codes_chunk[:, :, actual_prefix_frames:]
-                wav_chunk, incremental_output = self._decode(
-                    codes_chunk,
-                    caches,
-                    clone_graph_output=False,
-                )
+                wav_chunk = self._decode(codes_chunk, caches, clone_graph_output=False)
 
             # Keep origin/main's concat semantics: Qwen3-Omni can return a chunk
             # that is shorter than the nominal code_len * total_upsample length.
             # Clone each slice because graph outputs are static buffers that later
             # replays may overwrite.
-            if incremental_output:
+            if caches is not None:
                 wavs.append(wav_chunk.clone())
             else:
                 wavs.append(wav_chunk[..., context_size * total_upsample :].clone())
-            incremental_flags.append(incremental_output)
             start_index = end_index
 
         if not wavs:
             return self.decoder._forward_exact(codes)
         output = torch.cat(wavs, dim=-1)
-        if caches is not None:
-            caches["_last_output_incremental_audio"] = bool(incremental_flags) and all(incremental_flags)
         if output.is_cuda and not torch.cuda.is_current_stream_capturing():
             torch.cuda.current_stream(output.device).synchronize()
         return output

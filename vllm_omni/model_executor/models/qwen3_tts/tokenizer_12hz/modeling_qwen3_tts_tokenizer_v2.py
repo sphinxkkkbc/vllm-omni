@@ -983,41 +983,12 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         for blocks in self.upsample:
             for block in blocks:
                 hidden = block(hidden)
-        caches.update({"ref_upsample": hidden[:, :, : prefix_frames * self.upsample_factor]})
-
         wav = hidden
 
         for block in self.decoder:
             wav = block(wav)
-        caches.update({"ref_wav": wav[:, :, : prefix_frames * self.total_upsample]})
-
         wav = wav.clamp(min=-1, max=1)
         return wav
-
-    def _decode_suffix_before_transformer(
-        self,
-        new_codes: torch.Tensor,
-        conv_context: torch.Tensor,
-        boundary_input: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Compute new suffix quantizer and pre-conv states before the Transformer.
-
-        ``conv_context`` contains the available quantized frames immediately
-        before ``new_codes``. In the rolling phase, ``boundary_input`` contains
-        the optional reference tail followed by the first two retained suffix
-        frames.
-        """
-        new_quantized = self.quantizer.decode(new_codes)
-
-        new_conv_input = torch.cat([conv_context, new_quantized], dim=-1)
-        new_conv = self.pre_conv(new_conv_input)
-        new_conv = new_conv[:, :, -new_codes.shape[-1] :].transpose(1, 2)
-
-        boundary_conv = None
-        if boundary_input is not None:
-            boundary_conv = self.pre_conv(boundary_input)
-            boundary_conv = boundary_conv[:, :, -_CONV_CONTEXT_FRAME:].transpose(1, 2)
-        return new_quantized, new_conv, boundary_conv
 
     def _decode_xvec_first_chunk(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
         """Initialize prefixless incremental state from the first codec chunk."""
@@ -1058,16 +1029,13 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         for blocks in self.upsample:
             for block in blocks:
                 hidden = block(hidden)
-        caches["ref_upsample"] = hidden[:, :, :0]
-
         wav = hidden
         for block in self.decoder:
             wav = block(wav)
-        caches["ref_wav"] = wav[:, :, :0]
         caches["suffix_frames"] = int(codes.shape[-1])
         return wav.clamp(min=-1, max=1)
 
-    def _decode_suffix_incremental(
+    def _decode_suffix(
         self,
         new_codes: torch.Tensor,
         old_quantized: torch.Tensor,
@@ -1081,46 +1049,37 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         ref_hidden = caches["ref_hidden"]
         conv_context = torch.cat([ref_hidden, old_quantized], dim=-1)[:, :, -_CONV_CONTEXT_FRAME:]
         suffix_cache_length = int(self.config.sliding_window)
+
+        new_quantized = self.quantizer.decode(new_codes)
+        new_conv_input = torch.cat([conv_context, new_quantized], dim=-1)
+        new_conv = self.pre_conv(new_conv_input)
+        new_conv = new_conv[:, :, -new_codes.shape[-1] :].transpose(1, 2)
+
         if rolling:
             boundary_input = torch.cat(
                 [ref_hidden[:, :, -_CONV_CONTEXT_FRAME:], old_quantized[:, :, :_CONV_CONTEXT_FRAME]],
                 dim=-1,
             )
-        else:
-            boundary_input = None
-
-        new_quantized, new_conv, boundary_conv = self._decode_suffix_before_transformer(
-            new_codes,
-            conv_context,
-            boundary_input,
-        )
-        if rolling:
-            assert boundary_conv is not None
+            boundary_conv = self.pre_conv(boundary_input)
+            boundary_conv = boundary_conv[:, :, -_CONV_CONTEXT_FRAME:].transpose(1, 2)
             suffix_conv = torch.cat([boundary_conv, old_conv, new_conv], dim=1)
         else:
             suffix_conv = torch.cat([old_conv, new_conv], dim=1)
 
         next_quantized = torch.cat([old_quantized, new_quantized], dim=-1)[:, :, -suffix_cache_length:]
         next_conv = suffix_conv[:, -(suffix_cache_length - _CONV_CONTEXT_FRAME) :, :]
-        wav = self._decode_suffix_transformer_and_downstream(
-            suffix_conv,
-            caches,
-            prefix_frames,
-            new_frames,
+
+        hidden = torch.cat([caches["ref_conv"], suffix_conv], dim=1)
+        hidden = hidden.transpose(1, 2).contiguous().transpose(1, 2)
+        working_cache = copy.deepcopy(caches["past_key_values"])
+        suffix_hidden = self.pre_transformer(
+            inputs_embeds=hidden[:, prefix_frames:, :],
             attention_mask=attention_mask,
-        )
-        return wav, next_quantized, next_conv
+            past_key_values=working_cache,
+            use_cache=True,
+        ).last_hidden_state
+        hidden = torch.cat([caches["prefix_hidden"], suffix_hidden], dim=1)
 
-    def _is_suffix_cache_rolling(self, previous_suffix_frames: int, cached_frames: int) -> bool:
-        suffix_cache_length = int(self.config.sliding_window)
-        return previous_suffix_frames >= suffix_cache_length and cached_frames == suffix_cache_length
-
-    def _decode_downstream_incremental(
-        self,
-        hidden: torch.Tensor,
-        new_frames: int,
-    ) -> torch.Tensor:
-        """Decode only newly emitted audio from the current Transformer output."""
         required_frames = min(hidden.shape[1], new_frames + _DOWNSTREAM_CONTEXT_FRAME)
         hidden = hidden[:, -required_frames:, :].permute(0, 2, 1)
         for blocks in self.upsample:
@@ -1130,32 +1089,14 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         wav = hidden
         for block in self.decoder:
             wav = block(wav)
-        return wav[..., -new_frames * self.total_upsample :].clamp(min=-1, max=1)
+        wav = wav[..., -new_frames * self.total_upsample :].clamp(min=-1, max=1)
+        return wav, next_quantized, next_conv
 
-    def _decode_suffix_transformer_and_downstream(
-        self,
-        suffix_conv: torch.Tensor,
-        caches: dict,
-        prefix_frames: int,
-        new_frames: int,
-        attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Recompute the full Transformer suffix, then decode only new audio."""
-        ref_conv = caches["ref_conv"]
-        hidden = torch.cat([ref_conv, suffix_conv], dim=1)
-        hidden = hidden.transpose(1, 2).contiguous().transpose(1, 2)
+    def _is_suffix_cache_rolling(self, previous_suffix_frames: int, cached_frames: int) -> bool:
+        suffix_cache_length = int(self.config.sliding_window)
+        return previous_suffix_frames >= suffix_cache_length and cached_frames == suffix_cache_length
 
-        working_cache = copy.deepcopy(caches["past_key_values"])
-        suffix_hidden = self.pre_transformer(
-            inputs_embeds=hidden[:, prefix_frames:, :],
-            attention_mask=attention_mask,
-            past_key_values=working_cache,
-            use_cache=True,
-        ).last_hidden_state
-        hidden = torch.cat([caches["prefix_hidden"], suffix_hidden], dim=1)
-        return self._decode_downstream_incremental(hidden, new_frames)
-
-    def _decode_delta_incremental(self, new_codes, caches, prefix_frames):
+    def decode_suffix(self, new_codes, caches, prefix_frames):
         previous_suffix_frames = int(caches.get("suffix_frames", caches["suffix_quantized"].shape[-1]))
         cached_frames = int(caches["suffix_quantized"].shape[-1])
         suffix_cache_length = int(self.config.sliding_window)
@@ -1175,7 +1116,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             device=new_codes.device,
         )
         attention_mask[:, : int(caches.get("prefix_pad_frames", 0))] = 0
-        output, next_quantized, next_conv = self._decode_suffix_incremental(
+        output, next_quantized, next_conv = self._decode_suffix(
             new_codes,
             caches["suffix_quantized"],
             caches["suffix_conv"],
@@ -1189,16 +1130,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         caches["suffix_conv"] = next_conv
         caches["suffix_frames"] = retained_frames + new_frames
         return output
-
-    def _decode_cached_incremental(self, codes, caches, prefix_frames):
-        previous_suffix_frames = int(caches.get("suffix_frames", caches["suffix_quantized"].shape[-1]))
-        cached_frames = int(caches["suffix_quantized"].shape[-1])
-        retained_frames = (
-            int(self.config.sliding_window)
-            if self._is_suffix_cache_rolling(previous_suffix_frames, cached_frames)
-            else previous_suffix_frames
-        )
-        return self._decode_delta_incremental(codes[:, :, retained_frames:], caches, prefix_frames)
 
     def forward(self, codes, caches=None):
         if codes.shape[1] != self.config.num_quantizers:
@@ -1215,7 +1146,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
                 f"prefix_frames={prefix_frames}, total_frames={codes.shape[-1]}"
             )
 
-        if "ref_wav" not in caches:
+        if "suffix_quantized" not in caches:
             if codes.shape[-1] < prefix_frames:
                 raise ValueError(
                     "Qwen3-TTS ICL first chunk is shorter than its prefix: "
@@ -1226,7 +1157,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             return self._decode_icl_first_chunk(codes, caches, prefix_frames)
         else:
             decoder_prefix_frames = int(caches.get("decoder_prefix_frames", prefix_frames))
-            return self._decode_delta_incremental(codes, caches, decoder_prefix_frames)
+            return self.decode_suffix(codes, caches, decoder_prefix_frames)
 
     def chunked_decode(
         self,
@@ -1246,31 +1177,29 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
         # Original implementation (eager mode)
         wavs = []
-        incremental_flags: list[bool] = []
         start_index = 0
         while start_index < codes.shape[-1]:
             end_index = min(start_index + chunk_size, codes.shape[-1])
             context_size = left_context_size if start_index - left_context_size > 0 else start_index
             codes_chunk = codes[..., start_index - context_size : end_index]
-            incremental_output = caches is not None and "ref_wav" in caches
-            if incremental_output:
+            if caches is not None:
                 logical_prefix_frames = int(caches["prefix_frames"])
                 decoder_prefix_frames = int(caches.get("decoder_prefix_frames", logical_prefix_frames))
-                suffix_codes = codes_chunk[:, :, logical_prefix_frames:]
-                wav_chunk = self._decode_cached_incremental(
-                    suffix_codes,
-                    caches,
-                    decoder_prefix_frames,
-                )
+                if "suffix_quantized" in caches:
+                    wav_chunk = self.decode_suffix(codes_chunk, caches, decoder_prefix_frames)
+                else:
+                    wav_chunk = self(codes_chunk, caches)
+                    suffix_frames = codes_chunk.shape[-1] - logical_prefix_frames
+                    wav_chunk = wav_chunk[..., -suffix_frames * self.total_upsample :]
                 wavs.append(wav_chunk)
             else:
                 wav_chunk = self(codes_chunk, caches)
+                if caches is not None and "suffix_quantized" not in caches:
+                    prefix_frames = int(caches.get("prefix_frames", 0))
+                    wav_chunk = wav_chunk[..., -(codes_chunk.shape[-1] - prefix_frames) * self.total_upsample :]
                 wavs.append(wav_chunk[..., context_size * self.total_upsample :])
-            incremental_flags.append(incremental_output)
             start_index = end_index
         output = torch.cat(wavs, dim=-1)
-        if caches is not None:
-            caches["_last_output_incremental_audio"] = bool(incremental_flags) and all(incremental_flags)
         return output
 
     def batched_chunked_decode(
