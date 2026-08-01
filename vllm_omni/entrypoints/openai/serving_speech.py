@@ -2977,51 +2977,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         stage0_params.temperature = 0.05
         return stage0_params
 
-    def _apply_cosyvoice3_dynamic_tokens(
-        self,
-        sampling_params_list: list,
-        request: OpenAICreateSpeechRequest,
-    ) -> list:
-        """Set min/max tokens from tokenized text length (ratios target tokens, not chars)."""
-        import copy
-
-        from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
-        from vllm_omni.model_executor.models.cosyvoice3.utils import extract_text_token
-
-        sampling_params_list = copy.deepcopy(sampling_params_list)
-        hf_cfg = self.model_config.hf_config
-        # Build the Qwen tokenizer once per process (resolving the model dir via
-        # snapshot_download at most once) and reuse it across requests.
-        tokenizer = self._cosyvoice3_tokenizer
-        if tokenizer is None:
-            model_path = self.engine_client.model_config.model
-            if not os.path.isdir(model_path):
-                from huggingface_hub import snapshot_download
-
-                model_path = snapshot_download(model_path)
-            tokenizer = get_qwen_tokenizer(
-                token_path=os.path.join(model_path, hf_cfg.qwen_pretrain_path),
-                skip_special_tokens=hf_cfg.skip_special_tokens,
-                version=hf_cfg.version,
-            )
-            self._cosyvoice3_tokenizer = tokenizer
-        _, text_token_len = extract_text_token(
-            request.input,
-            tokenizer,
-            hf_cfg.allowed_special,
-        )
-        min_ratio = getattr(hf_cfg, "min_token_text_ratio", 2)
-        max_ratio = getattr(hf_cfg, "max_token_text_ratio", 20)
-        sampling_params_list[0].min_tokens = max(1, int(text_token_len * min_ratio))
-        sampling_params_list[0].max_tokens = min(2048, int(text_token_len * max_ratio))
-        logger.info(
-            "CosyVoice3 dynamic tokens: text_tokens=%d, min_tokens=%d, max_tokens=%d",
-            text_token_len,
-            sampling_params_list[0].min_tokens,
-            sampling_params_list[0].max_tokens,
-        )
-        return sampling_params_list
-
     # ---- GLM-TTS helpers ----
 
     async def _build_glm_tts_prompt(
@@ -3313,9 +3268,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         elif self._tts_model_type == "audex_tta" and sampling_params_list:
             sampling_params_list[0] = self._inject_audex_tta_args(request_id, prompt, sampling_params_list[0])
 
-        # Some TTS model defaults come from deploy YAML. Their AR
-        # generation length is controlled by SamplingParams.max_tokens, so only
-        # override it when the caller explicitly requests max_new_tokens.
+        # Apply adapter-owned sampling overrides, including request-level token
+        # limits and model-specific dynamic token or stop-token configuration.
         if sampling_params_list and (adapter := self._get_tts_adapter()) is not None:
             sampling_params_list = adapter.apply_sampling_overrides(sampling_params_list, request, prompt)
 
