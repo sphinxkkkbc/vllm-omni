@@ -16,6 +16,7 @@ from PIL import Image
 from torch import nn
 
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -465,7 +466,7 @@ def test_edge_forward_rejects_unsupported_modes(
 
 
 def test_pipeline_registered_and_exported() -> None:
-    from vllm_omni.diffusion.cache.cache_dit_backend import CUSTOM_DIT_ENABLERS
+    from vllm_omni.diffusion.cache.cachedit import CUSTOM_DIT_ENABLERS
     from vllm_omni.diffusion.models import cosmos3
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
     from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
@@ -857,6 +858,10 @@ def test_flow_unipc_reuses_scheduler_and_forwards_each_request_shift(make_cosmos
     assert all(call["sigmas"] is None for call in scheduler.set_timesteps_calls)
 
 
+@pytest.mark.skipif(
+    current_omni_platform.is_rocm(),
+    reason="Pytorch shipped with vLLM does not built with LAPACK support",
+)
 def test_flow_unipc_reproducible_with_same_seed(make_cosmos3_pipeline) -> None:
     from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import (
         FlowUniPCMultistepScheduler,

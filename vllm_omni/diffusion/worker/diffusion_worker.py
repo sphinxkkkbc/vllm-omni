@@ -11,8 +11,11 @@ to DiffusionModelRunner.
 import gc
 import multiprocessing as mp
 import os
+import queue
 import signal
+import threading
 import traceback
+import uuid
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -30,6 +33,8 @@ from vllm.utils.mem_utils import GiB_bytes
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from vllm_omni.diffusion.data import (
+    AsyncDiffusionOutput,
+    AsyncOutputKind,
     DiffusionOutput,
     OmniACK,
     OmniDiffusionConfig,
@@ -50,6 +55,7 @@ from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPref
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
+from vllm_omni.inputs.data import OmniInteractionPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
@@ -315,6 +321,7 @@ class DiffusionWorker:
                 sequence_parallel_size=parallel_config.sequence_parallel_size,
                 ulysses_degree=parallel_config.ulysses_degree,
                 ring_degree=parallel_config.ring_degree,
+                allgather_degree=parallel_config.allgather_degree,
                 tensor_parallel_size=parallel_config.tensor_parallel_size,
                 pipeline_parallel_size=parallel_config.pipeline_parallel_size,
                 fully_shard_degree=parallel_config.hsdp_shard_size if parallel_config.use_hsdp else 1,
@@ -509,6 +516,15 @@ class DiffusionWorker:
         # NOTE (Alex): We have not implemented the API routing
         # for the frontend server yet.
         return self.lora_manager.add_adapter(lora_request)
+
+    def submit_interaction(
+        self,
+        request_id: str,
+        interaction: OmniInteractionPrompt,
+    ) -> None:
+        """Apply a midway interaction to an active stepwise request."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        self.model_runner.submit_interaction(request_id, interaction)
 
     def list_loras(self) -> list[int]:
         return self.lora_manager.list_adapters()
@@ -783,6 +799,21 @@ class WorkerProc:
         self.worker = self._create_worker(gpu_id, od_config, worker_extension_cls, custom_pipeline_args)
         self._running = True
 
+        self._async_output_queue: queue.Queue | None = None
+        self._async_output_thread: threading.Thread | None = None
+        if not self.od_config.step_execution:
+            self._async_output_queue = queue.Queue()
+            self._async_output_thread = threading.Thread(
+                target=self._async_output_loop,
+                daemon=True,
+                name="DiffusionAsyncOutput",
+            )
+            self._async_output_thread.start()
+
+    @staticmethod
+    def _generate_async_output_id() -> str:
+        return uuid.uuid4().hex
+
     def _create_worker(
         self,
         gpu_id: int,
@@ -802,18 +833,72 @@ class WorkerProc:
         )
         return wrapper
 
-    def _return_result(self, output: Any) -> None:
+    def _return_result(self, output: Any, rpc_id: str | None = None) -> None:
         """Reply to client, only on rank 0."""
-        if self.result_mq is not None:
-            if isinstance(output, OmniACK):
-                self.result_mq.enqueue(output)
-                return
-            try:
-                pack_diffusion_output_shm(output)
-            except Exception as e:
-                if hasattr(output, "output"):
-                    logger.warning("SHM pack failed for model output: %s", e)
+        if self.result_mq is None:
+            return
+        if isinstance(output, OmniACK):
             self.result_mq.enqueue(output)
+            return
+
+        # Async path: enqueue compute_done immediately, bg thread does D2H+SHM.
+        if not self.od_config.step_execution and isinstance(output, (DiffusionOutput, BatchRunnerOutput)):
+            async_output_id = WorkerProc._generate_async_output_id()
+            gpu_event = current_omni_platform.record_device_event()
+            self._async_output_queue.put((output, async_output_id, gpu_event))
+            msg = AsyncDiffusionOutput(
+                kind=AsyncOutputKind.COMPUTE_DONE,
+                rpc_id=rpc_id,
+                async_output_id=async_output_id,
+            )
+            self.result_mq.enqueue(msg)
+            return
+
+        # Sync path (original, or async fallback).
+        try:
+            pack_diffusion_output_shm(output)
+        except Exception as e:
+            if hasattr(output, "output"):
+                logger.warning("SHM pack failed for model output: %s", e)
+        self.result_mq.enqueue(output)
+
+    def _async_output_loop(self):
+        """Background thread: D2H + SHM packing for async diffusion output.
+
+        Uses a side stream so the D2H transfer does not block the default
+        stream where the next forward runs.
+        """
+        device = torch.device(torch.accelerator.current_accelerator().type, self.gpu_id)
+        d2h_stream = torch.Stream(device=device)
+        while self._running:
+            output, async_output_id, gpu_event = self._async_output_queue.get()
+            try:
+                # Cross-stream ordering: wait for default stream to finish
+                # writing the output tensors before the side stream reads.
+                if gpu_event is not None:
+                    d2h_stream.wait_event(gpu_event)
+                pack_diffusion_output_shm(output, d2h_stream=d2h_stream)
+                d2h_stream.synchronize()
+
+                self.result_mq.enqueue(
+                    AsyncDiffusionOutput(
+                        kind=AsyncOutputKind.OUTPUT_READY,
+                        async_output_id=async_output_id,
+                        output=output,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Async output packing failed for id '%s'; sending error",
+                    async_output_id,
+                )
+                self.result_mq.enqueue(
+                    AsyncDiffusionOutput(
+                        kind=AsyncOutputKind.OUTPUT_READY,
+                        async_output_id=async_output_id,
+                        error="Background D2H/SHM packing failed",
+                    )
+                )
 
     def _gather_rpc_rank_statuses(self, status: dict[str, Any]) -> list[dict[str, Any]]:
         if not torch.distributed.is_initialized():
@@ -925,13 +1010,25 @@ class WorkerProc:
             # Route message based on type
             elif isinstance(msg, dict) and msg.get("type") == "rpc":
                 try:
+                    rpc_id = msg.get("rpc_id")
                     result, should_reply = self._execute_rpc(msg)
                     if should_reply:
-                        self._return_result(result)
+                        self._return_result(result, rpc_id=rpc_id)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     if self.result_mq is not None:
-                        self._return_result({"status": "error", "error": str(e)})
+                        if rpc_id is not None:
+                            # Async RPC: must complete the executor''s pending
+                            # future so collective_rpc() doesn''t hang.
+                            self.result_mq.enqueue(
+                                AsyncDiffusionOutput(
+                                    kind=AsyncOutputKind.RPC_RESULT,
+                                    rpc_id=rpc_id,
+                                    error=str(e),
+                                )
+                            )
+                        else:
+                            self._return_result({"status": "error", "error": str(e)})
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)
