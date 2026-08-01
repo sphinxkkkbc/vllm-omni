@@ -66,7 +66,7 @@ def test_segmented_capture_sizes_are_derived_from_decoder_and_chunk_config():
     assert wrapper._xvec_previous_frames_by_target == {6: 2, 10: 6, 14: 10}
 
 
-def test_xvec_capture_uses_actual_cached_conv_lengths():
+def test_xvec_and_icl_capture_use_the_same_cached_conv_lengths():
     decoder = _RecordingDecoder()
     decoder.config.sliding_window = 72
     wrapper = CUDAGraphDecoderWrapper(
@@ -76,7 +76,7 @@ def test_xvec_capture_uses_actual_cached_conv_lengths():
         enabled=False,
     )
 
-    assert [wrapper._cached_conv_frames("xvec", frames) for frames in (1, 26, 51, 72)] == [1, 25, 50, 70]
+    assert [wrapper._cached_conv_frames("xvec", frames) for frames in (1, 26, 51, 72)] == [1, 26, 51, 70]
     assert [wrapper._cached_conv_frames("icl", frames) for frames in (1, 26, 51, 72)] == [1, 26, 51, 70]
 
 
@@ -446,6 +446,44 @@ def test_xvec_prefixless_incremental_matches_full_decode_tail():
     assert caches["suffix_frames"] == 50
     assert caches["past_key_values"].get_seq_length() == 0
     assert all(layer.is_initialized for layer in caches["past_key_values"].layers)
+    torch.testing.assert_close(
+        incremental,
+        full[..., -25 * decoder.total_upsample :],
+        atol=1e-5,
+        rtol=1e-4,
+    )
+
+
+def test_single_frame_xvec_prefix_keeps_all_next_chunk_conv_frames():
+    torch.manual_seed(4)
+    config = Qwen3TTSTokenizerV2DecoderConfig(
+        codebook_size=32,
+        hidden_size=16,
+        latent_dim=16,
+        codebook_dim=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_quantizers=2,
+        decoder_dim=32,
+        upsample_rates=(8, 5, 4, 3),
+        upsampling_ratios=(2, 2),
+        sliding_window=72,
+    )
+    decoder = Qwen3TTSTokenizerV2Decoder(config).eval()
+    decoder._incremental_chunk_frames = 25
+    codes = torch.randint(0, config.codebook_size, (1, config.num_quantizers, 26))
+    caches = {"prefix_frames": 0}
+
+    with torch.no_grad():
+        decoder(codes[..., :1], caches=caches)
+        incremental = decoder(codes[..., 1:], caches=caches)
+        full = decoder._forward_exact(codes)
+
+    assert caches["suffix_frames"] == 26
+    assert caches["suffix_quantized"].shape[-1] == 26
+    assert caches["suffix_conv"].shape[1] == 26
     torch.testing.assert_close(
         incremental,
         full[..., -25 * decoder.total_upsample :],

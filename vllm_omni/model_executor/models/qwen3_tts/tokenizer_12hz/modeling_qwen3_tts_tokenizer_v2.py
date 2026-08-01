@@ -1010,7 +1010,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
         new_conv_input = torch.cat([conv_context, new_quantized], dim=-1)
         new_conv = self.pre_conv(new_conv_input)
-        new_conv = new_conv[:, :, _CONV_CONTEXT_FRAME:].transpose(1, 2)
+        new_conv = new_conv[:, :, conv_context.shape[-1] :].transpose(1, 2)
 
         boundary_conv = None
         if boundary_input is not None:

@@ -129,12 +129,8 @@ class CUDAGraphDecoderWrapper:
     def _transitions_for_mode(self, mode: str) -> dict[int, int]:
         return self._xvec_previous_frames_by_target if mode == "xvec" else self._previous_frames_by_target
 
-    def _cached_conv_frames(self, mode: str, previous_frames: int) -> int:
-        capacity = self.prefix_length - 2
-        if mode != "xvec" or previous_frames == self.initial_chunk_frames:
-            return min(previous_frames, capacity)
-        missing_initial_context = max(0, 2 - self.initial_chunk_frames)
-        return min(previous_frames - missing_initial_context, capacity)
+    def _cached_conv_frames(self, _mode: str, previous_frames: int) -> int:
+        return min(previous_frames, self.prefix_length - 2)
 
     def _record_graph_hit(self, phase: str, batch_size: int, request_count: int) -> None:
         if not getattr(self, "_stats_enabled", False):
