@@ -51,6 +51,7 @@ from vllm_omni.model_executor.models.ming_tts.constants import (
     KEY_SPEAKER_WAVEFORM,
     KEY_SPEAKER_WAVEFORM_LENGTHS,
     SPEAKER_EMBEDDING_DIM,
+    TEXT_EOS_TOKEN_ID,
 )
 from vllm_omni.outputs import OmniRequestOutput
 

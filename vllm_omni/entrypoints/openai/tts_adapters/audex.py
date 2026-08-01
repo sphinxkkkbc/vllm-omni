@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Audex (Nemotron-Labs-Audex-2B) TTS serving adapter."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
 from vllm_omni.model_executor.models.audex.prompt import build_cond_prompt
 
 if TYPE_CHECKING:
@@ -65,3 +65,11 @@ class AudexAdapter(ARTTSAdapter):
     ) -> PreparedRequest:
         prompt = {"prompt": build_cond_prompt(request.input)}
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="audex")
+
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: "OpenAICreateSpeechRequest",
+        prompt: dict[str, Any] | None = None,
+    ) -> list:
+        return apply_max_new_tokens(sampling_params_list, request)

@@ -8,10 +8,10 @@ after the final request id exists: the RVQ phase-mask contract
 scale 3.0 — guidance is effectively mandatory for TTA quality).
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
 from vllm_omni.model_executor.models.audex.prompt import build_tta_cond_prompt
 
 if TYPE_CHECKING:
@@ -67,3 +67,11 @@ class AudexTTAAdapter(ARTTSAdapter):
     ) -> PreparedRequest:
         prompt = {"prompt": build_tta_cond_prompt(request.input)}
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="audex_tta")
+
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: "OpenAICreateSpeechRequest",
+        prompt: dict[str, Any] | None = None,
+    ) -> list:
+        return apply_max_new_tokens(sampling_params_list, request)
