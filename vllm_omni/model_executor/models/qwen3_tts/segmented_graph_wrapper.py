@@ -129,7 +129,7 @@ class CUDAGraphDecoderWrapper:
     def _transitions_for_mode(self, mode: str) -> dict[int, int]:
         return self._xvec_previous_frames_by_target if mode == "xvec" else self._previous_frames_by_target
 
-    def _cached_conv_frames(self, _mode: str, previous_frames: int) -> int:
+    def _cached_conv_frames(self, previous_frames: int) -> int:
         return min(previous_frames, self.prefix_length - 2)
 
     def _record_graph_hit(self, phase: str, batch_size: int, request_count: int) -> None:
@@ -255,12 +255,10 @@ class CUDAGraphDecoderWrapper:
     def _make_dummy_xvec_cache(
         self,
         batch_size: int,
-        previous_frames: int,
         device: torch.device,
         model_dtype: torch.dtype,
     ) -> dict:
         config = self.decoder.config
-        boundary_frames = 2 if previous_frames >= self.prefix_length else 0
         head_dim = getattr(
             config,
             "head_dim",
@@ -275,9 +273,7 @@ class CUDAGraphDecoderWrapper:
             device=device,
         )
         return {
-            "ref_hidden": torch.zeros(
-                batch_size, config.codebook_dim, boundary_frames, device=device, dtype=model_dtype
-            ),
+            "ref_hidden": torch.zeros(batch_size, config.codebook_dim, 0, device=device, dtype=model_dtype),
             "ref_conv": torch.zeros(batch_size, 0, config.latent_dim, device=device, dtype=model_dtype),
             "past_key_values": empty_prefix_cache,
             "prefix_hidden": torch.zeros(batch_size, 0, config.latent_dim, device=device, dtype=model_dtype),
@@ -340,7 +336,7 @@ class CUDAGraphDecoderWrapper:
         for batch_size in self.capture_batch_sizes:
             for size, previous_frames in self._xvec_previous_frames_by_target.items():
                 try:
-                    caches = self._make_dummy_xvec_cache(batch_size, previous_frames, device, model_dtype)
+                    caches = self._make_dummy_xvec_cache(batch_size, device, model_dtype)
                     self._capture_combined_suffix("xvec", batch_size, size, caches, device, dtype)
                     logger.info("  Captured xvec suffix CUDA Graph for batch=%d size=%d", batch_size, size)
                 except Exception:
@@ -400,7 +396,7 @@ class CUDAGraphDecoderWrapper:
         )
         static_conv = torch.zeros(
             batch_size,
-            self._cached_conv_frames(mode, previous_frames),
+            self._cached_conv_frames(previous_frames),
             self.decoder.config.latent_dim,
             dtype=model_dtype,
             device=device,
@@ -845,14 +841,8 @@ class CUDAGraphDecoderWrapper:
         static_codes.zero_()
         static_mask.fill_(1)
 
-        xvec_boundaries: list[torch.Tensor | None] = []
         for row, (codes, cache, new_frames) in enumerate(zip(codes_list, request_caches, new_frames_list, strict=True)):
             self._ensure_suffix_buffers(cache)
-            xvec_boundaries.append(
-                self._get_xvec_boundary(cache, self._transitions_for_mode(mode)[target_frames], new_frames)
-                if mode == "xvec"
-                else None
-            )
             static_codes[row, :, :new_frames].copy_(codes[0, :, -new_frames:])
             static_quantized[row : row + 1].copy_(cache["suffix_quantized"])
             static_conv[row : row + 1].copy_(cache["suffix_conv"])
@@ -886,16 +876,7 @@ class CUDAGraphDecoderWrapper:
                 cache["suffix_frames"] = target_frames
                 cache["suffix_quantized"] = next_quantized[:, :, :quantized_valid]
                 cache["suffix_conv"] = next_conv[:, :conv_valid, :]
-            if xvec_boundaries[row] is not None:
-                cache["ref_hidden"] = xvec_boundaries[row]
         return outputs
-
-    def _get_xvec_boundary(self, cache: dict, cached_frames: int, new_frames: int) -> torch.Tensor | None:
-        suffix_cache_length = self.prefix_length
-        boundary_start = cached_frames + new_frames - suffix_cache_length - 2
-        if 0 <= boundary_start and boundary_start + 2 <= cached_frames:
-            return cache["suffix_quantized"][:, :, boundary_start : boundary_start + 2].clone()
-        return None
 
     def _batched_request_decode(
         self,
@@ -1089,7 +1070,6 @@ class CUDAGraphDecoderWrapper:
             return self._decode_eager(codes, caches), True
 
         new_codes = codes[:, :, -new_frames:]
-        xvec_boundary = self._get_xvec_boundary(caches, previous_suffix_frames, new_frames) if mode == "xvec" else None
         static_codes = self.combined_static_codes[graph_key]
         if new_frames == self.codec_chunk_frames:
             static_codes.copy_(new_codes)
@@ -1123,9 +1103,6 @@ class CUDAGraphDecoderWrapper:
             caches["suffix_frames"] = target_frames
             caches["suffix_quantized"] = next_quantized[:, :, :quantized_valid]
             caches["suffix_conv"] = next_conv[:, :conv_valid, :]
-        if xvec_boundary is not None:
-            caches["ref_hidden"] = xvec_boundary
-
         actual_suffix_frames = (self.prefix_length if rolling else previous_suffix_frames) + new_frames
         output = self._trim_replay_output(output, actual_suffix_frames, target_frames)
         if clone_graph_output:

@@ -1002,20 +1002,21 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Compute new suffix quantizer and pre-conv states before the Transformer.
 
-        ``conv_context`` contains the two quantized frames immediately before
-        ``new_codes``. In the rolling phase, ``boundary_input`` contains the
-        reference tail followed by the first two retained suffix frames.
+        ``conv_context`` contains the available quantized frames immediately
+        before ``new_codes``. In the rolling phase, ``boundary_input`` contains
+        the optional reference tail followed by the first two retained suffix
+        frames.
         """
         new_quantized = self.quantizer.decode(new_codes)
 
         new_conv_input = torch.cat([conv_context, new_quantized], dim=-1)
         new_conv = self.pre_conv(new_conv_input)
-        new_conv = new_conv[:, :, conv_context.shape[-1] :].transpose(1, 2)
+        new_conv = new_conv[:, :, -new_codes.shape[-1] :].transpose(1, 2)
 
         boundary_conv = None
         if boundary_input is not None:
             boundary_conv = self.pre_conv(boundary_input)
-            boundary_conv = boundary_conv[:, :, _CONV_CONTEXT_FRAME:].transpose(1, 2)
+            boundary_conv = boundary_conv[:, :, -_CONV_CONTEXT_FRAME:].transpose(1, 2)
         return new_quantized, new_conv, boundary_conv
 
     def _decode_xvec_first_chunk(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
@@ -1174,14 +1175,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             device=new_codes.device,
         )
         attention_mask[:, : int(caches.get("prefix_pad_frames", 0))] = 0
-        xvec_boundary = None
-        if prefix_frames == 0:
-            combined_frames = cached_frames + new_frames
-            boundary_start = combined_frames - suffix_cache_length - _CONV_CONTEXT_FRAME
-            if boundary_start >= 0 and boundary_start + _CONV_CONTEXT_FRAME <= cached_frames:
-                xvec_boundary = caches["suffix_quantized"][
-                    :, :, boundary_start : boundary_start + _CONV_CONTEXT_FRAME
-                ].clone()
         output, next_quantized, next_conv = self._decode_suffix_incremental(
             new_codes,
             caches["suffix_quantized"],
@@ -1194,8 +1187,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         )
         caches["suffix_quantized"] = next_quantized
         caches["suffix_conv"] = next_conv
-        if xvec_boundary is not None:
-            caches["ref_hidden"] = xvec_boundary
         caches["suffix_frames"] = retained_frames + new_frames
         return output
 

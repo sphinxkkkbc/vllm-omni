@@ -66,7 +66,7 @@ def test_segmented_capture_sizes_are_derived_from_decoder_and_chunk_config():
     assert wrapper._xvec_previous_frames_by_target == {6: 2, 10: 6, 14: 10}
 
 
-def test_xvec_and_icl_capture_use_the_same_cached_conv_lengths():
+def test_capture_uses_cached_conv_lengths():
     decoder = _RecordingDecoder()
     decoder.config.sliding_window = 72
     wrapper = CUDAGraphDecoderWrapper(
@@ -76,8 +76,7 @@ def test_xvec_and_icl_capture_use_the_same_cached_conv_lengths():
         enabled=False,
     )
 
-    assert [wrapper._cached_conv_frames("xvec", frames) for frames in (1, 26, 51, 72)] == [1, 26, 51, 70]
-    assert [wrapper._cached_conv_frames("icl", frames) for frames in (1, 26, 51, 72)] == [1, 26, 51, 70]
+    assert [wrapper._cached_conv_frames(frames) for frames in (1, 26, 51, 72)] == [1, 26, 51, 70]
 
 
 def test_graph_prefix_cache_keeps_physical_prefix_length(monkeypatch):
@@ -247,7 +246,7 @@ def test_xvec_dummy_cache_is_initialized_before_graph_capture():
     wrapper.prefix_length = 72
     wrapper.decoder = SimpleNamespace(config=config)
 
-    cache = wrapper._make_dummy_xvec_cache(2, 25, torch.device("cpu"), torch.float32)["past_key_values"]
+    cache = wrapper._make_dummy_xvec_cache(2, torch.device("cpu"), torch.float32)["past_key_values"]
 
     assert cache.get_seq_length() == 0
     assert all(layer.is_initialized for layer in cache.layers)
@@ -371,17 +370,6 @@ def test_xvec_first_chunk_replays_prefix_graph(monkeypatch):
     assert len(outputs) == 2
 
 
-def test_xvec_boundary_is_saved_before_suffix_cache_rolls():
-    wrapper = CUDAGraphDecoderWrapper.__new__(CUDAGraphDecoderWrapper)
-    wrapper.prefix_length = 72
-    cached = torch.arange(72, dtype=torch.float32).view(1, 1, 72)
-
-    boundary = wrapper._get_xvec_boundary({"suffix_quantized": cached}, cached_frames=51, new_frames=25)
-
-    assert boundary is not None
-    torch.testing.assert_close(boundary, cached[:, :, 2:4])
-
-
 def test_incremental_downstream_matches_full_decode_tail():
     torch.manual_seed(0)
     config = Qwen3TTSTokenizerV2DecoderConfig(
@@ -487,6 +475,47 @@ def test_single_frame_xvec_prefix_keeps_all_next_chunk_conv_frames():
     torch.testing.assert_close(
         incremental,
         full[..., -25 * decoder.total_upsample :],
+        atol=1e-5,
+        rtol=1e-4,
+    )
+
+
+def test_xvec_rolling_matches_truncated_suffix_window():
+    torch.manual_seed(5)
+    config = Qwen3TTSTokenizerV2DecoderConfig(
+        codebook_size=32,
+        hidden_size=16,
+        latent_dim=16,
+        codebook_dim=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_quantizers=2,
+        decoder_dim=32,
+        upsample_rates=(8, 5, 4, 3),
+        upsampling_ratios=(2, 2),
+        sliding_window=72,
+    )
+    decoder = Qwen3TTSTokenizerV2Decoder(config).eval()
+    decoder._incremental_chunk_frames = 25
+    codes = torch.randint(0, config.codebook_size, (1, config.num_quantizers, 101))
+    caches = {"prefix_frames": 0}
+
+    with torch.no_grad():
+        decoder(codes[..., :1], caches=caches)
+        decoder(codes[..., 1:26], caches=caches)
+        decoder(codes[..., 26:51], caches=caches)
+        decoder(codes[..., 51:76], caches=caches)
+        rolling = decoder(codes[..., 76:101], caches=caches)
+        truncated = decoder._forward_exact(codes[..., -(config.sliding_window + 25) :])
+
+    assert caches["ref_hidden"].shape[-1] == 0
+    assert caches["suffix_quantized"].shape[-1] == config.sliding_window
+    assert caches["suffix_conv"].shape[1] == config.sliding_window - 2
+    torch.testing.assert_close(
+        rolling,
+        truncated[..., -25 * decoder.total_upsample :],
         atol=1e-5,
         rtol=1e-4,
     )
