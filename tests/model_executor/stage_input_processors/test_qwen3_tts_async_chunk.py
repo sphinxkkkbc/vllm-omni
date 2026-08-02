@@ -283,8 +283,8 @@ def test_first_streaming_chunk_prepends_ref_code_context():
     assert len(payload.codes.audio) == _Q * 12
 
 
-def test_followup_ref_code_context_is_sent_as_metadata_handle():
-    """Follow-up chunks keep full ref context semantically without resending it."""
+def test_followup_sends_only_codec_delta_without_ref_metadata():
+    """Follow-up chunks rely on decoder state and resend neither reference codes nor metadata."""
     tm = _tm()
     rid = "r-ref2"
     tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(35)]
