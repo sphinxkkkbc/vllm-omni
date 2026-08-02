@@ -867,10 +867,12 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
     def enable_cudagraph(
         self,
         capture_batch_sizes: list[int] | None = None,
+        stateless_capture_sizes: list[int] | None = None,
         device: torch.device | None = None,
         codec_chunk_frames: int = 0,
         codec_left_context_frames: int = 0,
         initial_codec_chunk_frames: int = 1,
+        async_chunk: bool = True,
         decode_chunk_size: int = 300,
         decode_left_context: int = 25,
     ):
@@ -886,10 +888,14 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         self._cudagraph_wrapper = CUDAGraphDecoderWrapper(
             decoder=self,
             capture_batch_sizes=capture_batch_sizes,
+            stateless_capture_sizes=stateless_capture_sizes,
             num_quantizers=self.config.num_quantizers,
             enabled=True,
+            async_chunk=async_chunk,
             initial_chunk_frames=initial_codec_chunk_frames,
             codec_chunk_frames=codec_chunk_frames or 25,
+            decode_chunk_size=decode_chunk_size,
+            decode_left_context=decode_left_context,
         )
         self._incremental_chunk_frames = codec_chunk_frames or 25
         self._cudagraph_wrapper.warmup(
@@ -900,7 +906,11 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         logger.info(
             "CUDA Graph enabled for decoder: batch_sizes=%s seq_lens=%s",
             self._cudagraph_wrapper.capture_batch_sizes,
-            self._cudagraph_wrapper.capture_sizes,
+            (
+                self._cudagraph_wrapper.icl_capture_sizes
+                if async_chunk
+                else self._cudagraph_wrapper.stateless_capture_sizes
+            ),
         )
 
     def _forward_exact(self, codes):

@@ -33,9 +33,16 @@ connectors:
       # initial_codec_chunk_frames (including the per-request API field).
       # Example:
       #   codec_chunk_ramp: [4, 4, 8, 16, 25]
-      # Stage 1 receives only newly emitted codec frames after the first chunk;
-      # the decoder derives all reachable CUDA-graph shape buckets from these
-      # chunk settings. Only graph batch-size buckets are configured here.
+      # Decoder CUDA Graph sizing:
+      #   * async_chunk=true derives all stateful ICL/xvec shapes from
+      #     initial_codec_chunk_frames, codec_chunk_frames, and sliding_window;
+      #     decode_cudagraph_capture_sizes is ignored in this mode.
+      #   * async_chunk=false captures stateless shapes 150 and
+      #     decode_chunk_frames + decode_left_context_frames (325 by default).
+      #     Extra stateless shapes may be added (union, not intersection) with:
+      #       decode_cudagraph_capture_sizes: [97, 400]
+      # Graph batch size defaults to 1. Add larger buckets only when needed:
+      #   decode_cudagraph_batch_sizes: [1, 2, 4]
 
 stages:
   - stage_id: 0

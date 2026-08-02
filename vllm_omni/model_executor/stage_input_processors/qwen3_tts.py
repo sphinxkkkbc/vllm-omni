@@ -198,6 +198,7 @@ def talker2code2wav_async_chunk(
     # ICL reference codes are part of the first decoder initialization only.
     # Follow-up chunks rely entirely on the request-local decoder cache.
     ref_code = request_payload.get(request_id)
+    emitted_chunks = int(transfer_manager.put_req_chunk.get(request_id, 0))
     ref_context_size = 0
     ref_context_request_id: str | None = None
     ref_context_included = False
@@ -227,7 +228,6 @@ def talker2code2wav_async_chunk(
             ref_context = ref_context[-ref_code_context_frames:]
         ref_context_size = int(ref_context.shape[0]) if ref_context.ndim > 1 else 0
         if ref_context_size > 0:
-            emitted_chunks = int(transfer_manager.put_req_chunk.get(request_id, 0))
             if emitted_chunks <= 0:
                 ref_context_request_id = request_id
                 ref_frames = ref_context.tolist()
