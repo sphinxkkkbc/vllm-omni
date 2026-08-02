@@ -349,6 +349,8 @@ class Qwen3TTSCode2Wav(nn.Module):
             if state_req_id is not None:
                 state = self._decoder_state_cache.setdefault(state_req_id, {})
                 state.setdefault("prefix_frames", 0)
+                if state_req_id.startswith(_DUMMY_REQUEST_ID):
+                    state["_is_dummy_run"] = True
                 if ref_ctx_frames > 0:
                     cached_prefix_frames = state.setdefault("prefix_frames", ref_ctx_frames)
                     if cached_prefix_frames == 0:

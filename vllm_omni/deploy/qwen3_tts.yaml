@@ -43,6 +43,8 @@ connectors:
       #       decode_cudagraph_capture_sizes: [97, 400]
       # Graph batch size defaults to 1. Add larger buckets only when needed:
       #   decode_cudagraph_batch_sizes: [1, 2, 4]
+      # Limit eager batches to reduce temporary stateful cache allocations; CUDA Graph batching uses the buckets above.
+      decode_batch_max_size: 4
 
 stages:
   - stage_id: 0

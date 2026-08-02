@@ -1212,6 +1212,278 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         output = torch.cat(wavs, dim=-1)
         return output
 
+    def batched_request_decode(
+        self,
+        codes_list: list[torch.Tensor],
+        request_caches: list[dict[str, Any]],
+        *,
+        prefix_length: int,
+        initial_chunk_frames: int,
+        codec_chunk_frames: int,
+        transitions_by_mode: dict[str, dict[int, int]],
+        decode_icl_prefix_batch: Callable[[list[torch.Tensor], list[dict[str, Any]]], list[torch.Tensor] | None] | None,
+        decode_xvec_prefix_batch: Callable[[list[torch.Tensor], list[dict[str, Any]]], list[torch.Tensor] | None]
+        | None,
+        decode_suffix_batch: Callable[
+            [str, int, list[torch.Tensor], list[dict[str, Any]], list[int]], list[torch.Tensor] | None
+        ]
+        | None,
+        decode_eager: Callable[[torch.Tensor, dict[str, Any]], torch.Tensor],
+        backend_max_batch_size: int = 0,
+    ) -> list[torch.Tensor]:
+        """Group stateful requests once, then execute them with a supplied backend.
+
+        The grouping policy is shared by CUDA Graph and eager execution.  A
+        backend may decline a grouped decode by returning ``None``; requests in
+        that group are then decoded individually through ``decode_eager``.
+        """
+        if len(codes_list) != len(request_caches):
+            raise ValueError("codes_list and request_caches must have the same length")
+
+        outputs: list[torch.Tensor | None] = [None] * len(codes_list)
+        groups: dict[tuple[str, int], list[int]] = {}
+        for index, (codes, cache) in enumerate(zip(codes_list, request_caches, strict=True)):
+            if "suffix_quantized" not in cache:
+                prefix_frames = int(cache["prefix_frames"])
+                suffix_frames = int(codes.shape[-1]) - prefix_frames
+                if prefix_frames == 0:
+                    phase = "xvec_first"
+                elif 0 < prefix_frames <= prefix_length and suffix_frames == initial_chunk_frames:
+                    phase = "icl_prefix"
+                else:
+                    phase = "eager"
+                groups.setdefault((phase, 0), []).append(index)
+                continue
+
+            request_kv = cache["past_key_values"]
+            decoder_prefix = int(cache.get("decoder_prefix_frames", cache["prefix_frames"]))
+            mode = "xvec" if decoder_prefix == 0 else "icl"
+            expected_kv_length = 0 if mode == "xvec" else prefix_length
+            if decoder_prefix != expected_kv_length or request_kv.get_seq_length() != expected_kv_length:
+                groups.setdefault(("eager", 0), []).append(index)
+                continue
+
+            previous = int(cache.get("suffix_frames", cache["suffix_quantized"].shape[-1]))
+            rolling = self._is_suffix_cache_rolling(previous, int(cache["suffix_quantized"].shape[-1]))
+            target = (
+                prefix_length + codec_chunk_frames
+                if rolling
+                else next(
+                    (target for target, source in transitions_by_mode[mode].items() if source == previous),
+                    None,
+                )
+            )
+            new_frames = int(codes.shape[-1])
+            if target is None or not 0 < new_frames <= codec_chunk_frames:
+                groups.setdefault(("eager", 0), []).append(index)
+            else:
+                groups.setdefault((f"suffix:{mode}", target), []).append(index)
+
+        for (phase, target), indices in groups.items():
+            group_splits = (
+                [
+                    indices[start : start + backend_max_batch_size]
+                    for start in range(0, len(indices), backend_max_batch_size)
+                ]
+                if backend_max_batch_size > 0
+                else [indices]
+            )
+            for split_indices in group_splits:
+                group_codes = [codes_list[index] for index in split_indices]
+                group_caches = [request_caches[index] for index in split_indices]
+                group_outputs: list[torch.Tensor] | None = None
+                if phase == "icl_prefix" and decode_icl_prefix_batch is not None:
+                    group_outputs = decode_icl_prefix_batch(group_codes, group_caches)
+                elif phase == "xvec_first" and decode_xvec_prefix_batch is not None:
+                    group_outputs = decode_xvec_prefix_batch(group_codes, group_caches)
+                elif phase.startswith("suffix:") and decode_suffix_batch is not None:
+                    mode = phase.removeprefix("suffix:")
+                    new_frames = [int(codes.shape[-1]) for codes in group_codes]
+                    group_outputs = decode_suffix_batch(mode, target, group_codes, group_caches, new_frames)
+
+                if group_outputs is None:
+                    group_outputs = [decode_eager(codes_list[index], request_caches[index]) for index in split_indices]
+                for index, output in zip(split_indices, group_outputs, strict=True):
+                    outputs[index] = output
+                    request_caches[index]["_last_output_audio_length"] = int(output.shape[-1])
+
+        if any(output is None for output in outputs):
+            raise RuntimeError("stateful batched decode did not produce an output for every request")
+        return [output for output in outputs if output is not None]
+
+    @staticmethod
+    def _batch_dynamic_caches(request_caches: list[DynamicCache]) -> DynamicCache:
+        batched_cache = copy.deepcopy(request_caches[0])
+        for batched_layer, request_layers in zip(
+            batched_cache.layers,
+            zip(*(cache.layers for cache in request_caches), strict=True),
+            strict=True,
+        ):
+            if any(layer.keys is None or layer.values is None for layer in request_layers):
+                if not all(layer.keys is None and layer.values is None for layer in request_layers):
+                    raise ValueError("Cannot batch partially initialized request KV caches")
+                batched_layer.keys = None
+                batched_layer.values = None
+                continue
+            batched_layer.keys = torch.cat([layer.keys for layer in request_layers], dim=0)
+            batched_layer.values = torch.cat([layer.values for layer in request_layers], dim=0)
+        return batched_cache
+
+    @staticmethod
+    def _slice_dynamic_cache(cache: DynamicCache, row: int) -> DynamicCache:
+        request_cache = copy.deepcopy(cache)
+        for layer in request_cache.layers:
+            if layer.keys is not None:
+                layer.keys = layer.keys[row : row + 1].clone()
+            if layer.values is not None:
+                layer.values = layer.values[row : row + 1].clone()
+        return request_cache
+
+    @staticmethod
+    def _cache_tensors_are_batchable(request_caches: list[dict[str, Any]], keys: tuple[str, ...]) -> bool:
+        return all(
+            key in cache
+            and cache[key].shape[1:] == request_caches[0][key].shape[1:]
+            and cache[key].dtype == request_caches[0][key].dtype
+            and cache[key].device == request_caches[0][key].device
+            for cache in request_caches
+            for key in keys
+        )
+
+    def _decode_icl_prefix_eager_batch(
+        self,
+        codes_list: list[torch.Tensor],
+        request_caches: list[dict[str, Any]],
+        *,
+        prefix_length: int,
+        initial_chunk_frames: int,
+    ) -> list[torch.Tensor] | None:
+        batch_size = len(codes_list)
+        total_frames = prefix_length + initial_chunk_frames
+        batched_codes = codes_list[0].new_zeros((batch_size, codes_list[0].shape[1], total_frames))
+        hidden_mask = torch.ones((batch_size, 1, total_frames), dtype=self.dtype, device=batched_codes.device)
+        prefix_mask = torch.ones((batch_size, prefix_length), dtype=torch.bool, device=batched_codes.device)
+        suffix_mask = torch.ones((batch_size, total_frames), dtype=torch.bool, device=batched_codes.device)
+        prefix_pads: list[int] = []
+        for row, (codes, cache) in enumerate(zip(codes_list, request_caches, strict=True)):
+            prefix_frames = int(cache["prefix_frames"])
+            suffix_frames = int(codes.shape[-1]) - prefix_frames
+            if not 0 < prefix_frames <= prefix_length or suffix_frames != initial_chunk_frames:
+                return None
+            prefix_pad = prefix_length - prefix_frames
+            prefix_pads.append(prefix_pad)
+            batched_codes[row, :, prefix_pad:prefix_length].copy_(codes[0, :, :prefix_frames])
+            batched_codes[row, :, prefix_length:].copy_(codes[0, :, prefix_frames:])
+            hidden_mask[row, :, :prefix_pad] = 0
+            prefix_mask[row, :prefix_pad] = 0
+            suffix_mask[row, :prefix_pad] = 0
+
+        batched_cache: dict[str, Any] = {}
+        output = self._decode_icl_first_chunk(
+            batched_codes,
+            batched_cache,
+            prefix_length,
+            prefix_hidden_mask=hidden_mask,
+            prefix_attention_mask=prefix_mask,
+            suffix_attention_mask=suffix_mask,
+        )
+        outputs: list[torch.Tensor] = []
+        for row, (cache, prefix_pad) in enumerate(zip(request_caches, prefix_pads, strict=True)):
+            for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"):
+                cache[key] = batched_cache[key][row : row + 1].clone()
+            cache["past_key_values"] = self._slice_dynamic_cache(batched_cache["past_key_values"], row)
+            cache["decoder_prefix_frames"] = prefix_length
+            cache["prefix_pad_frames"] = prefix_pad
+            cache["suffix_frames"] = initial_chunk_frames
+            outputs.append(output[row : row + 1, :, -initial_chunk_frames * self.total_upsample :].clone())
+        return outputs
+
+    def _decode_xvec_prefix_eager_batch(
+        self,
+        codes_list: list[torch.Tensor],
+        request_caches: list[dict[str, Any]],
+        *,
+        initial_chunk_frames: int,
+    ) -> list[torch.Tensor] | None:
+        if any(int(codes.shape[-1]) != initial_chunk_frames for codes in codes_list):
+            return None
+        batched_codes = torch.cat(codes_list, dim=0)
+        batched_cache: dict[str, Any] = {}
+        output = self._decode_xvec_first_chunk(batched_codes, batched_cache)
+        outputs: list[torch.Tensor] = []
+        for row, cache in enumerate(request_caches):
+            for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"):
+                cache[key] = batched_cache[key][row : row + 1].clone()
+            cache["past_key_values"] = self._slice_dynamic_cache(batched_cache["past_key_values"], row)
+            cache["decoder_prefix_frames"] = 0
+            cache["suffix_frames"] = initial_chunk_frames
+            outputs.append(output[row : row + 1].clone())
+        return outputs
+
+    def _decode_suffix_eager_batch(
+        self,
+        mode: str,
+        target_frames: int,
+        codes_list: list[torch.Tensor],
+        request_caches: list[dict[str, Any]],
+        new_frames_list: list[int],
+        *,
+        prefix_length: int,
+        codec_chunk_frames: int,
+        transitions_by_mode: dict[str, dict[int, int]],
+    ) -> list[torch.Tensor] | None:
+        tensor_keys = ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv")
+        if not self._cache_tensors_are_batchable(request_caches, tensor_keys):
+            return None
+        previous_frames = transitions_by_mode[mode].get(target_frames)
+        if previous_frames is None:
+            return None
+
+        batched_codes = codes_list[0].new_zeros((len(codes_list), codes_list[0].shape[1], codec_chunk_frames))
+        for row, (codes, new_frames) in enumerate(zip(codes_list, new_frames_list, strict=True)):
+            batched_codes[row, :, :new_frames].copy_(codes[0, :, -new_frames:])
+        batched_cache = {
+            key: torch.cat([cache[key] for cache in request_caches], dim=0)
+            for key in ("ref_hidden", "ref_conv", "prefix_hidden")
+        }
+        try:
+            batched_cache["past_key_values"] = self._batch_dynamic_caches(
+                [cache["past_key_values"] for cache in request_caches]
+            )
+        except ValueError:
+            return None
+        attention_mask = torch.ones(
+            len(codes_list),
+            (prefix_length if mode == "icl" else 0) + previous_frames + codec_chunk_frames,
+            dtype=torch.bool,
+            device=batched_codes.device,
+        )
+        if mode == "icl":
+            for row, cache in enumerate(request_caches):
+                attention_mask[row, : int(cache.get("prefix_pad_frames", 0))] = 0
+        old_quantized = torch.cat([cache["suffix_quantized"] for cache in request_caches], dim=0)
+        old_conv = torch.cat([cache["suffix_conv"] for cache in request_caches], dim=0)
+        rolling = self._is_suffix_cache_rolling(previous_frames, int(old_quantized.shape[-1]))
+        output, next_quantized, next_conv = self._decode_suffix(
+            batched_codes,
+            old_quantized,
+            old_conv,
+            batched_cache,
+            prefix_length if mode == "icl" else 0,
+            codec_chunk_frames,
+            rolling,
+            attention_mask=attention_mask,
+        )
+
+        outputs: list[torch.Tensor] = []
+        for row, (cache, new_frames) in enumerate(zip(request_caches, new_frames_list, strict=True)):
+            outputs.append(output[row : row + 1, :, : new_frames * self.total_upsample].clone())
+            if new_frames == codec_chunk_frames:
+                cache["suffix_quantized"] = next_quantized[row : row + 1].clone()
+                cache["suffix_conv"] = next_conv[row : row + 1].clone()
+                cache["suffix_frames"] = target_frames
+        return outputs
+
     def batched_chunked_decode(
         self,
         codes,
@@ -1236,16 +1508,55 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             )
 
         if caches is not None:
-            outputs = []
-            for row, (length, cache) in enumerate(zip(lengths, caches, strict=True)):
-                output = self.chunked_decode(
-                    codes[row : row + 1, :, :length],
+            prefix_length = int(getattr(self.config, "sliding_window", 0) or 0)
+            codec_chunk_frames = int(getattr(self, "_incremental_chunk_frames", 25))
+            initial_chunk_frames = 1
+            transitions: dict[int, int] = {}
+            previous = initial_chunk_frames
+            while previous < prefix_length:
+                target = previous + codec_chunk_frames
+                transitions[target] = previous
+                previous = target
+            transitions[prefix_length + codec_chunk_frames] = prefix_length
+            codes_list = [codes[row : row + 1, :, :length] for row, length in enumerate(lengths)]
+            outputs = self.batched_request_decode(
+                codes_list,
+                caches,
+                prefix_length=prefix_length,
+                initial_chunk_frames=initial_chunk_frames,
+                codec_chunk_frames=codec_chunk_frames,
+                transitions_by_mode={"icl": transitions, "xvec": transitions},
+                decode_icl_prefix_batch=lambda group_codes, group_caches: self._decode_icl_prefix_eager_batch(
+                    group_codes,
+                    group_caches,
+                    prefix_length=prefix_length,
+                    initial_chunk_frames=initial_chunk_frames,
+                ),
+                decode_xvec_prefix_batch=lambda group_codes, group_caches: self._decode_xvec_prefix_eager_batch(
+                    group_codes,
+                    group_caches,
+                    initial_chunk_frames=initial_chunk_frames,
+                ),
+                decode_suffix_batch=lambda mode, target, group_codes, group_caches, new_frames: (
+                    self._decode_suffix_eager_batch(
+                        mode,
+                        target,
+                        group_codes,
+                        group_caches,
+                        new_frames,
+                        prefix_length=prefix_length,
+                        codec_chunk_frames=codec_chunk_frames,
+                        transitions_by_mode={"icl": transitions, "xvec": transitions},
+                    )
+                ),
+                decode_eager=lambda request_codes, cache: self.chunked_decode(
+                    request_codes,
                     caches=cache,
                     chunk_size=chunk_size,
                     left_context_size=left_context_size,
-                )
-                cache["_last_output_audio_length"] = int(output.shape[-1])
-                outputs.append(output)
+                ),
+                backend_max_batch_size=max_batch_size,
+            )
             max_length = max((int(output.shape[-1]) for output in outputs), default=0)
             padded = codes.new_zeros(
                 (len(outputs), 1, max_length),

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +18,12 @@ from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _decoder_stub(**kwargs):
+    decoder = SimpleNamespace(**kwargs)
+    decoder.batched_request_decode = Qwen3TTSTokenizerV2Decoder.batched_request_decode.__get__(decoder)
+    return decoder
 
 
 class _RecordingDecoder(nn.Module):
@@ -163,7 +171,7 @@ def test_batched_chunked_decode_groups_exact_phases(monkeypatch):
     wrapper.codec_chunk_frames = 25
     wrapper._icl_previous_frames_by_target = {26: 1, 51: 26, 76: 51, 97: 72}
     wrapper._xvec_previous_frames_by_target = {26: 1, 51: 26, 76: 51, 97: 72}
-    wrapper.decoder = SimpleNamespace(_is_suffix_cache_rolling=lambda previous, cached: previous >= 72 and cached == 72)
+    wrapper.decoder = _decoder_stub(_is_suffix_cache_rolling=lambda previous, cached: previous >= 72 and cached == 72)
     calls: list[tuple[str, int, int]] = []
 
     def _icl_prefix(codes, caches):
@@ -227,7 +235,7 @@ def test_xvec_delta_chunks_route_through_all_reachable_graph_phases(monkeypatch)
     wrapper.codec_chunk_frames = 25
     wrapper._icl_previous_frames_by_target = {26: 1, 51: 26, 76: 51, 97: 72}
     wrapper._xvec_previous_frames_by_target = {26: 1, 51: 26, 76: 51, 97: 72}
-    wrapper.decoder = SimpleNamespace(_is_suffix_cache_rolling=lambda previous, cached: previous >= 72 and cached == 72)
+    wrapper.decoder = _decoder_stub(_is_suffix_cache_rolling=lambda previous, cached: previous >= 72 and cached == 72)
     calls: list[tuple[str, int]] = []
 
     def _suffix(mode, target, codes, caches, new_frames):
@@ -363,7 +371,7 @@ def test_xvec_first_chunk_uses_prefixless_initializer(monkeypatch):
     wrapper._icl_previous_frames_by_target = {26: 1}
     wrapper._xvec_previous_frames_by_target = {26: 1}
     calls = []
-    wrapper.decoder = SimpleNamespace(
+    wrapper.decoder = _decoder_stub(
         _decode_xvec_first_chunk=lambda codes, cache: calls.append("xvec") or codes[:, :1, :],
     )
 
@@ -374,6 +382,62 @@ def test_xvec_first_chunk_uses_prefixless_initializer(monkeypatch):
 
     assert calls == ["xvec"]
     assert output[0].shape == (1, 1, 25)
+
+
+def test_dummy_request_does_not_record_pre_capture_shape_fallback():
+    wrapper = CUDAGraphDecoderWrapper.__new__(CUDAGraphDecoderWrapper)
+    wrapper.prefix_length = 72
+    wrapper.initial_chunk_frames = 1
+    wrapper.codec_chunk_frames = 25
+    wrapper._icl_previous_frames_by_target = {26: 1}
+    wrapper._xvec_previous_frames_by_target = {26: 1}
+    wrapper.xvec_prefix_graphs = {}
+    wrapper._stats_enabled = True
+    wrapper._stats_total_requests = 0
+    wrapper._stats_hit_requests = 0
+    wrapper._stats_fallback_requests = 0
+    wrapper._stats_replays = Counter()
+    wrapper._stats_fallbacks = Counter()
+    wrapper._maybe_log_stats = lambda: None
+    wrapper.decoder = _decoder_stub(
+        _decode_xvec_first_chunk=lambda codes, _cache: codes[:, :1, :],
+    )
+
+    wrapper._batched_request_decode(
+        [torch.zeros(1, 2, 4)],
+        [{"prefix_frames": 0, "_is_dummy_run": True}],
+    )
+
+    assert wrapper._stats_total_requests == 0
+    assert wrapper._stats_fallback_requests == 0
+    assert wrapper._stats_fallbacks == Counter()
+    assert wrapper._suppress_stats is False
+
+
+def test_eager_backend_max_batch_size_splits_each_phase_group():
+    decoder = _decoder_stub()
+    batch_sizes = []
+
+    def decode_xvec(codes, _caches):
+        batch_sizes.append(len(codes))
+        return [code[:, :1, :].clone() for code in codes]
+
+    outputs = decoder.batched_request_decode(
+        [torch.zeros(1, 2, 1) for _ in range(5)],
+        [{"prefix_frames": 0} for _ in range(5)],
+        prefix_length=72,
+        initial_chunk_frames=1,
+        codec_chunk_frames=25,
+        transitions_by_mode={"icl": {26: 1}, "xvec": {26: 1}},
+        decode_icl_prefix_batch=None,
+        decode_xvec_prefix_batch=decode_xvec,
+        decode_suffix_batch=None,
+        decode_eager=lambda *_args: pytest.fail("unexpected per-request fallback"),
+        backend_max_batch_size=2,
+    )
+
+    assert batch_sizes == [2, 2, 1]
+    assert len(outputs) == 5
 
 
 def test_xvec_first_chunk_replays_prefix_graph(monkeypatch):
@@ -404,9 +468,10 @@ def test_xvec_first_chunk_replays_prefix_graph(monkeypatch):
     wrapper._record_graph_hit = lambda *_args: None
     wrapper._record_graph_fallback = lambda *_args: None
     wrapper._ensure_suffix_buffers = lambda cache: None
-    wrapper.decoder = SimpleNamespace(
+    wrapper.decoder = _decoder_stub(
         _is_suffix_cache_rolling=lambda previous, cached: False,
         _decode_xvec_first_chunk=lambda *_args: pytest.fail("unexpected eager fallback"),
+        _slice_dynamic_cache=Qwen3TTSTokenizerV2Decoder._slice_dynamic_cache,
     )
 
     caches = [{"prefix_frames": 0}, {"prefix_frames": 0}]
@@ -539,3 +604,120 @@ def test_xvec_rolling_matches_truncated_suffix_window():
         atol=1e-5,
         rtol=1e-4,
     )
+
+
+def test_stateful_eager_batches_xvec_prefix_and_suffix():
+    torch.manual_seed(7)
+    config = Qwen3TTSTokenizerV2DecoderConfig(
+        codebook_size=32,
+        hidden_size=16,
+        latent_dim=16,
+        codebook_dim=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_quantizers=2,
+        decoder_dim=32,
+        upsample_rates=(8, 5, 4, 3),
+        upsampling_ratios=(2, 2),
+        sliding_window=72,
+    )
+    batched_decoder = Qwen3TTSTokenizerV2Decoder(config).eval()
+    eager_decoder = copy.deepcopy(batched_decoder)
+    batched_decoder._incremental_chunk_frames = 25
+    eager_decoder._incremental_chunk_frames = 25
+    codes = torch.randint(0, config.codebook_size, (2, config.num_quantizers, 26))
+    batched_caches = [{"prefix_frames": 0}, {"prefix_frames": 0}]
+    eager_caches = [{"prefix_frames": 0}, {"prefix_frames": 0}]
+
+    with torch.no_grad():
+        batched_prefix = batched_decoder.batched_chunked_decode(
+            codes[..., :1],
+            [1, 1],
+            caches=batched_caches,
+        )
+        eager_prefix = torch.cat(
+            [eager_decoder.chunked_decode(codes[row : row + 1, :, :1], caches=eager_caches[row]) for row in range(2)],
+            dim=0,
+        )
+        batched_suffix = batched_decoder.batched_chunked_decode(
+            codes[..., 1:],
+            [25, 25],
+            caches=batched_caches,
+        )
+        eager_suffix = torch.cat(
+            [eager_decoder.chunked_decode(codes[row : row + 1, :, 1:], caches=eager_caches[row]) for row in range(2)],
+            dim=0,
+        )
+
+    torch.testing.assert_close(batched_prefix, eager_prefix, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(batched_suffix, eager_suffix, atol=1e-5, rtol=1e-4)
+    for batched_cache, eager_cache in zip(batched_caches, eager_caches, strict=True):
+        assert batched_cache["suffix_frames"] == eager_cache["suffix_frames"] == 26
+        torch.testing.assert_close(batched_cache["suffix_quantized"], eager_cache["suffix_quantized"])
+        torch.testing.assert_close(batched_cache["suffix_conv"], eager_cache["suffix_conv"])
+
+
+def test_stateful_eager_batches_variable_icl_prefixes():
+    torch.manual_seed(11)
+    config = Qwen3TTSTokenizerV2DecoderConfig(
+        codebook_size=32,
+        hidden_size=16,
+        latent_dim=16,
+        codebook_dim=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_quantizers=2,
+        decoder_dim=32,
+        upsample_rates=(8, 5, 4, 3),
+        upsampling_ratios=(2, 2),
+        sliding_window=72,
+    )
+    batched_decoder = Qwen3TTSTokenizerV2Decoder(config).eval()
+    eager_decoder = copy.deepcopy(batched_decoder)
+    batched_decoder._incremental_chunk_frames = 25
+    eager_decoder._incremental_chunk_frames = 25
+    lengths = [49, 73]
+    codes = torch.zeros(2, config.num_quantizers, max(lengths), dtype=torch.long)
+    for row, length in enumerate(lengths):
+        codes[row, :, :length] = torch.randint(0, config.codebook_size, (config.num_quantizers, length))
+    batched_caches = [{"prefix_frames": 48}, {"prefix_frames": 72}]
+    eager_caches = [{"prefix_frames": 48}, {"prefix_frames": 72}]
+
+    with torch.no_grad():
+        batched_output = batched_decoder.batched_chunked_decode(codes, lengths, caches=batched_caches)
+        eager_output = torch.cat(
+            [
+                eager_decoder.chunked_decode(
+                    codes[row : row + 1, :, :length],
+                    caches=eager_caches[row],
+                )
+                for row, length in enumerate(lengths)
+            ],
+            dim=0,
+        )
+        suffix_codes = torch.randint(0, config.codebook_size, (2, config.num_quantizers, 25))
+        batched_suffix = batched_decoder.batched_chunked_decode(
+            suffix_codes,
+            [25, 25],
+            caches=batched_caches,
+        )
+        eager_suffix = torch.cat(
+            [
+                eager_decoder.chunked_decode(
+                    suffix_codes[row : row + 1],
+                    caches=eager_caches[row],
+                )
+                for row in range(2)
+            ],
+            dim=0,
+        )
+
+    torch.testing.assert_close(batched_output, eager_output, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(batched_suffix, eager_suffix, atol=1e-5, rtol=1e-4)
+    for batched_cache in batched_caches:
+        assert batched_cache["decoder_prefix_frames"] == 72
+        assert batched_cache["suffix_frames"] == 26

@@ -337,6 +337,20 @@ def test_dummy_runtime_information_provides_finished_request_state():
     assert all(info["meta"]["finished"] for info in runtime_info)
 
 
+def test_dummy_request_state_is_marked_for_graph_stats_suppression():
+    model = _make_model(async_chunk=True)
+    runtime_info = model.get_dummy_runtime_additional_information(1)
+
+    model.forward(
+        input_ids=torch.arange(4, dtype=torch.long),
+        runtime_additional_information=runtime_info,
+    )
+
+    cache = model.decoder.batched_decode_calls[0]["caches"][0]
+    assert cache["_is_dummy_run"] is True
+    assert model._decoder_state_cache == {}
+
+
 def test_forward_batches_equal_length_requests_in_one_decoder_call():
     model = _make_model()
 
