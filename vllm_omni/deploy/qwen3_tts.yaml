@@ -35,6 +35,7 @@ connectors:
       #   codec_chunk_ramp: [4, 4, 8, 16, 25]
       # Decoder CUDA Graph sizing:
       #   * async_chunk=true derives all stateful ICL/xvec shapes from
+      #     codec_chunk_ramp when enabled, otherwise from
       #     initial_codec_chunk_frames, codec_chunk_frames, and sliding_window;
       #     decode_cudagraph_capture_sizes is ignored in this mode.
       #   * async_chunk=false captures stateless shapes 150 and

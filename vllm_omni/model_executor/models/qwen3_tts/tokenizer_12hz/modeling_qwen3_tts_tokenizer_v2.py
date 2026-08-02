@@ -872,6 +872,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         codec_chunk_frames: int = 0,
         codec_left_context_frames: int = 0,
         initial_codec_chunk_frames: int = 1,
+        codec_chunk_ramp: list[int] | None = None,
         async_chunk: bool = True,
         decode_chunk_size: int = 300,
         decode_left_context: int = 25,
@@ -894,10 +895,12 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             async_chunk=async_chunk,
             initial_chunk_frames=initial_codec_chunk_frames,
             codec_chunk_frames=codec_chunk_frames or 25,
+            codec_chunk_ramp=codec_chunk_ramp,
             decode_chunk_size=decode_chunk_size,
             decode_left_context=decode_left_context,
         )
         self._incremental_chunk_frames = codec_chunk_frames or 25
+        self._incremental_chunk_ramp = list(codec_chunk_ramp or ())
         self._cudagraph_wrapper.warmup(
             device,
             dtype=torch.long,
@@ -1438,8 +1441,11 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         previous_frames = transitions_by_mode[mode].get(target_frames)
         if previous_frames is None:
             return None
+        expected_new_frames = target_frames - previous_frames
+        if any(not 0 < new_frames <= expected_new_frames for new_frames in new_frames_list):
+            return None
 
-        batched_codes = codes_list[0].new_zeros((len(codes_list), codes_list[0].shape[1], codec_chunk_frames))
+        batched_codes = codes_list[0].new_zeros((len(codes_list), codes_list[0].shape[1], expected_new_frames))
         for row, (codes, new_frames) in enumerate(zip(codes_list, new_frames_list, strict=True)):
             batched_codes[row, :, :new_frames].copy_(codes[0, :, -new_frames:])
         batched_cache = {
@@ -1454,7 +1460,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             return None
         attention_mask = torch.ones(
             len(codes_list),
-            (prefix_length if mode == "icl" else 0) + previous_frames + codec_chunk_frames,
+            (prefix_length if mode == "icl" else 0) + previous_frames + expected_new_frames,
             dtype=torch.bool,
             device=batched_codes.device,
         )
@@ -1470,7 +1476,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             old_conv,
             batched_cache,
             prefix_length if mode == "icl" else 0,
-            codec_chunk_frames,
+            expected_new_frames,
             rolling,
             attention_mask=attention_mask,
         )
@@ -1478,7 +1484,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         outputs: list[torch.Tensor] = []
         for row, (cache, new_frames) in enumerate(zip(request_caches, new_frames_list, strict=True)):
             outputs.append(output[row : row + 1, :, : new_frames * self.total_upsample].clone())
-            if new_frames == codec_chunk_frames:
+            if new_frames == expected_new_frames:
                 cache["suffix_quantized"] = next_quantized[row : row + 1].clone()
                 cache["suffix_conv"] = next_conv[row : row + 1].clone()
                 cache["suffix_frames"] = target_frames
@@ -1510,9 +1516,16 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         if caches is not None:
             prefix_length = int(getattr(self.config, "sliding_window", 0) or 0)
             codec_chunk_frames = int(getattr(self, "_incremental_chunk_frames", 25))
-            initial_chunk_frames = 1
+            chunk_ramp = list(getattr(self, "_incremental_chunk_ramp", ()) or ())
+            initial_chunk_frames = int(chunk_ramp[0]) if chunk_ramp else 1
             transitions: dict[int, int] = {}
             previous = initial_chunk_frames
+            for new_frames in chunk_ramp[1:]:
+                if previous >= prefix_length:
+                    break
+                target = previous + int(new_frames)
+                transitions[target] = previous
+                previous = target
             while previous < prefix_length:
                 target = previous + codec_chunk_frames
                 transitions[target] = previous

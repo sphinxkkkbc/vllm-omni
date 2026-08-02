@@ -14,6 +14,7 @@ from vllm.model_executor.model_loader import DefaultModelLoader
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
 
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2Config,
@@ -148,6 +149,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         codec_chunk_frames: int,
         codec_left_context_frames: int,
         initial_codec_chunk_frames: int,
+        codec_chunk_ramp: list[int] | None,
         decode_cudagraph_batch_sizes: list[int] | None,
         decode_cudagraph_capture_sizes: list[int] | None,
     ) -> None:
@@ -185,6 +187,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             codec_chunk_frames=codec_chunk_frames,
             codec_left_context_frames=codec_left_context_frames,
             initial_codec_chunk_frames=initial_codec_chunk_frames,
+            codec_chunk_ramp=codec_chunk_ramp,
             async_chunk=self._async_chunk,
             decode_chunk_size=self._decode_chunk_frames,
             decode_left_context=self._decode_left_context_frames,
@@ -625,6 +628,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             codec_chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
             codec_left_context_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
             initial_codec_chunk_frames = int(extra_cfg.get("initial_codec_chunk_frames") or 1)
+            codec_chunk_ramp = parse_chunk_ramp(extra_cfg, steady=codec_chunk_frames) if self._async_chunk else None
             decode_chunk_frames = _get_int_config("decode_chunk_frames", self._decode_chunk_frames)
             decode_left_context_frames = _get_int_config(
                 "decode_left_context_frames",
@@ -651,6 +655,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             codec_chunk_frames = 0
             codec_left_context_frames = 0
             initial_codec_chunk_frames = 1
+            codec_chunk_ramp = None
             decode_cudagraph_batch_sizes = None
             decode_cudagraph_capture_sizes = None
             decode_enable_tf32 = False
@@ -670,6 +675,9 @@ class Qwen3TTSCode2Wav(nn.Module):
                 torch.get_float32_matmul_precision(),
             )
 
+        self.decoder._incremental_chunk_frames = codec_chunk_frames or 25
+        self.decoder._incremental_chunk_ramp = list(codec_chunk_ramp or ())
+
         if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
             try:
                 self._maybe_enable_decoder_cudagraph(
@@ -677,6 +685,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                     codec_chunk_frames=codec_chunk_frames,
                     codec_left_context_frames=codec_left_context_frames,
                     initial_codec_chunk_frames=initial_codec_chunk_frames,
+                    codec_chunk_ramp=codec_chunk_ramp,
                     decode_cudagraph_batch_sizes=decode_cudagraph_batch_sizes,
                     decode_cudagraph_capture_sizes=decode_cudagraph_capture_sizes,
                 )

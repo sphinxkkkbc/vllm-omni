@@ -505,6 +505,7 @@ def test_decode_chunking_override_is_passed_to_cudagraph():
         "codec_chunk_frames": 25,
         "codec_left_context_frames": 72,
         "initial_codec_chunk_frames": 1,
+        "codec_chunk_ramp": None,
         "async_chunk": True,
         "decode_chunk_size": 400,
         "decode_left_context": 17,
