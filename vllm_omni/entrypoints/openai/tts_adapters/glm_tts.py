@@ -54,6 +54,7 @@ class GlmTTSAdapter(ARTTSAdapter):
         sampling_params_list: list,
         request: "OpenAICreateSpeechRequest",
         prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
     ) -> list:
         # GLM-TTS: set dynamic min/max tokens based on text length.
         import copy

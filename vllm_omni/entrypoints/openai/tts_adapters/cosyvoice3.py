@@ -59,6 +59,7 @@ class CosyVoice3Adapter(ARTTSAdapter):
         sampling_params_list: list,
         request: "OpenAICreateSpeechRequest",
         prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
     ) -> list:
         """Set dynamic min/max tokens based on tokenized text length.
 

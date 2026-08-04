@@ -72,6 +72,7 @@ class MingTTSAdapter(ARTTSAdapter):
         sampling_params_list: list,
         request: "OpenAICreateSpeechRequest",
         prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
     ) -> list:
         import copy
 

@@ -42,5 +42,6 @@ class HiggsAudioV3Adapter(ARTTSAdapter):
         sampling_params_list: list,
         request: "OpenAICreateSpeechRequest",
         prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
     ) -> list:
         return apply_max_new_tokens(sampling_params_list, request)
