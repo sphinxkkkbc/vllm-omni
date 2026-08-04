@@ -3633,7 +3633,7 @@ def ming_flash_omni_tts_server(mocker: MockerFixture):
     )
 
 
-class TestMingFlashTTSServing:
+class TestMingFlashOmniTTSServing:
     def test_validate_ming_flash_omni_tts_rejects_ref_text(self, ming_flash_omni_tts_server):
         request = OpenAICreateSpeechRequest(input="Hello", ref_text="Reference transcript")
         error = ming_flash_omni_tts_server._validate_tts_request(request)
