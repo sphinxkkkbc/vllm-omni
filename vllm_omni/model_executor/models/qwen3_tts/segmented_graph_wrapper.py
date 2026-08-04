@@ -926,11 +926,6 @@ class CUDAGraphDecoderWrapper:
         codes_list: list[torch.Tensor],
         request_caches: list[dict],
     ) -> list[torch.Tensor]:
-        # vLLM may invoke the model while capturing its outer CUDA Graph. Do
-        # not create DynamicCache objects in that context: transformers'
-        # cache initialization can copy CPU tensors into CUDA during capture.
-        # The outer dummy run only needs a representative decoder output and
-        # must not publish request state.
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             return [self.decoder._forward_exact(codes) for codes in codes_list]
         previous_suppression = getattr(self, "_suppress_stats", False)
@@ -1040,7 +1035,7 @@ class CUDAGraphDecoderWrapper:
         )
         return output.clone() if clone_graph_output else output
 
-    def _decode(
+    def _decode_suffix(
         self,
         codes: torch.Tensor,
         caches: dict,
@@ -1049,16 +1044,7 @@ class CUDAGraphDecoderWrapper:
     ) -> torch.Tensor:
         if not self.async_chunk:
             raise RuntimeError("Incremental decode is unavailable when async_chunk=False")
-        if not self.enabled or not self._warmed_up:
-            return self._decode_eager(codes, caches)
-
-        # Inner CUDA graph replay is illegal while an outer stream capture is
-        # active (e.g. vLLM's cudagraph_mode=FULL warmup on Stage 1). Fall back
-        # to eager in that case so the outer capture can complete. The guard is
-        # a no-op at runtime: is_current_stream_capturing() returns False
-        # outside the startup capture window, so normal inference still hits
-        # the graph fast path.
-        if torch.cuda.is_current_stream_capturing():
+        if not self.enabled or not self._warmed_up or torch.cuda.is_current_stream_capturing():
             return self._decode_eager(codes, caches)
 
         if int(codes.shape[0]) != 1:
@@ -1195,7 +1181,7 @@ class CUDAGraphDecoderWrapper:
             else:
                 actual_prefix_frames = int(caches.get("prefix_frames", self.prefix_length))
                 codes_chunk = codes_chunk[:, :, actual_prefix_frames:]
-                wav_chunk = self._decode(codes_chunk, caches, clone_graph_output=False)
+                wav_chunk = self._decode_suffix(codes_chunk, caches, clone_graph_output=False)
 
             # Keep origin/main's concat semantics: Qwen3-Omni can return a chunk
             # that is shorter than the nominal code_len * total_upsample length.

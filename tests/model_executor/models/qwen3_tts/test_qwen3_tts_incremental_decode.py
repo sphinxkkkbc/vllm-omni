@@ -764,7 +764,7 @@ def test_eager_fallback_uses_dynamic_decoder_prefix_length():
     wrapper = CUDAGraphDecoderWrapper(decoder, enabled=False)
     codes = torch.zeros(1, 2, 2)
 
-    output = wrapper._decode(
+    output = wrapper._decode_suffix(
         codes,
         {
             "prefix_frames": 48,
