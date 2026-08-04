@@ -560,18 +560,26 @@ def test_icl_prefix_graph_cache_keeps_physical_prefix_length(monkeypatch):
     total_upsample = 1920
 
     wrapper = CUDAGraphDecoderWrapper.__new__(CUDAGraphDecoderWrapper)
-    wrapper.icl_prefix_graphs = {batch_size: type("_Graph", (), {"replay": lambda self: None})()}
-    wrapper.icl_prefix_static_inputs = {batch_size: torch.zeros(batch_size, num_quantizers, physical_frames)}
-    wrapper.icl_prefix_static_outputs = {batch_size: torch.zeros(batch_size, 1, physical_frames * total_upsample)}
-    wrapper.icl_prefix_suffix_quantized = {batch_size: torch.zeros(batch_size, num_quantizers, initial_chunk_frames)}
-    wrapper.icl_prefix_suffix_conv = {batch_size: torch.zeros(batch_size, initial_chunk_frames, 2)}
-    wrapper.icl_prefix_hidden_masks = {batch_size: torch.ones(batch_size, 1, physical_frames)}
-    wrapper.icl_prefix_attention_masks = {batch_size: torch.ones(batch_size, prefix_length, dtype=torch.bool)}
-    wrapper.icl_suffix_attention_masks = {batch_size: torch.ones(batch_size, physical_frames, dtype=torch.bool)}
+    wrapper.icl_prefix_states = {
+        batch_size: {
+            "graph": type("_Graph", (), {"replay": lambda self: None})(),
+            "input": {
+                "codes": torch.zeros(batch_size, num_quantizers, physical_frames),
+                "hidden_mask": torch.ones(batch_size, 1, physical_frames),
+                "prefix_attention_mask": torch.ones(batch_size, prefix_length, dtype=torch.bool),
+                "suffix_attention_mask": torch.ones(batch_size, physical_frames, dtype=torch.bool),
+            },
+            "output": torch.zeros(batch_size, 1, physical_frames * total_upsample),
+            "cache": {
+                "decoder_prefix_frames": prefix_length,
+                "suffix_quantized": torch.zeros(batch_size, num_quantizers, initial_chunk_frames),
+                "suffix_conv": torch.zeros(batch_size, initial_chunk_frames, 2),
+            },
+        }
+    }
     wrapper.prefix_length = prefix_length
     wrapper.initial_chunk_frames = initial_chunk_frames
     wrapper.decoder = type("_Decoder", (), {"total_upsample": total_upsample})()
-    wrapper.icl_prefix_static_caches = {batch_size: {"decoder_prefix_frames": prefix_length}}
     wrapper._ensure_suffix_buffers = lambda caches: None
 
     caches = {"prefix_frames": 48}
@@ -620,12 +628,6 @@ def test_batched_suffix_graph_updates_ping_pong_buffers(monkeypatch):
     wrapper._xvec_previous_frames_by_target = {26: 1, 51: 26, 76: 51, 97: 72}
     wrapper.capture_batch_sizes = [1, 2]
     key = ("icl", 2, 26)
-    wrapper.combined_graphs = {key: type("_Graph", (), {"replay": lambda self: None})()}
-    wrapper.combined_static_codes = {key: torch.zeros(2, 2, 25)}
-    wrapper.combined_static_quantized = {key: torch.zeros(2, 2, 1)}
-    wrapper.combined_static_conv = {key: torch.zeros(2, 1, 3)}
-    wrapper.combined_static_masks = {key: torch.ones(2, 98, dtype=torch.bool)}
-    wrapper.combined_static_caches = {key: {}}
     graph_output = torch.stack(
         [
             torch.arange(50, dtype=torch.float32).view(1, -1),
@@ -634,7 +636,19 @@ def test_batched_suffix_graph_updates_ping_pong_buffers(monkeypatch):
     )
     graph_next_quantized = torch.stack([torch.full((2, 26), 1.0), torch.full((2, 26), 2.0)])
     graph_next_conv = torch.stack([torch.full((26, 3), 3.0), torch.full((26, 3), 4.0)])
-    wrapper.combined_static_outputs = {key: (graph_output, graph_next_quantized, graph_next_conv)}
+    wrapper.combined_states = {
+        key: {
+            "graph": type("_Graph", (), {"replay": lambda self: None})(),
+            "input": {
+                "codes": torch.zeros(2, 2, 25),
+                "quantized": torch.zeros(2, 2, 1),
+                "conv": torch.zeros(2, 1, 3),
+                "mask": torch.ones(2, 98, dtype=torch.bool),
+            },
+            "output": (graph_output, graph_next_quantized, graph_next_conv),
+            "cache": {},
+        }
+    }
     wrapper.decoder = type("_Decoder", (), {"total_upsample": 2})()
     monkeypatch.setattr(wrapper, "_copy_request_caches_to_batch", lambda caches, static: None)
 
@@ -667,7 +681,7 @@ def test_dummy_request_does_not_record_pre_capture_shape_fallback():
     wrapper.codec_chunk_frames = 25
     wrapper._icl_previous_frames_by_target = {26: 1}
     wrapper._xvec_previous_frames_by_target = {26: 1}
-    wrapper.xvec_prefix_graphs = {}
+    wrapper.xvec_prefix_states = {}
     wrapper._stats_enabled = True
     wrapper._stats_total_requests = 0
     wrapper._stats_hit_requests = 0
@@ -700,19 +714,21 @@ def test_xvec_first_chunk_replays_prefix_graph(monkeypatch):
     wrapper._icl_previous_frames_by_target = {26: 1}
     wrapper._xvec_previous_frames_by_target = {26: 1}
     replayed = []
-    wrapper.xvec_prefix_graphs = {2: SimpleNamespace(replay=lambda: replayed.append(True))}
-    wrapper.xvec_prefix_static_inputs = {2: torch.zeros(2, 2, 1)}
-    wrapper.xvec_prefix_static_outputs = {2: torch.arange(4, dtype=torch.float32).view(2, 1, 2)}
-    wrapper.xvec_prefix_static_caches = {
+    wrapper.xvec_prefix_states = {
         2: {
-            "ref_hidden": torch.zeros(2, 2, 0),
-            "ref_conv": torch.zeros(2, 0, 3),
-            "prefix_hidden": torch.zeros(2, 0, 3),
-            "ref_upsample": torch.zeros(2, 3, 0),
-            "ref_wav": torch.zeros(2, 1, 0),
-            "suffix_quantized": torch.ones(2, 2, 1),
-            "suffix_conv": torch.ones(2, 1, 3),
-            "past_key_values": SimpleNamespace(layers=[]),
+            "graph": SimpleNamespace(replay=lambda: replayed.append(True)),
+            "input": {"codes": torch.zeros(2, 2, 1)},
+            "output": torch.arange(4, dtype=torch.float32).view(2, 1, 2),
+            "cache": {
+                "ref_hidden": torch.zeros(2, 2, 0),
+                "ref_conv": torch.zeros(2, 0, 3),
+                "prefix_hidden": torch.zeros(2, 0, 3),
+                "ref_upsample": torch.zeros(2, 3, 0),
+                "ref_wav": torch.zeros(2, 1, 0),
+                "suffix_quantized": torch.ones(2, 2, 1),
+                "suffix_conv": torch.ones(2, 1, 3),
+                "past_key_values": SimpleNamespace(layers=[]),
+            },
         }
     }
     wrapper._record_graph_hit = lambda *_args: None
@@ -731,8 +747,8 @@ def test_xvec_first_chunk_replays_prefix_graph(monkeypatch):
     )
 
     assert replayed == [True]
-    torch.testing.assert_close(wrapper.xvec_prefix_static_inputs[2][0], torch.full((2, 1), 3.0))
-    torch.testing.assert_close(wrapper.xvec_prefix_static_inputs[2][1], torch.full((2, 1), 4.0))
+    torch.testing.assert_close(wrapper.xvec_prefix_states[2]["input"]["codes"][0], torch.full((2, 1), 3.0))
+    torch.testing.assert_close(wrapper.xvec_prefix_states[2]["input"]["codes"][1], torch.full((2, 1), 4.0))
     assert [cache["decoder_prefix_frames"] for cache in caches] == [0, 0]
     assert [cache["suffix_frames"] for cache in caches] == [1, 1]
     assert len(outputs) == 2
@@ -887,8 +903,8 @@ def test_graph_batch_overflow_splits_at_largest_bucket():
 def test_missing_graph_phase_falls_back_instead_of_returning_empty(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     wrapper = CUDAGraphDecoderWrapper.__new__(CUDAGraphDecoderWrapper)
-    wrapper.icl_prefix_graphs = {}
-    wrapper.combined_graphs = {}
+    wrapper.icl_prefix_states = {}
+    wrapper.combined_states = {}
     wrapper._record_graph_fallback = lambda *_args: None
 
     codes = [torch.zeros(1, 2, 25)]
@@ -1035,9 +1051,14 @@ def test_stateless_replay_pads_to_bucket_and_trims_output(monkeypatch):
     wrapper.enabled = True
     wrapper._warmed_up = True
     wrapper.stateless_capture_sizes = [4]
-    wrapper.stateless_graphs = {(1, 4): _Graph()}
-    wrapper.stateless_static_inputs = {(1, 4): torch.full((1, 2, 4), -1, dtype=torch.long)}
-    wrapper.stateless_static_outputs = {(1, 4): torch.arange(4, dtype=torch.float32).view(1, 1, 4)}
+    wrapper.stateless_states = {
+        (1, 4): {
+            "graph": _Graph(),
+            "input": {"codes": torch.full((1, 2, 4), -1, dtype=torch.long)},
+            "output": torch.arange(4, dtype=torch.float32).view(1, 1, 4),
+            "cache": None,
+        }
+    }
     wrapper.decoder = SimpleNamespace(total_upsample=1)
     codes = torch.tensor([[[1, 2], [3, 4]]])
 
@@ -1045,7 +1066,7 @@ def test_stateless_replay_pads_to_bucket_and_trims_output(monkeypatch):
 
     torch.testing.assert_close(output, torch.tensor([[[0.0, 1.0]]]))
     torch.testing.assert_close(
-        wrapper.stateless_static_inputs[(1, 4)],
+        wrapper.stateless_states[(1, 4)]["input"]["codes"],
         torch.tensor([[[1, 2, 0, 0], [3, 4, 0, 0]]]),
     )
 

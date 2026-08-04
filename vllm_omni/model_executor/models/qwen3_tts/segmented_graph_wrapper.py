@@ -56,29 +56,10 @@ class CUDAGraphDecoderWrapper:
         self.async_chunk = bool(async_chunk)
         self._warmed_up = False
 
-        self.combined_graphs: dict[tuple[str, int, int], CUDAGraph] = {}
-        self.combined_static_codes: dict[tuple[str, int, int], torch.Tensor] = {}
-        self.combined_static_quantized: dict[tuple[str, int, int], torch.Tensor] = {}
-        self.combined_static_conv: dict[tuple[str, int, int], torch.Tensor] = {}
-        self.combined_static_masks: dict[tuple[str, int, int], torch.Tensor] = {}
-        self.combined_static_caches: dict[tuple[str, int, int], dict] = {}
-        self.combined_static_outputs: dict[tuple[str, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-        self.icl_prefix_graphs: dict[int, CUDAGraph] = {}
-        self.icl_prefix_static_inputs: dict[int, torch.Tensor] = {}
-        self.icl_prefix_static_outputs: dict[int, torch.Tensor] = {}
-        self.icl_prefix_suffix_quantized: dict[int, torch.Tensor] = {}
-        self.icl_prefix_suffix_conv: dict[int, torch.Tensor] = {}
-        self.icl_prefix_hidden_masks: dict[int, torch.Tensor] = {}
-        self.icl_prefix_attention_masks: dict[int, torch.Tensor] = {}
-        self.icl_suffix_attention_masks: dict[int, torch.Tensor] = {}
-        self.icl_prefix_static_caches: dict[int, dict] = {}
-        self.xvec_prefix_graphs: dict[int, CUDAGraph] = {}
-        self.xvec_prefix_static_inputs: dict[int, torch.Tensor] = {}
-        self.xvec_prefix_static_outputs: dict[int, torch.Tensor] = {}
-        self.xvec_prefix_static_caches: dict[int, dict] = {}
-        self.stateless_graphs: dict[tuple[int, int], CUDAGraph] = {}
-        self.stateless_static_inputs: dict[tuple[int, int], torch.Tensor] = {}
-        self.stateless_static_outputs: dict[tuple[int, int], torch.Tensor] = {}
+        self.combined_states: dict[tuple[str, int, int], dict] = {}
+        self.icl_prefix_states: dict[int, dict] = {}
+        self.xvec_prefix_states: dict[int, dict] = {}
+        self.stateless_states: dict[tuple[int, int], dict] = {}
 
         self._device = None
         self.prefix_length = int(getattr(self.decoder.config, "sliding_window", 0) or 0)
@@ -332,7 +313,7 @@ class CUDAGraphDecoderWrapper:
                         size,
                         exc_info=True,
                     )
-            self._warmed_up = bool(self.stateless_graphs)
+            self._warmed_up = bool(self.stateless_states)
             return
 
         if not self.icl_capture_sizes:
@@ -386,7 +367,7 @@ class CUDAGraphDecoderWrapper:
                         exc_info=True,
                     )
 
-        self._warmed_up = bool(self.icl_prefix_graphs) or bool(self.xvec_prefix_graphs) or bool(self.combined_graphs)
+        self._warmed_up = bool(self.icl_prefix_states) or bool(self.xvec_prefix_states) or bool(self.combined_states)
 
     def _capture_stateless(
         self,
@@ -406,9 +387,12 @@ class CUDAGraphDecoderWrapper:
             with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                 static_output = self.decoder._forward_exact(static_input)
 
-        self.stateless_graphs[key] = graph
-        self.stateless_static_inputs[key] = static_input
-        self.stateless_static_outputs[key] = static_output
+        self.stateless_states[key] = {
+            "graph": graph,
+            "input": {"codes": static_input},
+            "output": static_output,
+            "cache": None,
+        }
 
     def _run_combined_suffix(
         self,
@@ -490,13 +474,17 @@ class CUDAGraphDecoderWrapper:
                     static_mask,
                 )
 
-        self.combined_graphs[key] = graph
-        self.combined_static_codes[key] = static_codes
-        self.combined_static_quantized[key] = static_quantized
-        self.combined_static_conv[key] = static_conv
-        self.combined_static_masks[key] = static_mask
-        self.combined_static_caches[key] = caches
-        self.combined_static_outputs[key] = outputs
+        self.combined_states[key] = {
+            "graph": graph,
+            "input": {
+                "codes": static_codes,
+                "quantized": static_quantized,
+                "conv": static_conv,
+                "mask": static_mask,
+            },
+            "output": outputs,
+            "cache": caches,
+        }
 
     def _capture_icl_prefix(self, batch_size: int, device: torch.device, dtype: torch.dtype):
         size = self.prefix_length + self.initial_chunk_frames
@@ -521,20 +509,6 @@ class CUDAGraphDecoderWrapper:
             dtype=model_dtype,
             device=device,
         )
-        suffix_quantized = torch.zeros(
-            batch_size,
-            config.codebook_dim,
-            self.prefix_length,
-            dtype=model_dtype,
-            device=device,
-        )
-        suffix_conv = torch.zeros(
-            batch_size,
-            self.prefix_length - 2,
-            config.latent_dim,
-            dtype=model_dtype,
-            device=device,
-        )
         prefix_hidden_mask = torch.ones(batch_size, 1, size, dtype=model_dtype, device=device)
         prefix_attention_mask = torch.ones(batch_size, self.prefix_length, dtype=torch.bool, device=device)
         suffix_attention_mask = torch.ones(batch_size, size, dtype=torch.bool, device=device)
@@ -551,18 +525,18 @@ class CUDAGraphDecoderWrapper:
                     prefix_attention_mask=prefix_attention_mask,
                     suffix_attention_mask=suffix_attention_mask,
                 )
-                suffix_quantized[:, :, : self.initial_chunk_frames].copy_(caches["suffix_quantized"])
-                suffix_conv[:, : self.initial_chunk_frames, :].copy_(caches["suffix_conv"])
 
-        self.icl_prefix_graphs[batch_size] = graph
-        self.icl_prefix_static_inputs[batch_size] = static_input
-        self.icl_prefix_static_outputs[batch_size] = static_output
-        self.icl_prefix_suffix_quantized[batch_size] = suffix_quantized
-        self.icl_prefix_suffix_conv[batch_size] = suffix_conv
-        self.icl_prefix_hidden_masks[batch_size] = prefix_hidden_mask
-        self.icl_prefix_attention_masks[batch_size] = prefix_attention_mask
-        self.icl_suffix_attention_masks[batch_size] = suffix_attention_mask
-        self.icl_prefix_static_caches[batch_size] = caches
+        self.icl_prefix_states[batch_size] = {
+            "graph": graph,
+            "input": {
+                "codes": static_input,
+                "hidden_mask": prefix_hidden_mask,
+                "prefix_attention_mask": prefix_attention_mask,
+                "suffix_attention_mask": suffix_attention_mask,
+            },
+            "output": static_output,
+            "cache": caches,
+        }
 
     def _capture_xvec_prefix(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> None:
         static_input = torch.zeros(
@@ -597,14 +571,16 @@ class CUDAGraphDecoderWrapper:
             with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                 static_output = self.decoder._decode_xvec_first_chunk(static_input, caches)
 
-        self.xvec_prefix_graphs[batch_size] = graph
-        self.xvec_prefix_static_inputs[batch_size] = static_input
-        self.xvec_prefix_static_outputs[batch_size] = static_output
-        self.xvec_prefix_static_caches[batch_size] = caches
+        self.xvec_prefix_states[batch_size] = {
+            "graph": graph,
+            "input": {"codes": static_input},
+            "output": static_output,
+            "cache": caches,
+        }
 
     def _decode_icl_prefix(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
         batch_size = int(codes.shape[0])
-        if batch_size != 1 or batch_size not in self.icl_prefix_graphs or torch.cuda.is_current_stream_capturing():
+        if batch_size != 1 or batch_size not in self.icl_prefix_states or torch.cuda.is_current_stream_capturing():
             output = self.decoder._decode_icl_first_chunk(codes, caches, int(caches["prefix_frames"]))
             prefix_frames = int(caches["prefix_frames"])
             return output[..., -max(0, codes.shape[-1] - prefix_frames) * self.decoder.total_upsample :]
@@ -615,10 +591,12 @@ class CUDAGraphDecoderWrapper:
             output = self.decoder._decode_icl_first_chunk(codes, caches, actual_prefix_frames)
             return output[..., -suffix_frames * self.decoder.total_upsample :]
 
-        prefix_static_input = self.icl_prefix_static_inputs[batch_size]
-        prefix_hidden_mask = self.icl_prefix_hidden_masks[batch_size]
-        prefix_attention_mask = self.icl_prefix_attention_masks[batch_size]
-        suffix_attention_mask = self.icl_suffix_attention_masks[batch_size]
+        state = self.icl_prefix_states[batch_size]
+        static_inputs = state["input"]
+        prefix_static_input = static_inputs["codes"]
+        prefix_hidden_mask = static_inputs["hidden_mask"]
+        prefix_attention_mask = static_inputs["prefix_attention_mask"]
+        suffix_attention_mask = static_inputs["suffix_attention_mask"]
         prefix_pad_frames = self.prefix_length - actual_prefix_frames
         prefix_static_input.zero_()
         prefix_static_input[:, :, prefix_pad_frames : self.prefix_length].copy_(codes[:, :, :actual_prefix_frames])
@@ -630,15 +608,20 @@ class CUDAGraphDecoderWrapper:
         suffix_attention_mask.fill_(1)
         suffix_attention_mask[:, :prefix_pad_frames] = 0
 
-        self.icl_prefix_graphs[batch_size].replay()
-        caches.update(self.icl_prefix_static_caches[batch_size])
+        state["graph"].replay()
+        static_caches = state["cache"]
+        for key in ("ref_hidden", "ref_conv", "prefix_hidden"):
+            if key in static_caches:
+                caches[key] = static_caches[key].clone()
+        if "past_key_values" in static_caches:
+            caches["past_key_values"] = self.decoder._slice_dynamic_cache(static_caches["past_key_values"], 0)
+        caches["decoder_prefix_frames"] = self.prefix_length
         caches["prefix_pad_frames"] = prefix_pad_frames
-        caches["suffix_quantized"] = self.icl_prefix_suffix_quantized[batch_size][:, :, : self.initial_chunk_frames]
-        caches["suffix_conv"] = self.icl_prefix_suffix_conv[batch_size][:, : self.initial_chunk_frames, :]
+        caches["suffix_quantized"] = static_caches["suffix_quantized"].clone()
+        caches["suffix_conv"] = static_caches["suffix_conv"].clone()
+        caches["suffix_frames"] = self.initial_chunk_frames
         self._ensure_suffix_buffers(caches)
-        return self.icl_prefix_static_outputs[batch_size][
-            ..., -self.initial_chunk_frames * self.decoder.total_upsample :
-        ]
+        return state["output"][..., -self.initial_chunk_frames * self.decoder.total_upsample :]
 
     def _ensure_suffix_buffers(self, caches: dict) -> None:
         if "_suffix_quantized_buffers" in caches:
@@ -723,7 +706,7 @@ class CUDAGraphDecoderWrapper:
         codes_list: list[torch.Tensor],
         request_caches: list[dict],
     ) -> list[torch.Tensor] | None:
-        available = set(self.icl_prefix_graphs)
+        available = set(self.icl_prefix_states)
         if torch.cuda.is_current_stream_capturing():
             self._record_graph_fallback("icl_prefix:capture", len(codes_list))
             return None
@@ -747,10 +730,12 @@ class CUDAGraphDecoderWrapper:
             self._record_graph_fallback("icl_prefix:no_graph", len(codes_list))
             return None
 
-        static_input = self.icl_prefix_static_inputs[batch_size]
-        hidden_mask = self.icl_prefix_hidden_masks[batch_size]
-        prefix_mask = self.icl_prefix_attention_masks[batch_size]
-        suffix_mask = self.icl_suffix_attention_masks[batch_size]
+        state = self.icl_prefix_states[batch_size]
+        static_inputs = state["input"]
+        static_input = static_inputs["codes"]
+        hidden_mask = static_inputs["hidden_mask"]
+        prefix_mask = static_inputs["prefix_attention_mask"]
+        suffix_mask = static_inputs["suffix_attention_mask"]
         static_input.zero_()
         hidden_mask.fill_(1)
         prefix_mask.fill_(1)
@@ -770,9 +755,9 @@ class CUDAGraphDecoderWrapper:
             prefix_mask[row, :prefix_pad] = 0
             suffix_mask[row, :prefix_pad] = 0
 
-        self.icl_prefix_graphs[batch_size].replay()
+        state["graph"].replay()
         self._record_graph_hit("icl_prefix", batch_size, len(codes_list))
-        static_caches = self.icl_prefix_static_caches[batch_size]
+        static_caches = state["cache"]
         outputs: list[torch.Tensor] = []
         tensor_keys = ("ref_hidden", "ref_conv", "prefix_hidden")
         for row, (cache, prefix_pad) in enumerate(zip(request_caches, prefix_pads, strict=True)):
@@ -781,17 +766,11 @@ class CUDAGraphDecoderWrapper:
             cache["past_key_values"] = self.decoder._slice_dynamic_cache(static_caches["past_key_values"], row)
             cache["decoder_prefix_frames"] = self.prefix_length
             cache["prefix_pad_frames"] = prefix_pad
-            cache["suffix_quantized"] = self.icl_prefix_suffix_quantized[batch_size][
-                row : row + 1, :, : self.initial_chunk_frames
-            ].clone()
-            cache["suffix_conv"] = self.icl_prefix_suffix_conv[batch_size][
-                row : row + 1, : self.initial_chunk_frames, :
-            ].clone()
+            cache["suffix_quantized"] = static_caches["suffix_quantized"][row : row + 1].clone()
+            cache["suffix_conv"] = static_caches["suffix_conv"][row : row + 1].clone()
             cache["suffix_frames"] = self.initial_chunk_frames
             outputs.append(
-                self.icl_prefix_static_outputs[batch_size][
-                    row : row + 1, :, -self.initial_chunk_frames * self.decoder.total_upsample :
-                ].clone()
+                state["output"][row : row + 1, :, -self.initial_chunk_frames * self.decoder.total_upsample :].clone()
             )
         return outputs
 
@@ -800,7 +779,7 @@ class CUDAGraphDecoderWrapper:
         codes_list: list[torch.Tensor],
         request_caches: list[dict],
     ) -> list[torch.Tensor] | None:
-        available = set(getattr(self, "xvec_prefix_graphs", {}))
+        available = set(getattr(self, "xvec_prefix_states", {}))
         if not available:
             self._record_graph_fallback("xvec_prefix:no_graph", len(codes_list))
             return None
@@ -827,14 +806,15 @@ class CUDAGraphDecoderWrapper:
             self._record_graph_fallback("xvec_prefix:no_graph", len(codes_list))
             return None
 
-        static_input = self.xvec_prefix_static_inputs[batch_size]
+        state = self.xvec_prefix_states[batch_size]
+        static_input = state["input"]["codes"]
         static_input.zero_()
         for row, codes in enumerate(codes_list):
             static_input[row].copy_(codes[0])
 
-        self.xvec_prefix_graphs[batch_size].replay()
+        state["graph"].replay()
         self._record_graph_hit("xvec_prefix", batch_size, len(codes_list))
-        static_caches = self.xvec_prefix_static_caches[batch_size]
+        static_caches = state["cache"]
         outputs: list[torch.Tensor] = []
         tensor_keys = ("ref_hidden", "ref_conv", "prefix_hidden")
         for row, cache in enumerate(request_caches):
@@ -846,7 +826,7 @@ class CUDAGraphDecoderWrapper:
             cache["suffix_conv"] = static_caches["suffix_conv"][row : row + 1].clone()
             cache["suffix_frames"] = self.initial_chunk_frames
             self._ensure_suffix_buffers(cache)
-            outputs.append(self.xvec_prefix_static_outputs[batch_size][row : row + 1].clone())
+            outputs.append(state["output"][row : row + 1].clone())
         return outputs
 
     def _decode_suffix_batch(
@@ -859,7 +839,7 @@ class CUDAGraphDecoderWrapper:
     ) -> list[torch.Tensor] | None:
         available = {
             batch
-            for graph_mode, batch, target in self.combined_graphs
+            for graph_mode, batch, target in self.combined_states
             if graph_mode == mode and target == target_frames
         }
         if torch.cuda.is_current_stream_capturing():
@@ -895,11 +875,13 @@ class CUDAGraphDecoderWrapper:
             self._record_graph_fallback(f"suffix_{target_frames}:no_graph", len(codes_list))
             return None
         key = (mode, batch_size, target_frames)
-        static_codes = self.combined_static_codes[key]
-        static_quantized = self.combined_static_quantized[key]
-        static_conv = self.combined_static_conv[key]
-        static_mask = self.combined_static_masks[key]
-        static_caches = self.combined_static_caches[key]
+        state = self.combined_states[key]
+        static_inputs = state["input"]
+        static_codes = static_inputs["codes"]
+        static_quantized = static_inputs["quantized"]
+        static_conv = static_inputs["conv"]
+        static_mask = static_inputs["mask"]
+        static_caches = state["cache"]
         static_codes.zero_()
         static_mask.fill_(1)
 
@@ -912,9 +894,9 @@ class CUDAGraphDecoderWrapper:
                 static_mask[row, : int(cache.get("prefix_pad_frames", 0))] = 0
 
         self._copy_request_caches_to_batch(request_caches, static_caches)
-        self.combined_graphs[key].replay()
+        state["graph"].replay()
         self._record_graph_hit(f"suffix_{target_frames}", batch_size, len(codes_list))
-        graph_output, graph_next_quantized, graph_next_conv = self.combined_static_outputs[key]
+        graph_output, graph_next_quantized, graph_next_conv = state["output"]
         outputs: list[torch.Tensor] = []
         for row, (cache, new_frames) in enumerate(zip(request_caches, new_frames_list, strict=True)):
             actual_suffix_frames = previous_frames + new_frames
@@ -1040,18 +1022,19 @@ class CUDAGraphDecoderWrapper:
             self.stateless_capture_sizes[bucket_index] if bucket_index < len(self.stateless_capture_sizes) else None
         )
         key = (batch_size, padded_frames) if padded_frames is not None else None
-        if key is None or key not in self.stateless_graphs:
+        if key is None or key not in self.stateless_states:
             return self.decoder._forward_exact(codes)
 
-        static_input = self.stateless_static_inputs[key]
+        state = self.stateless_states[key]
+        static_input = state["input"]["codes"]
         if actual_frames == padded_frames:
             static_input.copy_(codes)
         else:
             static_input.zero_()
             static_input[:, :, :actual_frames].copy_(codes)
-        self.stateless_graphs[key].replay()
+        state["graph"].replay()
         output = self._trim_replay_output(
-            self.stateless_static_outputs[key],
+            state["output"],
             actual_frames,
             padded_frames,
         )
@@ -1113,7 +1096,7 @@ class CUDAGraphDecoderWrapper:
         expected_new_frames = (
             target_frames - self._transitions_for_mode(mode)[target_frames] if target_frames is not None else None
         )
-        if graph_key is None or not 0 < new_frames <= expected_new_frames or graph_key not in self.combined_graphs:
+        if graph_key is None or not 0 < new_frames <= expected_new_frames or graph_key not in self.combined_states:
             return self._decode_eager(codes, caches)
 
         request_kv = caches["past_key_values"]
@@ -1128,23 +1111,25 @@ class CUDAGraphDecoderWrapper:
             return self._decode_eager(codes, caches)
 
         new_codes = codes[:, :, -new_frames:]
-        static_codes = self.combined_static_codes[graph_key]
+        state = self.combined_states[graph_key]
+        static_inputs = state["input"]
+        static_codes = static_inputs["codes"]
         static_codes.zero_()
         static_codes[:, :, :new_frames].copy_(new_codes)
 
-        self.combined_static_quantized[graph_key].copy_(old_quantized)
-        self.combined_static_conv[graph_key].copy_(old_conv)
-        static_mask = self.combined_static_masks[graph_key]
+        static_inputs["quantized"].copy_(old_quantized)
+        static_inputs["conv"].copy_(old_conv)
+        static_mask = static_inputs["mask"]
         static_mask.fill_(1)
         if mode == "icl":
             static_mask[:, : int(caches.get("prefix_pad_frames", 0))] = 0
 
-        static_caches = self.combined_static_caches[graph_key]
+        static_caches = state["cache"]
         if caches is not static_caches:
             self._copy_caches(caches, static_caches)
-        self.combined_graphs[graph_key].replay()
+        state["graph"].replay()
 
-        output, graph_next_quantized, graph_next_conv = self.combined_static_outputs[graph_key]
+        output, graph_next_quantized, graph_next_conv = state["output"]
         if new_frames == expected_new_frames:
             current_index = int(caches["_suffix_buffer_index"])
             next_index = 1 - current_index
