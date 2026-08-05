@@ -3494,9 +3494,11 @@ class TestCosyVoice3Serving:
                 "mm_processor_kwargs": {"prompt_text": "ref text", "sample_rate": 24000},
             }
         )
-        cosyvoice3_server._adapter.apply_sampling_overrides = mocker.MagicMock(
-            side_effect=lambda spl, req, prompt, req_id: spl
+        cosyvoice3_server.model_config.hf_config = SimpleNamespace(
+            min_token_text_ratio=1, max_token_text_ratio=200, allowed_special=True
         )
+        cosyvoice3_server._cosyvoice3_tokenizer = mocker.MagicMock()
+        mocker.patch("vllm_omni.model_executor.models.cosyvoice3.utils.extract_text_token", return_value=[None, 10])
 
         request = OpenAICreateSpeechRequest(
             input="Hello",
@@ -3504,7 +3506,10 @@ class TestCosyVoice3Serving:
             ref_text="Reference text",
         )
         request_id, generator, tts_params = asyncio.run(cosyvoice3_server._prepare_speech_generation(request))
+        sampling_params = cosyvoice3_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
 
+        assert sampling_params.min_tokens == 10
+        assert sampling_params.max_tokens == 2000
         assert request_id.startswith("speech-")
         assert generator == "generator"
         assert tts_params == {}
@@ -3587,6 +3592,31 @@ class TestGLMTTSServing:
 
         assert text_token_len == 3
         load_tokenizer.assert_called_once()
+
+    def test_prepare_speech_generation_glm_tts(self, glm_tts_server, mocker: MockerFixture):
+        glm_tts_server._build_glm_tts_prompt = mocker.AsyncMock(
+            return_value={
+                "prompt": "Hello",
+                "multi_modal_data": {"audio": (np.zeros(24000), 24000)},
+                "mm_processor_kwargs": {"prompt_text": "ref text", "sample_rate": 24000},
+            }
+        )
+        request = OpenAICreateSpeechRequest(
+            input="Hello",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="Reference text",
+        )
+        glm_tts_server.model_config.hf_config = SimpleNamespace(min_token_text_ratio=1, max_token_text_ratio=200)
+        glm_tts_server._estimate_glm_tts_text_token_len = mocker.MagicMock(return_value=10)
+        request_id, generator, tts_params = asyncio.run(glm_tts_server._prepare_speech_generation(request))
+        sampling_params = glm_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+
+        assert sampling_params.min_tokens == 10
+        assert sampling_params.max_tokens == 2000
+        assert request_id.startswith("speech-")
+        assert generator == "generator"
+        assert tts_params == {}
+        glm_tts_server._build_glm_tts_prompt.assert_awaited_once()
 
 
 @pytest.fixture
