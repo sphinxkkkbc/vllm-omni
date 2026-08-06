@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -117,12 +117,7 @@ class BatchedToken2Wav(nn.Module):
                 raise ValueError("MiniCPM-o HiFT CUDA Graph requires connector chunk configuration")
             if self.mel_cache_len <= 0 or self.source_cache_len % self.mel_cache_len != 0:
                 raise ValueError("MiniCPM-o HiFT CUDA Graph requires source_cache_len to be divisible by mel_cache_len")
-            capture_batch_sizes = graph_config.get("capture_batch_sizes", (1,))
-            if not isinstance(capture_batch_sizes, Sequence) or isinstance(capture_batch_sizes, (str, bytes)):
-                raise TypeError("HiFT Graph capture_batch_sizes must be a sequence of integers")
-            capture_batch_sizes = sorted({int(size) for size in capture_batch_sizes if int(size) > 0})
-            if not capture_batch_sizes:
-                raise ValueError("HiFT Graph capture_batch_sizes must contain a positive integer")
+            capture_batch_sizes = graph_config.get("capture_batch_sizes", [1])
 
             self.hift_graph_wrapper = HiFTGraphWrapper(
                 token2wav=token2wav,

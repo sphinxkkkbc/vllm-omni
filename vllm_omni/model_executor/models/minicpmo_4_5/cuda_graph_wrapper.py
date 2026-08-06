@@ -6,7 +6,6 @@ from vllm.platforms import current_platform
 class HiFTGraphWrapper:
     def __init__(self, token2wav, connector_config, capture_batch_size):
         self.decode_fn = token2wav.hift.inference
-        self.connector_config = connector_config
         self.codec_chunk_frames = connector_config["codec_chunk_frames"]
         self.codec_left_context_frames = connector_config["codec_left_context_frames"]
         lookahead_layer = getattr(token2wav.flow.encoder, "pre_lookahead_layer", None)
@@ -23,8 +22,6 @@ class HiFTGraphWrapper:
         self.static_speech_outputs: dict[tuple[int, int, int], torch.Tensor] = {}
         self.static_cache_source_inputs: dict[tuple[int, int, int], torch.Tensor] = {}
         self.static_cache_source_outputs: dict[tuple[int, int, int], torch.Tensor] = {}
-        self.enabled = True
-        self.captured = False
         parameter = next(token2wav.hift.parameters())
         self.device = parameter.device
         self.dtype = parameter.dtype
@@ -44,9 +41,6 @@ class HiFTGraphWrapper:
         return [uncached_bucket_size, cached_bucket_size], [uncached_source_cache_len, cached_source_cache_len]
 
     def capture(self):
-        if not self.enabled:
-            return None
-
         for batch_size in self.capture_batch_size:
             for mel_frames, source_cache_len in zip(
                 self.capture_bucket_size,
@@ -54,8 +48,6 @@ class HiFTGraphWrapper:
                 strict=True,
             ):
                 self._capture(batch_size, mel_frames, source_cache_len)
-
-        self.captured = True
 
     def _capture(
         self,
@@ -90,7 +82,7 @@ class HiFTGraphWrapper:
         self.static_cache_source_outputs[key] = static_cache_source_output
 
     def replay(self, speech_feat, cache_source):
-        if not self.enabled or not self.captured or torch.cuda.is_current_stream_capturing():
+        if torch.cuda.is_current_stream_capturing():
             return self.decode_fn(speech_feat, cache_source)
 
         batch_size = speech_feat.shape[0]

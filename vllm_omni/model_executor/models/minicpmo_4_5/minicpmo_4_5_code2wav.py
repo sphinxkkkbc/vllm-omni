@@ -157,15 +157,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         if self._connector_config["codec_chunk_frames"] <= 0 or self._connector_config["codec_left_context_frames"] < 0:
             raise ValueError(f"Invalid MiniCPM-o connector chunk configuration: {self._connector_config}")
         raw_capture_batch_sizes = extra.get("hift_graph_capture_batch_sizes")
-        if raw_capture_batch_sizes is None:
-            capture_batch_sizes = [1]
-        elif isinstance(raw_capture_batch_sizes, Sequence) and not isinstance(
-            raw_capture_batch_sizes,
-            (str, bytes, bytearray),
-        ):
-            capture_batch_sizes = [int(size) for size in raw_capture_batch_sizes]
-        else:
-            raise TypeError("hift_graph_capture_batch_sizes must be a sequence of integers")
+        capture_batch_sizes = [1] if raw_capture_batch_sizes is None else raw_capture_batch_sizes
         self._hift_graph_config = {
             "enabled": bool(extra.get("enable_hift_graph", False)),
             "capture_batch_sizes": capture_batch_sizes,
