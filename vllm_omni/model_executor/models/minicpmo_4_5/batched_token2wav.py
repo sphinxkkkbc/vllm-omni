@@ -63,8 +63,6 @@ class BatchedToken2Wav(nn.Module):
     asset loader and prompt feature extractor.
     """
 
-
-
     def __init__(
         self,
         token2wav: Any,
