@@ -71,6 +71,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._decode_chunk_frames = 300
         self._decode_left_context_frames = 25
         self._decode_batch_max_size = 0
+        self._initial_codec_chunk_frames = 1
         self._logged_codec_stats = False
         self._logged_malformed_codec_lengths: set[tuple[int, int]] = set()
         self._batch_stats_enabled = os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS", "").lower() in (
@@ -103,6 +104,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._total_upsample = int(self.decoder.total_upsample)
         self._decoder_sliding_window = int(getattr(dec_config, "sliding_window", 0) or 0)
         self._decoder_state_cache: dict[str, dict[str, Any]] = {}
+        self._decoder_state_cache_warn_entries = 512
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         # This stage ignores token embeddings. Keep a stable dummy embedding for vLLM runner.
@@ -275,7 +277,9 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         valid_codes_qf: list[tuple[str | None, torch.Tensor]] = []
         valid_indices: list[int] = []
+        left_context_size = [0] * len(request_ids_list)
         ref_context_size = [0] * len(request_ids_list)
+        segment_finished_flags = [False] * len(request_ids_list)
         request_state_ids: list[str | None] = [None] * len(request_ids_list)
         ref_context_request_ids: list[str | None] = [None] * len(request_ids_list)
         ref_context_included = [False] * len(request_ids_list)
@@ -309,6 +313,10 @@ class Qwen3TTSCode2Wav(nn.Module):
                 if not isinstance(info, dict):
                     continue
                 meta = info.get("meta", {})
+                if "is_segment_finished" in meta:
+                    segment_finished_flags[i] = _meta_bool(meta["is_segment_finished"])
+                if "left_context_size" in meta:
+                    left_context_size[i] = _meta_int(meta["left_context_size"])
                 if "ref_context_size" in meta:
                     ref_context_size[i] = _meta_int(meta["ref_context_size"])
                 if "ref_context_request_id" in meta:
@@ -350,7 +358,17 @@ class Qwen3TTSCode2Wav(nn.Module):
                     raise ValueError("Qwen3-TTS async_chunk first ICL chunk must include its declared reference prefix")
             valid_codes_qf.append((state_req_id, codes_qf))
             if state_req_id is not None:
-                state = self._decoder_state_cache.setdefault(state_req_id, {})
+                state = self._decoder_state_cache.get(state_req_id)
+                if state is None:
+                    if len(self._decoder_state_cache) >= self._decoder_state_cache_warn_entries:
+                        logger.warning_once(
+                            "Qwen3-TTS decoder state cache exceeded the expected active-request envelope: "
+                            "entries=%d threshold=%d. Keeping all active states; check request cleanup paths.",
+                            len(self._decoder_state_cache),
+                            self._decoder_state_cache_warn_entries,
+                        )
+                    state = {}
+                    self._decoder_state_cache[state_req_id] = state
                 state.setdefault("prefix_frames", 0)
                 if state_req_id.startswith(_DUMMY_REQUEST_ID):
                     state["_is_dummy_run"] = True
@@ -368,14 +386,14 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         num_req = len(request_ids_list)
         if not valid_codes_qf:
-            for req_id, finished in zip(
+            for req_id, finished, segment_finished in zip(
                 request_state_ids,
                 finished_flags,
+                segment_finished_flags,
                 strict=False,
             ):
-                if finished:
-                    if req_id is not None:
-                        self._decoder_state_cache.pop(req_id, None)
+                if req_id is not None and (finished or segment_finished):
+                    self._decoder_state_cache.pop(req_id, None)
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
@@ -430,6 +448,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             request_lengths,
             caches=request_states,
             chunk_size=self._decode_chunk_frames,
+            initial_chunk_size=self._initial_codec_chunk_frames,
             left_context_size=self._decode_left_context_frames,
             max_batch_size=self._decode_batch_max_size,
         )
@@ -447,6 +466,10 @@ class Qwen3TTSCode2Wav(nn.Module):
                 raise ValueError(f"Qwen3-TTS batched decoder returned unexpected row shape {tuple(wav.shape)}")
             if request_states is not None:
                 wav = wav[: int(request_states[row].get("_last_output_audio_length", wav.shape[-1]))]
+            else:
+                start = left_context_size[row] * self._total_upsample
+                end = request_lengths[row] * self._total_upsample
+                wav = wav[start:end]
             wav_tensors.append(wav)
 
         if self._batch_stats_log_every > 0 and self._batch_stats_forwards % self._batch_stats_log_every == 0:
@@ -464,12 +487,13 @@ class Qwen3TTSCode2Wav(nn.Module):
                 # Decoder already runs in fp32, so the .to(float32) is a redundant dispatch.
                 audios[idx] = (wav if wav.dtype == torch.float32 else wav.to(torch.float32)).reshape(-1)
 
-        for req_id, finished in zip(
+        for req_id, finished, segment_finished in zip(
             request_state_ids,
             finished_flags,
+            segment_finished_flags,
             strict=False,
         ):
-            if req_id is not None and finished:
+            if req_id is not None and (finished or segment_finished):
                 self._decoder_state_cache.pop(req_id, None)
 
         return OmniOutput(
@@ -659,6 +683,8 @@ class Qwen3TTSCode2Wav(nn.Module):
             decode_cudagraph_batch_sizes = None
             decode_cudagraph_capture_sizes = None
             decode_enable_tf32 = False
+
+        self._initial_codec_chunk_frames = initial_codec_chunk_frames
 
         if decode_enable_tf32 and device.type == "cuda":
             # PyTorch exposes TF32 controls as process-wide CUDA backend

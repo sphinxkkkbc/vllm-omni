@@ -61,6 +61,7 @@ class _FakeDecoder(nn.Module):
         *,
         caches=None,
         chunk_size: int = 300,
+        initial_chunk_size: int = 1,
         left_context_size: int = 25,
         max_batch_size: int = 0,
     ) -> torch.Tensor:
@@ -186,7 +187,7 @@ def test_forward_uses_decoder_audio_contract_on_exact_frame_boundaries():
     )
 
     audio = out.multimodal_outputs["model_outputs"][0]
-    expected = torch.arange(30, dtype=torch.float32)
+    expected = torch.arange(8, 24, dtype=torch.float32)
     torch.testing.assert_close(audio, expected)
 
 
@@ -199,11 +200,11 @@ def test_forward_uses_decoder_audio_contract_without_context():
     )
 
     audio = out.multimodal_outputs["model_outputs"][0]
-    expected = torch.arange(30, dtype=torch.float32)
+    expected = torch.arange(24, dtype=torch.float32)
     torch.testing.assert_close(audio, expected)
 
 
-def test_forward_does_not_retrim_decoder_output():
+def test_stateless_forward_trims_reference_prefix_from_decoder_output():
     model = _make_model()
 
     def _incremental_decode(codes, lengths, *, caches, **_kwargs):
@@ -225,7 +226,7 @@ def test_forward_does_not_retrim_decoder_output():
     )
 
     audio = out.multimodal_outputs["model_outputs"][0]
-    torch.testing.assert_close(audio, torch.arange(16, dtype=torch.float32))
+    torch.testing.assert_close(audio, torch.arange(8, 16, dtype=torch.float32))
 
 
 def test_request_aware_forward_passes_only_delta_frames_to_decoder():
@@ -244,6 +245,38 @@ def test_request_aware_forward_passes_only_delta_frames_to_decoder():
         (1, _NUM_QUANTIZERS, 3),
         (1, _NUM_QUANTIZERS, 2),
     ]
+
+
+def test_four_frame_first_chunk_uses_configured_initial_size_without_ramp():
+    model = _make_model(
+        async_chunk=True,
+        stage_connector_config={
+            "extra": {
+                "codec_chunk_frames": 25,
+                "initial_codec_chunk_frames": 4,
+            }
+        },
+    )
+    _load_weights_noop(model)
+    original_decode = model.decoder.batched_chunked_decode
+    decode_kwargs = []
+
+    def _record_decode(*args, **kwargs):
+        decode_kwargs.append(kwargs)
+        return original_decode(*args, **kwargs)
+
+    model.decoder.batched_chunked_decode = _record_decode
+
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),
+        runtime_additional_information=[{"meta": {"request_id": "four-frame-request", "left_context_size": 0}}],
+    )
+
+    assert model._initial_codec_chunk_frames == 4
+    assert model.decoder._incremental_chunk_ramp == []
+    assert decode_kwargs[0]["initial_chunk_size"] == 4
+    assert tuple(model.decoder.decode_codes[-1].shape) == (1, _NUM_QUANTIZERS, 4)
+    assert model._decoder_state_cache["four-frame-request"]["_last_output_audio_length"] > 0
 
 
 def test_connector_codec_chunking_does_not_override_decode_chunking():
@@ -351,6 +384,22 @@ def test_dummy_request_state_is_marked_for_graph_stats_suppression():
     assert model._decoder_state_cache == {}
 
 
+def test_decoder_state_cache_capacity_warns_without_evicting_or_failing():
+    model = _make_model(async_chunk=True)
+    assert model._decoder_state_cache_warn_entries == 512
+    model._decoder_state_cache.update({f"active-{index}": {"prefix_frames": 0} for index in range(512)})
+
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger.warning_once") as warning:
+        model.forward(
+            input_ids=torch.arange(4, dtype=torch.long),
+            runtime_additional_information=[{"meta": {"request_id": "new-request"}}],
+        )
+
+    warning.assert_called_once()
+    assert len(model._decoder_state_cache) == 513
+    assert "new-request" in model._decoder_state_cache
+
+
 def test_forward_batches_equal_length_requests_in_one_decoder_call():
     model = _make_model()
 
@@ -375,8 +424,8 @@ def test_forward_batches_equal_length_requests_in_one_decoder_call():
         }
     ]
     audios = out.multimodal_outputs["model_outputs"]
-    torch.testing.assert_close(audios[0], torch.arange(18, dtype=torch.float32))
-    torch.testing.assert_close(audios[1], torch.arange(1000, 1018, dtype=torch.float32))
+    torch.testing.assert_close(audios[0], torch.arange(12, dtype=torch.float32))
+    torch.testing.assert_close(audios[1], torch.arange(1004, 1012, dtype=torch.float32))
 
 
 def test_forward_batches_request_aware_decoder_states():
@@ -478,8 +527,8 @@ def test_forward_passes_variable_length_padded_batch_to_decoder():
         }
     ]
     audios = out.multimodal_outputs["model_outputs"]
-    torch.testing.assert_close(audios[0], torch.arange(22, dtype=torch.float32))
-    torch.testing.assert_close(audios[1], torch.arange(1000, 1022, dtype=torch.float32))
+    torch.testing.assert_close(audios[0], torch.arange(8, dtype=torch.float32))
+    torch.testing.assert_close(audios[1], torch.arange(1008, 1016, dtype=torch.float32))
 
 
 def test_decode_chunking_override_is_passed_to_cudagraph():

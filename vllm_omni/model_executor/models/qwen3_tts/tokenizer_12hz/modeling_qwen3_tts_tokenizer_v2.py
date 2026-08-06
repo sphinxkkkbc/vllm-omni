@@ -1148,7 +1148,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         if codes.shape[1] != self.config.num_quantizers:
             raise ValueError(f"Expected {self.config.num_quantizers} layer of codes, got {codes.shape[1]}")
 
-        if codes.shape[-1] == 4 or caches is None:
+        if caches is None:
             wav = self._forward_exact(codes)
             return wav
 
@@ -1496,6 +1496,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         lengths,
         caches=None,
         chunk_size=300,
+        initial_chunk_size=1,
         left_context_size=25,
         max_batch_size=0,
     ):
@@ -1517,7 +1518,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             prefix_length = int(getattr(self.config, "sliding_window", 0) or 0)
             codec_chunk_frames = int(getattr(self, "_incremental_chunk_frames", 25))
             chunk_ramp = list(getattr(self, "_incremental_chunk_ramp", ()) or ())
-            initial_chunk_frames = int(chunk_ramp[0]) if chunk_ramp else 1
+            initial_chunk_frames = int(chunk_ramp[0]) if chunk_ramp else initial_chunk_size
             transitions: dict[int, int] = {}
             previous = initial_chunk_frames
             for new_frames in chunk_ramp[1:]:
