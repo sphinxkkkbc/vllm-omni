@@ -150,6 +150,33 @@ class MiniCPMO45Code2Wav(nn.Module):
             prefix="minicpmo45-runtime-prompts-",
         )
         extra = self._extra_config()
+        self._connector_config = {
+            "codec_chunk_frames": int(extra.get("codec_chunk_frames", 25)),
+            "codec_left_context_frames": int(extra.get("codec_left_context_frames", 3)),
+        }
+        if self._connector_config["codec_chunk_frames"] <= 0 or self._connector_config["codec_left_context_frames"] < 0:
+            raise ValueError(f"Invalid MiniCPM-o connector chunk configuration: {self._connector_config}")
+        scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
+        max_batch_size = max(1, int(getattr(scheduler_config, "max_num_seqs", 1)))
+        raw_capture_batch_sizes = extra.get("hift_cuda_graph_capture_batch_sizes")
+        if raw_capture_batch_sizes is None:
+            capture_batch_sizes = []
+            size = 1
+            while size < max_batch_size:
+                capture_batch_sizes.append(size)
+                size *= 2
+            capture_batch_sizes.append(max_batch_size)
+        elif isinstance(raw_capture_batch_sizes, Sequence) and not isinstance(
+            raw_capture_batch_sizes,
+            (str, bytes, bytearray),
+        ):
+            capture_batch_sizes = [int(size) for size in raw_capture_batch_sizes]
+        else:
+            raise TypeError("hift_cuda_graph_capture_batch_sizes must be a sequence of integers")
+        self._hift_graph_config = {
+            "enabled": bool(extra.get("enable_hift_cuda_graph", False)),
+            "capture_batch_sizes": capture_batch_sizes,
+        }
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
@@ -765,4 +792,8 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         finally:
             torch.set_default_dtype(previous_dtype)
-        self.backend = BatchedToken2Wav(token2wav)
+        self.backend = BatchedToken2Wav(
+            token2wav,
+            connector_config=self._connector_config,
+            hift_graph_config=self._hift_graph_config,
+        )

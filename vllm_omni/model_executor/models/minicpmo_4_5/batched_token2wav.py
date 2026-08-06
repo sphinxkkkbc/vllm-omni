@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +12,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .cuda_graph_wrapper import HiFTGraphWrapper
 
 _SILENCE_TOKEN = 4218
 
@@ -60,7 +63,13 @@ class BatchedToken2Wav(nn.Module):
     asset loader and prompt feature extractor.
     """
 
-    def __init__(self, token2wav: Any):
+    def __init__(
+        self,
+        token2wav: Any,
+        *,
+        connector_config: Mapping[str, int] | None = None,
+        hift_graph_config: Mapping[str, Any] | None = None,
+    ):
         super().__init__()
         self._token2wav = token2wav
         self.flow = token2wav.flow
@@ -79,7 +88,7 @@ class BatchedToken2Wav(nn.Module):
                 _autocast_disabled(device),
             ):
                 # 50 mel frames match the default first streamed vocoder chunk.
-                speech, source = self.hift(
+                speech, source = self.hift.inference(
                     torch.zeros((1, mel_channels, 50), device=device, dtype=dtype),
                     torch.zeros((1, 1, 0), device=device, dtype=dtype),
                 )
@@ -95,7 +104,52 @@ class BatchedToken2Wav(nn.Module):
             token2wav.speech_window.detach().clone(),
             persistent=False,
         )
+        self.hift_graph_wrapper: HiFTGraphWrapper | None = None
+        graph_config = dict(hift_graph_config or {})
+        if bool(graph_config.get("enabled", False)):
+            if hift_parameter is None or hift_parameter.device.type != "cuda":
+                raise ValueError("MiniCPM-o HiFT CUDA Graph requires HiFT on a CUDA device")
+            if connector_config is None:
+                raise ValueError("MiniCPM-o HiFT CUDA Graph requires connector chunk configuration")
+            pre_lookahead_len = self._pre_lookahead_len()
+            if pre_lookahead_len is None:
+                raise ValueError("MiniCPM-o HiFT CUDA Graph requires a fixed pre-lookahead length")
+            if self.mel_cache_len <= 0 or self.source_cache_len % self.mel_cache_len != 0:
+                raise ValueError("MiniCPM-o HiFT CUDA Graph requires source_cache_len to be divisible by mel_cache_len")
+            capture_batch_sizes = graph_config.get("capture_batch_sizes", (1,))
+            if not isinstance(capture_batch_sizes, Sequence) or isinstance(capture_batch_sizes, (str, bytes)):
+                raise TypeError("HiFT CUDA Graph capture_batch_sizes must be a sequence of integers")
+            capture_batch_sizes = sorted({int(size) for size in capture_batch_sizes if int(size) > 0})
+            if not capture_batch_sizes:
+                raise ValueError("HiFT CUDA Graph capture_batch_sizes must contain a positive integer")
+
+            hift_config = {
+                "mel_cache_len": self.mel_cache_len,
+                "mel_frames": int(self.hift.conv_pre.in_channels),
+                "samples_per_mel": self.source_cache_len // self.mel_cache_len,
+                "flow_upsample_rate": int(getattr(self.flow, "token_mel_ratio", 2)),
+            }
+            self.hift_graph_wrapper = HiFTGraphWrapper(
+                decode_fn=self.hift.inference,
+                hift_config=hift_config,
+                connector_config=dict(connector_config),
+                pre_lookahead_len=pre_lookahead_len,
+                capture_batch_size=capture_batch_sizes,
+                device=hift_parameter.device,
+                dtype=hift_parameter.dtype,
+            )
+            with torch.inference_mode(), _autocast_disabled(hift_parameter.device):
+                self.hift_graph_wrapper.capture()
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
+
+    def _hift_inference(
+        self,
+        mel: torch.Tensor,
+        source_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.hift_graph_wrapper is None:
+            return self.hift.inference(mel, source_cache)
+        return self.hift_graph_wrapper.replay(mel, source_cache)
 
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
@@ -449,7 +503,7 @@ class BatchedToken2Wav(nn.Module):
         old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
         old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
         mel = torch.cat((old_mel, chunk_mel), dim=2)
-        speech, source = self.hift(mel, old_source)
+        speech, source = self._hift_inference(mel, old_source)
         if old_speech.shape[-1] > 0:
             window = self.speech_window.to(device=speech.device, dtype=speech.dtype)
             speech = self._fade_in_out(speech, old_speech, window)
