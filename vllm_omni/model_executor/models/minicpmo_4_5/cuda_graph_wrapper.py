@@ -1,40 +1,39 @@
-from vllm.platforms import current_platform
 import torch
-from typing import Tuple
 from torch.cuda import CUDAGraph
+from vllm.platforms import current_platform
 
 
 class HiFTGraphWrapper:
-    def __init__(self, decode_fn, hift_config, connector_config, pre_lookahead_len, capture_batch_size, device, dtype):
-        self.decode_fn = decode_fn
+    def __init__(self, token2wav, connector_config, capture_batch_size):
+        self.decode_fn = token2wav.hift.inference
         self.connector_config = connector_config
         self.codec_chunk_frames = connector_config["codec_chunk_frames"]
         self.codec_left_context_frames = connector_config["codec_left_context_frames"]
-        self.pre_lookahead_len = pre_lookahead_len
-        self.mel_cache_len = hift_config["mel_cache_len"]
-        self.hift_config = hift_config
-        self.mel_frames = hift_config["mel_frames"]
-        self.upsample_factor = hift_config["samples_per_mel"]
-        self.flow_upsample_rate = hift_config["flow_upsample_rate"]
+        lookahead_layer = getattr(token2wav.flow.encoder, "pre_lookahead_layer", None)
+        self.pre_lookahead_len = int(getattr(lookahead_layer, "pre_lookahead_len"))
+        self.mel_cache_len = int(token2wav.mel_cache_len)
+        source_cache_len = int(token2wav.source_cache_len)
+        self.mel_frames = int(token2wav.hift.conv_pre.in_channels)
+        self.upsample_factor = source_cache_len // self.mel_cache_len
+        self.flow_upsample_rate = int(getattr(token2wav.flow, "token_mel_ratio", 2))
         self.capture_bucket_size, self.capture_source_cache_len = self.derive_capture_bucket_size()
         self.capture_batch_size = capture_batch_size
-        self.graph: dict[Tuple[int, int, int], torch.cuda.CUDAGraph] = {}
-        self.static_speech_inputs: dict[Tuple[int, int, int], torch.Tensor] = {}
-        self.static_speech_outputs: dict[Tuple[int, int, int], torch.Tensor] = {}
-        self.static_cache_source_inputs: dict[Tuple[int, int, int], torch.Tensor] = {}
-        self.static_cache_source_outputs: dict[Tuple[int, int, int], torch.Tensor] = {}
+        self.graph: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}
+        self.static_speech_inputs: dict[tuple[int, int, int], torch.Tensor] = {}
+        self.static_speech_outputs: dict[tuple[int, int, int], torch.Tensor] = {}
+        self.static_cache_source_inputs: dict[tuple[int, int, int], torch.Tensor] = {}
+        self.static_cache_source_outputs: dict[tuple[int, int, int], torch.Tensor] = {}
         self.enabled = True
         self.captured = False
-        self.device = device
-        self.dtype = dtype
+        parameter = next(token2wav.hift.parameters())
+        self.device = parameter.device
+        self.dtype = parameter.dtype
         self.max_lazy_graphs = 8
         self.lazy_graph_count = 0
 
     def derive_capture_bucket_size(self):
         chunk_mel_frames = (
-            self.codec_chunk_frames
-            + self.codec_left_context_frames
-            - self.pre_lookahead_len
+            self.codec_chunk_frames + self.codec_left_context_frames - self.pre_lookahead_len
         ) * self.flow_upsample_rate
 
         uncached_source_cache_len = 0
@@ -66,26 +65,14 @@ class HiFTGraphWrapper:
     ):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Cannot capture HiFT graph during an active stream capture")
-        
+
         key = (batch_size, mel_frames, source_cache_len)
 
         if key in self.graph:
             return
 
-        static_mel = torch.zeros(
-            batch_size,
-            self.mel_frames,
-            mel_frames,
-            device=self.device,
-            dtype=self.dtype
-        )
-        static_source_cache = torch.zeros(
-            batch_size,
-            1,
-            source_cache_len,
-            device=self.device,
-            dtype=self.dtype
-        )    
+        static_mel = torch.zeros(batch_size, self.mel_frames, mel_frames, device=self.device, dtype=self.dtype)
+        static_source_cache = torch.zeros(batch_size, 1, source_cache_len, device=self.device, dtype=self.dtype)
         with torch.no_grad():
             _ = self.decode_fn(static_mel, static_source_cache)
 
@@ -93,9 +80,7 @@ class HiFTGraphWrapper:
 
         graph = CUDAGraph()
         with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
-            static_speech_output, static_cache_source_output = self.decode_fn(
-                static_mel, static_source_cache
-            )
+            static_speech_output, static_cache_source_output = self.decode_fn(static_mel, static_source_cache)
 
         self.graph[key] = graph
         self.static_speech_inputs[key] = static_mel
@@ -103,7 +88,6 @@ class HiFTGraphWrapper:
 
         self.static_speech_outputs[key] = static_speech_output
         self.static_cache_source_outputs[key] = static_cache_source_output
-
 
     def replay(self, speech_feat, cache_source):
         if not self.enabled or not self.captured or torch.cuda.is_current_stream_capturing():
@@ -116,7 +100,7 @@ class HiFTGraphWrapper:
 
         if target_b is None:
             return self.decode_fn(speech_feat, cache_source)
-        
+
         key = (target_b, num_frames, cache_source_len)
 
         if key not in self.graph:
@@ -124,7 +108,6 @@ class HiFTGraphWrapper:
                 return self.decode_fn(speech_feat, cache_source)
             self._capture(*key)
             self.lazy_graph_count += 1
-
 
         static_speech_inputs = self.static_speech_inputs[key].zero_()
         static_speech_inputs[:batch_size].copy_(speech_feat)

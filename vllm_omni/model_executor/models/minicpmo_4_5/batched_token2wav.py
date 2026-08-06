@@ -107,36 +107,23 @@ class BatchedToken2Wav(nn.Module):
         self.hift_graph_wrapper: HiFTGraphWrapper | None = None
         graph_config = dict(hift_graph_config or {})
         if bool(graph_config.get("enabled", False)):
-            if hift_parameter is None or hift_parameter.device.type != "cuda":
-                raise ValueError("MiniCPM-o HiFT CUDA Graph requires HiFT on a CUDA device")
+            if hift_parameter is None:
+                raise ValueError("MiniCPM-o HiFT Graph requires a parameterized HiFT module")
             if connector_config is None:
                 raise ValueError("MiniCPM-o HiFT CUDA Graph requires connector chunk configuration")
-            pre_lookahead_len = self._pre_lookahead_len()
-            if pre_lookahead_len is None:
-                raise ValueError("MiniCPM-o HiFT CUDA Graph requires a fixed pre-lookahead length")
             if self.mel_cache_len <= 0 or self.source_cache_len % self.mel_cache_len != 0:
                 raise ValueError("MiniCPM-o HiFT CUDA Graph requires source_cache_len to be divisible by mel_cache_len")
             capture_batch_sizes = graph_config.get("capture_batch_sizes", (1,))
             if not isinstance(capture_batch_sizes, Sequence) or isinstance(capture_batch_sizes, (str, bytes)):
-                raise TypeError("HiFT CUDA Graph capture_batch_sizes must be a sequence of integers")
+                raise TypeError("HiFT Graph capture_batch_sizes must be a sequence of integers")
             capture_batch_sizes = sorted({int(size) for size in capture_batch_sizes if int(size) > 0})
             if not capture_batch_sizes:
-                raise ValueError("HiFT CUDA Graph capture_batch_sizes must contain a positive integer")
+                raise ValueError("HiFT Graph capture_batch_sizes must contain a positive integer")
 
-            hift_config = {
-                "mel_cache_len": self.mel_cache_len,
-                "mel_frames": int(self.hift.conv_pre.in_channels),
-                "samples_per_mel": self.source_cache_len // self.mel_cache_len,
-                "flow_upsample_rate": int(getattr(self.flow, "token_mel_ratio", 2)),
-            }
             self.hift_graph_wrapper = HiFTGraphWrapper(
-                decode_fn=self.hift.inference,
-                hift_config=hift_config,
+                token2wav=token2wav,
                 connector_config=dict(connector_config),
-                pre_lookahead_len=pre_lookahead_len,
                 capture_batch_size=capture_batch_sizes,
-                device=hift_parameter.device,
-                dtype=hift_parameter.dtype,
             )
             with torch.inference_mode(), _autocast_disabled(hift_parameter.device):
                 self.hift_graph_wrapper.capture()

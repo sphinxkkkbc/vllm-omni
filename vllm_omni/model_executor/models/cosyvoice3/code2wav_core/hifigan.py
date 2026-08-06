@@ -200,6 +200,11 @@ class SineGen2(torch.nn.Module):
         self.flag_for_pulse = flag_for_pulse
         self.upsample_scale = upsample_scale
         self.causal = causal
+        self.register_buffer(
+            "harmonic_ids",
+            torch.arange(1, self.harmonic_num + 2, dtype=torch.float32).view(1, 1, -1),
+            persistent=False,
+        )
         if causal is True:
             self.rand_ini = torch.rand(1, 9)
             self.rand_ini[:, 0] = 0
@@ -277,7 +282,7 @@ class SineGen2(torch.nn.Module):
         output uv: tensor(batchsize=1, length, 1)
         """
         # fundamental component
-        fn = torch.multiply(f0, torch.FloatTensor([[range(1, self.harmonic_num + 2)]]).to(f0.device))
+        fn = torch.multiply(f0, self.harmonic_ids)
 
         # generate sine waveforms
         sine_waves = self._f02sine(fn) * self.sine_amp
@@ -463,7 +468,11 @@ class HiFTGenerator(nn.Module):
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
-        self.stft_window = torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32))
+        self.register_buffer(
+            "stft_window",
+            torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32)),
+            persistent=False,
+        )
         self.f0_predictor = f0_predictor
 
     def remove_weight_norm(self):
@@ -485,7 +494,7 @@ class HiFTGenerator(nn.Module):
             self.istft_params["n_fft"],
             self.istft_params["hop_len"],
             self.istft_params["n_fft"],
-            window=self.stft_window.to(x.device),
+            window=self.stft_window,
             return_complex=True,
         )
         spec = torch.view_as_real(spec)  # [B, F, TT, 2]
@@ -500,7 +509,7 @@ class HiFTGenerator(nn.Module):
             self.istft_params["n_fft"],
             self.istft_params["hop_len"],
             self.istft_params["n_fft"],
-            window=self.stft_window.to(magnitude.device),
+            window=self.stft_window,
         )
         return inverse_transform
 
