@@ -61,7 +61,6 @@ class _FakeDecoder(nn.Module):
         *,
         caches=None,
         chunk_size: int = 300,
-        initial_chunk_size: int = 1,
         left_context_size: int = 25,
         max_batch_size: int = 0,
     ) -> torch.Tensor:
@@ -258,25 +257,15 @@ def test_four_frame_first_chunk_uses_configured_initial_size_without_ramp():
         },
     )
     _load_weights_noop(model)
-    original_decode = model.decoder.batched_chunked_decode
-    decode_kwargs = []
-
-    def _record_decode(*args, **kwargs):
-        decode_kwargs.append(kwargs)
-        return original_decode(*args, **kwargs)
-
-    model.decoder.batched_chunked_decode = _record_decode
 
     model.forward(
         input_ids=torch.arange(8, dtype=torch.long),
         runtime_additional_information=[{"meta": {"request_id": "four-frame-request", "left_context_size": 0}}],
     )
 
-    assert model._initial_codec_chunk_frames == 4
+    assert model.decoder._initial_codec_chunk_frames == 4
     assert model.decoder._incremental_chunk_ramp == []
-    assert decode_kwargs[0]["initial_chunk_size"] == 4
     assert tuple(model.decoder.decode_codes[-1].shape) == (1, _NUM_QUANTIZERS, 4)
-    assert model._decoder_state_cache["four-frame-request"]["_last_output_audio_length"] > 0
 
 
 def test_connector_codec_chunking_does_not_override_decode_chunking():

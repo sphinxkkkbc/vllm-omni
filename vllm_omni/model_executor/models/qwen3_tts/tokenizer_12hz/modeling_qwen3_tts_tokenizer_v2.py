@@ -1496,7 +1496,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         lengths,
         caches=None,
         chunk_size=300,
-        initial_chunk_size=1,
         left_context_size=25,
         max_batch_size=0,
     ):
@@ -1516,9 +1515,10 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
         if caches is not None:
             prefix_length = int(getattr(self.config, "sliding_window", 0) or 0)
+            initial_codec_chunk_frames = int(getattr(self, "_initial_codec_chunk_frames", 1))
             codec_chunk_frames = int(getattr(self, "_incremental_chunk_frames", 25))
             chunk_ramp = list(getattr(self, "_incremental_chunk_ramp", ()) or ())
-            initial_chunk_frames = int(chunk_ramp[0]) if chunk_ramp else initial_chunk_size
+            initial_chunk_frames = int(chunk_ramp[0]) if chunk_ramp else initial_codec_chunk_frames
             transitions: dict[int, int] = {}
             previous = initial_chunk_frames
             for new_frames in chunk_ramp[1:]:

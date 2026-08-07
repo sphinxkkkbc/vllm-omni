@@ -71,7 +71,6 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._decode_chunk_frames = 300
         self._decode_left_context_frames = 25
         self._decode_batch_max_size = 0
-        self._initial_codec_chunk_frames = 1
         self._logged_codec_stats = False
         self._logged_malformed_codec_lengths: set[tuple[int, int]] = set()
         self._batch_stats_enabled = os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS", "").lower() in (
@@ -448,7 +447,6 @@ class Qwen3TTSCode2Wav(nn.Module):
             request_lengths,
             caches=request_states,
             chunk_size=self._decode_chunk_frames,
-            initial_chunk_size=self._initial_codec_chunk_frames,
             left_context_size=self._decode_left_context_frames,
             max_batch_size=self._decode_batch_max_size,
         )
@@ -684,8 +682,6 @@ class Qwen3TTSCode2Wav(nn.Module):
             decode_cudagraph_capture_sizes = None
             decode_enable_tf32 = False
 
-        self._initial_codec_chunk_frames = initial_codec_chunk_frames
-
         if decode_enable_tf32 and device.type == "cuda":
             # PyTorch exposes TF32 controls as process-wide CUDA backend
             # switches. This opt-in is intended for deployments where
@@ -701,6 +697,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 torch.get_float32_matmul_precision(),
             )
 
+        self.decoder._initial_codec_chunk_frames = initial_codec_chunk_frames
         self.decoder._incremental_chunk_frames = codec_chunk_frames or 25
         self.decoder._incremental_chunk_ramp = list(codec_chunk_ramp or ())
 
