@@ -6,6 +6,9 @@ from vllm.platforms import current_platform
 class HiFTGraphWrapper:
     def __init__(self, token2wav, connector_config, capture_batch_size):
         self.decode_fn = token2wav.hift.inference
+        self.graph_fn = token2wav.hift._inference_pre_istft
+        self.istft_fn = token2wav.hift._istft
+        self.audio_limit = token2wav.hift.audio_limit
         self.codec_chunk_frames = connector_config["codec_chunk_frames"]
         self.codec_left_context_frames = connector_config["codec_left_context_frames"]
         lookahead_layer = getattr(token2wav.flow.encoder, "pre_lookahead_layer", None)
@@ -19,7 +22,8 @@ class HiFTGraphWrapper:
         self.capture_batch_size = capture_batch_size
         self.graph: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}
         self.static_speech_inputs: dict[tuple[int, int, int], torch.Tensor] = {}
-        self.static_speech_outputs: dict[tuple[int, int, int], torch.Tensor] = {}
+        self.static_magnitude_outputs: dict[tuple[int, int, int], torch.Tensor] = {}
+        self.static_phase_outputs: dict[tuple[int, int, int], torch.Tensor] = {}
         self.static_cache_source_inputs: dict[tuple[int, int, int], torch.Tensor] = {}
         self.static_cache_source_outputs: dict[tuple[int, int, int], torch.Tensor] = {}
         parameter = next(token2wav.hift.parameters())
@@ -65,20 +69,28 @@ class HiFTGraphWrapper:
 
         static_mel = torch.zeros(batch_size, self.mel_frames, mel_frames, device=self.device, dtype=self.dtype)
         static_source_cache = torch.zeros(batch_size, 1, source_cache_len, device=self.device, dtype=self.dtype)
-        with torch.no_grad():
-            _ = self.decode_fn(static_mel, static_source_cache)
-
-        torch.accelerator.synchronize(self.device)
+        current_stream = torch.cuda.current_stream(self.device)
+        warmup_stream = torch.cuda.Stream(device=self.device)
+        warmup_stream.wait_stream(current_stream)
+        with torch.cuda.stream(warmup_stream), torch.no_grad():
+            for _ in range(3):
+                warmup_outputs = self.graph_fn(static_mel, static_source_cache)
+        current_stream.wait_stream(warmup_stream)
+        del warmup_outputs
 
         graph = CUDAGraph()
         with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
-            static_speech_output, static_cache_source_output = self.decode_fn(static_mel, static_source_cache)
+            static_magnitude_output, static_phase_output, static_cache_source_output = self.graph_fn(
+                static_mel,
+                static_source_cache,
+            )
 
         self.graph[key] = graph
         self.static_speech_inputs[key] = static_mel
         self.static_cache_source_inputs[key] = static_source_cache
 
-        self.static_speech_outputs[key] = static_speech_output
+        self.static_magnitude_outputs[key] = static_magnitude_output
+        self.static_phase_outputs[key] = static_phase_output
         self.static_cache_source_outputs[key] = static_cache_source_output
 
     def replay(self, speech_feat, cache_source):
@@ -107,8 +119,13 @@ class HiFTGraphWrapper:
         static_cache_sources[:batch_size].copy_(cache_source)
 
         self.graph[key].replay()
-        static_speech_output = self.static_speech_outputs[key]
+        static_magnitude_output = self.static_magnitude_outputs[key]
+        static_phase_output = self.static_phase_outputs[key]
         static_cache_source_output = self.static_cache_source_outputs[key]
-        speech = static_speech_output[:batch_size].clone()
+        speech = self.istft_fn(
+            static_magnitude_output[:batch_size],
+            static_phase_output[:batch_size],
+        )
+        speech = torch.clamp(speech, -self.audio_limit, self.audio_limit)
         cache_source = static_cache_source_output[:batch_size].clone()
         return speech, cache_source

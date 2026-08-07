@@ -513,7 +513,11 @@ class HiFTGenerator(nn.Module):
         )
         return inverse_transform
 
-    def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
+    def _decode_pre_istft(
+        self,
+        x: torch.Tensor,
+        s: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         s_stft_real, s_stft_imag = self._stft(s.squeeze(1))
         s_stft = torch.cat([s_stft_real, s_stft_imag], dim=1)
 
@@ -542,7 +546,10 @@ class HiFTGenerator(nn.Module):
         x = self.conv_post(x)
         magnitude = torch.exp(x[:, : self.istft_params["n_fft"] // 2 + 1, :])
         phase = torch.sin(x[:, self.istft_params["n_fft"] // 2 + 1 :, :])  # actually, sin is redundancy
+        return magnitude, phase
 
+    def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
+        magnitude, phase = self._decode_pre_istft(x, s)
         x = self._istft(magnitude, phase)
         x = torch.clamp(x, -self.audio_limit, self.audio_limit)
         return x
@@ -564,7 +571,11 @@ class HiFTGenerator(nn.Module):
         return generated_speech, f0
 
     @torch.inference_mode()
-    def inference(self, speech_feat: torch.Tensor, cache_source: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
+    def _inference_pre_istft(
+        self,
+        speech_feat: torch.Tensor,
+        cache_source: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # mel->f0
         f0 = self.f0_predictor(speech_feat)
         # f0->source
@@ -574,7 +585,14 @@ class HiFTGenerator(nn.Module):
         # use cache_source to avoid glitch
         if cache_source.shape[2] != 0:
             s[:, :, : cache_source.shape[2]] = cache_source
-        generated_speech = self.decode(x=speech_feat, s=s)
+        magnitude, phase = self._decode_pre_istft(speech_feat, s)
+        return magnitude, phase, s
+
+    @torch.inference_mode()
+    def inference(self, speech_feat: torch.Tensor, cache_source: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
+        magnitude, phase, s = self._inference_pre_istft(speech_feat, cache_source)
+        generated_speech = self._istft(magnitude, phase)
+        generated_speech = torch.clamp(generated_speech, -self.audio_limit, self.audio_limit)
         return generated_speech, s
 
 
