@@ -18,7 +18,7 @@ class HiFTGraphWrapper:
         self.codec_left_context_frames = connector_config["codec_left_context_frames"]
         lookahead_layer = getattr(token2wav.flow.encoder, "pre_lookahead_layer", None)
         pre_lookahead_len = getattr(lookahead_layer, "pre_lookahead_len", None)
-        self.pre_lookahead_len = int(pre_lookahead_len) if pre_lookahead_len is not None else 0
+        self.pre_lookahead_len = int(pre_lookahead_len) if pre_lookahead_len is not None else 3
         self.mel_cache_len = int(token2wav.mel_cache_len)
         self.source_cache_len = int(token2wav.source_cache_len)
         self.mel_frames = int(token2wav.hift.conv_pre.in_channels)
