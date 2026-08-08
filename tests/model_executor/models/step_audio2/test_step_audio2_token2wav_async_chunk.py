@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -124,6 +125,18 @@ def test_step_audio2_token2wav_async_chunk_last_chunk_resets_state(monkeypatch):
     assert len(audio_list) == 1
     assert torch.allclose(audio_list[0], torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32))
     assert calls == {"setup": 1, "stream": 1, "reset": 1}
+
+
+def test_step_audio2_token2wav_routes_non_final_chunk_to_async_forward():
+    model = _build_model()
+    model._forward_async_chunk = MagicMock()
+
+    model.forward(
+        input_ids=torch.tensor([10, 11, 12]),
+        positions=torch.tensor([0, 1, 2]),
+        runtime_additional_information=[{"meta": {"left_context_size": 0}}],
+    )
+    model._forward_async_chunk.assert_called_once()
 
 
 def test_step_audio2_token2wav_async_chunk_empty_eof_returns_zero_chunk():
