@@ -76,8 +76,8 @@ def test_step_audio2_token2wav_async_chunk_batch_guard():
         model._forward_async_chunk(
             input_ids=torch.tensor([1, 2, 3]),
             runtime_additional_information=[
-                {"left_context_size": 0},
-                {"left_context_size": 1},
+                {"meta": {"left_context_size": 0}},
+                {"meta": {"left_context_size": 1}},
             ],
         )
 
@@ -116,7 +116,7 @@ def test_step_audio2_token2wav_async_chunk_last_chunk_resets_state(monkeypatch):
     out = model.forward(
         input_ids=torch.tensor([10, 11, 12]),
         positions=torch.tensor([0, 1, 2]),
-        runtime_additional_information=[{"left_context_size": 1}],
+        runtime_additional_information=[{"meta": {"left_context_size": 1}}],
     )
 
     audio_list = out.multimodal_outputs["model_outputs"]
@@ -131,7 +131,7 @@ def test_step_audio2_token2wav_async_chunk_empty_eof_returns_zero_chunk():
 
     out = model._forward_async_chunk(
         input_ids=torch.tensor([], dtype=torch.int64),
-        runtime_additional_information=[{"left_context_size": 1}],
+        runtime_additional_information=[{"meta": {"left_context_size": 1}}],
     )
 
     audio_list = out.multimodal_outputs["model_outputs"]
