@@ -548,11 +548,14 @@ class HiFTGenerator(nn.Module):
         phase = torch.sin(x[:, self.istft_params["n_fft"] // 2 + 1 :, :])  # actually, sin is redundancy
         return magnitude, phase
 
-    def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
-        magnitude, phase = self._decode_pre_istft(x, s)
+    def _finalize_decode(self, magnitude, phase):
         x = self._istft(magnitude, phase)
         x = torch.clamp(x, -self.audio_limit, self.audio_limit)
         return x
+
+    def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
+        magnitude, phase = self._decode_pre_istft(x, s)
+        return self._finalize_decode(magnitude, phase)
 
     def forward(
         self,
@@ -591,8 +594,7 @@ class HiFTGenerator(nn.Module):
     @torch.inference_mode()
     def inference(self, speech_feat: torch.Tensor, cache_source: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
         magnitude, phase, s = self._inference_pre_istft(speech_feat, cache_source)
-        generated_speech = self._istft(magnitude, phase)
-        generated_speech = torch.clamp(generated_speech, -self.audio_limit, self.audio_limit)
+        generated_speech = self._finalize_decode(magnitude, phase)
         return generated_speech, s
 
 

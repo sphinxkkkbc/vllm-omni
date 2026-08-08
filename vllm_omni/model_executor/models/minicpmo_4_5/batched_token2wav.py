@@ -12,8 +12,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.logger import init_logger
 
 from .cuda_graph_wrapper import HiFTGraphWrapper
+
+logger = init_logger(__name__)
 
 _SILENCE_TOKEN = 4218
 
@@ -113,19 +116,25 @@ class BatchedToken2Wav(nn.Module):
         if bool(graph_config.get("enabled", False)):
             if hift_parameter is None:
                 raise ValueError("MiniCPM-o HiFT Graph requires a parameterized HiFT module")
-            if connector_config is None:
-                raise ValueError("MiniCPM-o HiFT CUDA Graph requires connector chunk configuration")
-            if self.mel_cache_len <= 0 or self.source_cache_len % self.mel_cache_len != 0:
-                raise ValueError("MiniCPM-o HiFT CUDA Graph requires source_cache_len to be divisible by mel_cache_len")
-            capture_batch_sizes = graph_config.get("capture_batch_sizes", [1])
-
-            self.hift_graph_wrapper = HiFTGraphWrapper(
-                token2wav=token2wav,
-                connector_config=dict(connector_config),
-                capture_batch_size=capture_batch_sizes,
-            )
-            with torch.inference_mode(), _autocast_disabled(hift_parameter.device):
-                self.hift_graph_wrapper.capture()
+            if hift_parameter.device.type != "cuda":
+                logger.info("HiFT CUDA Graph is disabled on device type %s", hift_parameter.device.type)
+            else:
+                if connector_config is None:
+                    raise ValueError("MiniCPM-o HiFT CUDA Graph requires connector chunk configuration")
+                if self.mel_cache_len <= 0 or self.source_cache_len % self.mel_cache_len != 0:
+                    raise ValueError(
+                        "MiniCPM-o HiFT CUDA Graph requires source_cache_len to be divisible by mel_cache_len"
+                    )
+                capture_batch_sizes = graph_config.get("capture_batch_sizes", [1])
+                logger.info("Enabling HiFT CUDA Graph with batch sizes %s", capture_batch_sizes)
+                self.hift_graph_wrapper = HiFTGraphWrapper(
+                    token2wav=token2wav,
+                    connector_config=dict(connector_config),
+                    capture_batch_sizes=capture_batch_sizes,
+                )
+                with torch.inference_mode(), _autocast_disabled(hift_parameter.device):
+                    self.hift_graph_wrapper.capture()
+                logger.info("HiFT CUDA Graph captured successfully")
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
 
     def _hift_inference(

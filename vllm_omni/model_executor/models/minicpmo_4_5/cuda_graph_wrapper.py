@@ -1,25 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import torch
 from torch.cuda import CUDAGraph
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 
 class HiFTGraphWrapper:
-    def __init__(self, token2wav, connector_config, capture_batch_size):
+    def __init__(self, token2wav, connector_config, capture_batch_sizes):
         self.decode_fn = token2wav.hift.inference
         self.graph_fn = token2wav.hift._inference_pre_istft
-        self.istft_fn = token2wav.hift._istft
-        self.audio_limit = token2wav.hift.audio_limit
+        self.finalize_fn = token2wav.hift._finalize_decode
         self.codec_chunk_frames = connector_config["codec_chunk_frames"]
         self.codec_left_context_frames = connector_config["codec_left_context_frames"]
         lookahead_layer = getattr(token2wav.flow.encoder, "pre_lookahead_layer", None)
-        self.pre_lookahead_len = int(getattr(lookahead_layer, "pre_lookahead_len"))
+        pre_lookahead_len = getattr(lookahead_layer, "pre_lookahead_len", None)
+        self.pre_lookahead_len = int(pre_lookahead_len) if pre_lookahead_len is not None else 0
         self.mel_cache_len = int(token2wav.mel_cache_len)
-        source_cache_len = int(token2wav.source_cache_len)
+        self.source_cache_len = int(token2wav.source_cache_len)
         self.mel_frames = int(token2wav.hift.conv_pre.in_channels)
-        self.upsample_factor = source_cache_len // self.mel_cache_len
         self.flow_upsample_rate = int(getattr(token2wav.flow, "token_mel_ratio", 2))
         self.capture_bucket_size, self.capture_source_cache_len = self.derive_capture_bucket_size()
-        self.capture_batch_size = capture_batch_size
+        self.capture_batch_sizes = capture_batch_sizes
         self.graph: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}
         self.static_speech_inputs: dict[tuple[int, int, int], torch.Tensor] = {}
         self.static_magnitude_outputs: dict[tuple[int, int, int], torch.Tensor] = {}
@@ -37,15 +42,13 @@ class HiFTGraphWrapper:
             self.codec_chunk_frames + self.codec_left_context_frames - self.pre_lookahead_len
         ) * self.flow_upsample_rate
 
-        uncached_source_cache_len = 0
-        cached_source_cache_len = self.mel_cache_len * self.upsample_factor
-        uncached_bucket_size = chunk_mel_frames
-        cached_bucket_size = chunk_mel_frames + self.mel_cache_len
-
-        return [uncached_bucket_size, cached_bucket_size], [uncached_source_cache_len, cached_source_cache_len]
+        return [chunk_mel_frames, chunk_mel_frames + self.mel_cache_len], [
+            0,
+            self.source_cache_len,
+        ]
 
     def capture(self):
-        for batch_size in self.capture_batch_size:
+        for batch_size in self.capture_batch_sizes:
             for mel_frames, source_cache_len in zip(
                 self.capture_bucket_size,
                 self.capture_source_cache_len,
@@ -92,24 +95,29 @@ class HiFTGraphWrapper:
         self.static_magnitude_outputs[key] = static_magnitude_output
         self.static_phase_outputs[key] = static_phase_output
         self.static_cache_source_outputs[key] = static_cache_source_output
+        logger.info("Captured HiFT CUDA Graph for shape %s", key)
 
     def replay(self, speech_feat, cache_source):
         if torch.cuda.is_current_stream_capturing():
+            logger.info("Falling back to eager HiFT inference during an active stream capture")
             return self.decode_fn(speech_feat, cache_source)
 
         batch_size = speech_feat.shape[0]
         num_frames = speech_feat.shape[2]
         cache_source_len = cache_source.shape[2]
-        target_b = next((b for b in sorted(self.capture_batch_size) if b >= batch_size), None)
+        target_b = next((b for b in sorted(self.capture_batch_sizes) if b >= batch_size), None)
 
         if target_b is None:
+            logger.info("Falling back to eager HiFT inference for unsupported batch size %d", batch_size)
             return self.decode_fn(speech_feat, cache_source)
 
         key = (target_b, num_frames, cache_source_len)
 
         if key not in self.graph:
             if self.lazy_graph_count >= self.max_lazy_graphs:
+                logger.info("Falling back to eager HiFT inference after reaching the lazy Graph limit")
                 return self.decode_fn(speech_feat, cache_source)
+            logger.info("Lazily capturing HiFT CUDA Graph for shape %s", key)
             self._capture(*key)
             self.lazy_graph_count += 1
 
@@ -122,10 +130,6 @@ class HiFTGraphWrapper:
         static_magnitude_output = self.static_magnitude_outputs[key]
         static_phase_output = self.static_phase_outputs[key]
         static_cache_source_output = self.static_cache_source_outputs[key]
-        speech = self.istft_fn(
-            static_magnitude_output[:batch_size],
-            static_phase_output[:batch_size],
-        )
-        speech = torch.clamp(speech, -self.audio_limit, self.audio_limit)
         cache_source = static_cache_source_output[:batch_size].clone()
+        speech = self.finalize_fn(static_magnitude_output[:batch_size], static_phase_output[:batch_size]).clone()
         return speech, cache_source
