@@ -603,25 +603,6 @@ class CUDAGraphDecoderWrapper:
         caches["suffix_quantized"] = quantized_buffers[0][:, :, :quantized_valid]
         caches["suffix_conv"] = conv_buffers[0][:, :conv_valid, :]
 
-    def _copy_caches(self, caches: dict, static_caches: dict):
-        tensor_cache_keys = {"ref_hidden", "ref_conv", "prefix_hidden"}
-        for key in tensor_cache_keys:
-            static_caches[key].copy_(caches[key])
-
-        static_kv = static_caches["past_key_values"]
-        request_kv = caches["past_key_values"]
-        for static_layer, request_layer in zip(
-            static_kv.layers,
-            request_kv.layers,
-            strict=True,
-        ):
-            if request_layer.keys is None or request_layer.values is None:
-                if static_layer.keys.numel() == 0 and static_layer.values.numel() == 0:
-                    continue
-                raise RuntimeError("Uninitialized request KV cache cannot populate a non-empty graph cache")
-            static_layer.keys.copy_(request_layer.keys)
-            static_layer.values.copy_(request_layer.values)
-
     def _copy_request_caches_to_batch(self, request_caches: list[dict], static_caches: dict) -> None:
         tensor_cache_keys = ("ref_hidden", "ref_conv", "prefix_hidden")
         for row, request_cache in enumerate(request_caches):
@@ -1056,106 +1037,6 @@ class CUDAGraphDecoderWrapper:
             padded_frames,
         )
         return output.clone() if clone_graph_output else output
-
-    def _decode_suffix(
-        self,
-        codes: torch.Tensor,
-        caches: dict,
-        *,
-        clone_graph_output: bool,
-    ) -> torch.Tensor:
-        if not self.async_chunk:
-            raise RuntimeError("Incremental decode is unavailable when async_chunk=False")
-        if not self.enabled or not self._warmed_up or torch.cuda.is_current_stream_capturing():
-            return self._decode_suffix_eager_fallback(codes, caches)
-
-        if int(codes.shape[0]) != 1:
-            return self._decode_suffix_eager_fallback(codes, caches)
-
-        suffix_frames = int(codes.shape[-1])
-        old_quantized = caches.get("suffix_quantized")
-        old_conv = caches.get("suffix_conv")
-        if old_quantized is None or old_conv is None:
-            return self._decode_suffix_eager_fallback(codes, caches)
-
-        self._ensure_suffix_buffers(caches)
-        old_quantized = caches["suffix_quantized"]
-        old_conv = caches["suffix_conv"]
-
-        previous_suffix_frames = int(caches["suffix_frames"])
-        decoder_prefix_frames = int(caches.get("decoder_prefix_frames", caches["prefix_frames"]))
-        mode = "xvec" if decoder_prefix_frames == 0 else "icl"
-        cached_frames = int(old_quantized.shape[-1])
-        rolling = self.decoder._is_suffix_cache_rolling(previous_suffix_frames, cached_frames)
-        new_frames = suffix_frames - (self.prefix_length if rolling else previous_suffix_frames)
-        target_frames = (
-            self.prefix_length + self.codec_chunk_frames
-            if rolling
-            else next(
-                (
-                    target
-                    for target, source in self._transitions_for_mode(mode).items()
-                    if source == previous_suffix_frames
-                ),
-                None,
-            )
-        )
-        graph_key = (mode, int(codes.shape[0]), target_frames) if target_frames is not None else None
-        expected_new_frames = (
-            target_frames - self._transitions_for_mode(mode)[target_frames] if target_frames is not None else None
-        )
-        if graph_key is None or not 0 < new_frames <= expected_new_frames or graph_key not in self.combined_states:
-            return self._decode_suffix_eager_fallback(codes, caches)
-
-        request_kv = caches["past_key_values"]
-        expected_kv_length = 0 if mode == "xvec" else self.prefix_length
-        if request_kv.get_seq_length() != expected_kv_length:
-            logger.warning_once(
-                "CUDA Graph decoder expected a prefix cache with logical length "
-                "%d, got %d; falling back to eager decoding",
-                expected_kv_length,
-                request_kv.get_seq_length(),
-            )
-            return self._decode_suffix_eager_fallback(codes, caches)
-
-        new_codes = codes[:, :, -new_frames:]
-        state = self.combined_states[graph_key]
-        static_inputs = state["input"]
-        static_codes = static_inputs["codes"]
-        static_codes.zero_()
-        static_codes[:, :, :new_frames].copy_(new_codes)
-
-        static_inputs["quantized"].copy_(old_quantized)
-        static_inputs["conv"].copy_(old_conv)
-        static_mask = static_inputs["mask"]
-        static_mask.fill_(1)
-        if mode == "icl":
-            static_mask[:, : int(caches.get("prefix_pad_frames", 0))] = 0
-
-        static_caches = state["cache"]
-        if caches is not static_caches:
-            self._copy_caches(caches, static_caches)
-        state["graph"].replay()
-
-        output, graph_next_quantized, graph_next_conv = state["output"]
-        if new_frames == expected_new_frames:
-            current_index = int(caches["_suffix_buffer_index"])
-            next_index = 1 - current_index
-            next_quantized = caches["_suffix_quantized_buffers"][next_index]
-            next_conv = caches["_suffix_conv_buffers"][next_index]
-            quantized_valid = int(graph_next_quantized.shape[-1])
-            conv_valid = int(graph_next_conv.shape[1])
-            next_quantized[:, :, :quantized_valid].copy_(graph_next_quantized)
-            next_conv[:, :conv_valid, :].copy_(graph_next_conv)
-            caches["_suffix_buffer_index"] = next_index
-            caches["suffix_frames"] = target_frames
-            caches["suffix_quantized"] = next_quantized[:, :, :quantized_valid]
-            caches["suffix_conv"] = next_conv[:, :conv_valid, :]
-        actual_suffix_frames = (self.prefix_length if rolling else previous_suffix_frames) + new_frames
-        output = self._trim_replay_output(output, actual_suffix_frames, target_frames)
-        if clone_graph_output:
-            return output.clone()
-        return output
 
     def _trim_replay_output(self, static_output: torch.Tensor, actual_size: int, padded_size: int) -> torch.Tensor:
         """Trim a graph/compiled replay output to the eager-equivalent length.
