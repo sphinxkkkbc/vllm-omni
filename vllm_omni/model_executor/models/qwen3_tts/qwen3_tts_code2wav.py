@@ -450,9 +450,9 @@ class Qwen3TTSCode2Wav(nn.Module):
             left_context_size=self._decode_left_context_frames,
             max_batch_size=self._decode_batch_max_size,
         )
-        if request_wavs.shape[0] != len(valid_codes_qf):
+        if len(request_wavs) != len(valid_codes_qf):
             raise ValueError(
-                f"Qwen3-TTS batched decoder returned {request_wavs.shape[0]} outputs for {len(valid_codes_qf)} requests"
+                f"Qwen3-TTS batched decoder returned {len(request_wavs)} outputs for {len(valid_codes_qf)} requests"
             )
 
         wav_tensors: list[torch.Tensor] = []
@@ -462,12 +462,9 @@ class Qwen3TTSCode2Wav(nn.Module):
                 wav = wav[0]
             elif wav.dim() != 1:
                 raise ValueError(f"Qwen3-TTS batched decoder returned unexpected row shape {tuple(wav.shape)}")
-            if request_states is not None:
-                wav = wav[: int(request_states[row].get("_last_output_audio_length", wav.shape[-1]))]
-            else:
+            if request_states is None:
                 start = left_context_size[row] * self._total_upsample
-                end = request_lengths[row] * self._total_upsample
-                wav = wav[start:end]
+                wav = wav[start:]
             wav_tensors.append(wav)
 
         if self._batch_stats_log_every > 0 and self._batch_stats_forwards % self._batch_stats_log_every == 0:

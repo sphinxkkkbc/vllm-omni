@@ -305,10 +305,10 @@ class CUDAGraphDecoderWrapper:
             for batch_size, size in capture_shapes:
                 try:
                     self._capture_stateless(batch_size, size, device, dtype)
-                    logger.info("  Captured stateless CUDA Graph for batch=%d size=%d", batch_size, size)
+                    logger.info("Captured stateless CUDA Graph for batch=%d size=%d", batch_size, size)
                 except Exception:
                     logger.warning(
-                        "  Failed to capture stateless CUDA Graph for batch=%d size=%d",
+                        "Failed to capture stateless CUDA Graph for batch=%d size=%d",
                         batch_size,
                         size,
                         exc_info=True,
@@ -323,14 +323,14 @@ class CUDAGraphDecoderWrapper:
         for batch_size in self.capture_batch_sizes:
             try:
                 self._capture_icl_prefix(batch_size, device, dtype)
-                logger.info("  Captured ICL prefix CUDA Graph for batch=%d", batch_size)
+                logger.info("Captured ICL prefix CUDA Graph for batch=%d", batch_size)
             except Exception:
-                logger.warning("  Failed to capture ICL prefix CUDA Graph for batch=%d", batch_size, exc_info=True)
+                logger.warning("Failed to capture ICL prefix CUDA Graph for batch=%d", batch_size, exc_info=True)
             try:
                 self._capture_xvec_prefix(batch_size, device, dtype)
-                logger.info("  Captured xvec prefix CUDA Graph for batch=%d", batch_size)
+                logger.info("Captured xvec prefix CUDA Graph for batch=%d", batch_size)
             except Exception:
-                logger.warning("  Failed to capture xvec prefix CUDA Graph for batch=%d", batch_size, exc_info=True)
+                logger.warning("Failed to capture xvec prefix CUDA Graph for batch=%d", batch_size, exc_info=True)
 
         logger.info(
             "Starting CUDA Graph warmup for %d shapes: batch_sizes=%s seq_lens=%s",
@@ -343,10 +343,10 @@ class CUDAGraphDecoderWrapper:
             try:
                 caches = self._make_dummy_icl_cache(batch_size, device, next(self.decoder.parameters()).dtype)
                 self._capture_combined_suffix("icl", batch_size, size, caches, device, dtype)
-                logger.info("  Captured combined suffix CUDA Graph for batch=%d size=%d", batch_size, size)
+                logger.info("Captured combined suffix CUDA Graph for batch=%d size=%d", batch_size, size)
             except Exception:
                 logger.warning(
-                    "  Failed to capture combined suffix graph for batch=%d size=%d",
+                    "Failed to capture combined suffix graph for batch=%d size=%d",
                     batch_size,
                     size,
                     exc_info=True,
@@ -358,10 +358,10 @@ class CUDAGraphDecoderWrapper:
                 try:
                     caches = self._make_dummy_xvec_cache(batch_size, device, model_dtype)
                     self._capture_combined_suffix("xvec", batch_size, size, caches, device, dtype)
-                    logger.info("  Captured xvec suffix CUDA Graph for batch=%d size=%d", batch_size, size)
+                    logger.info("Captured xvec suffix CUDA Graph for batch=%d size=%d", batch_size, size)
                 except Exception:
                     logger.warning(
-                        "  Failed to capture xvec suffix graph for batch=%d size=%d",
+                        "Failed to capture xvec suffix graph for batch=%d size=%d",
                         batch_size,
                         size,
                         exc_info=True,
@@ -577,51 +577,6 @@ class CUDAGraphDecoderWrapper:
             "output": static_output,
             "cache": caches,
         }
-
-    def _decode_icl_prefix(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
-        batch_size = int(codes.shape[0])
-        if batch_size != 1 or batch_size not in self.icl_prefix_states or torch.cuda.is_current_stream_capturing():
-            output = self.decoder._decode_icl_first_chunk(codes, caches, int(caches["prefix_frames"]))
-            prefix_frames = int(caches["prefix_frames"])
-            return output[..., -max(0, codes.shape[-1] - prefix_frames) * self.decoder.total_upsample :]
-
-        actual_prefix_frames = int(caches["prefix_frames"])
-        suffix_frames = int(codes.shape[-1]) - actual_prefix_frames
-        if not 0 < actual_prefix_frames <= self.prefix_length or suffix_frames != self.initial_chunk_frames:
-            output = self.decoder._decode_icl_first_chunk(codes, caches, actual_prefix_frames)
-            return output[..., -suffix_frames * self.decoder.total_upsample :]
-
-        state = self.icl_prefix_states[batch_size]
-        static_inputs = state["input"]
-        prefix_static_input = static_inputs["codes"]
-        prefix_hidden_mask = static_inputs["hidden_mask"]
-        prefix_attention_mask = static_inputs["prefix_attention_mask"]
-        suffix_attention_mask = static_inputs["suffix_attention_mask"]
-        prefix_pad_frames = self.prefix_length - actual_prefix_frames
-        prefix_static_input.zero_()
-        prefix_static_input[:, :, prefix_pad_frames : self.prefix_length].copy_(codes[:, :, :actual_prefix_frames])
-        prefix_static_input[:, :, self.prefix_length :].copy_(codes[:, :, actual_prefix_frames:])
-        prefix_hidden_mask.fill_(1)
-        prefix_hidden_mask[:, :, :prefix_pad_frames] = 0
-        prefix_attention_mask.fill_(1)
-        prefix_attention_mask[:, :prefix_pad_frames] = 0
-        suffix_attention_mask.fill_(1)
-        suffix_attention_mask[:, :prefix_pad_frames] = 0
-
-        state["graph"].replay()
-        static_caches = state["cache"]
-        for key in ("ref_hidden", "ref_conv", "prefix_hidden"):
-            if key in static_caches:
-                caches[key] = static_caches[key].clone()
-        if "past_key_values" in static_caches:
-            caches["past_key_values"] = self.decoder._slice_dynamic_cache(static_caches["past_key_values"], 0)
-        caches["decoder_prefix_frames"] = self.prefix_length
-        caches["prefix_pad_frames"] = prefix_pad_frames
-        caches["suffix_quantized"] = static_caches["suffix_quantized"].clone()
-        caches["suffix_conv"] = static_caches["suffix_conv"].clone()
-        caches["suffix_frames"] = self.initial_chunk_frames
-        self._ensure_suffix_buffers(caches)
-        return state["output"][..., -self.initial_chunk_frames * self.decoder.total_upsample :]
 
     def _ensure_suffix_buffers(self, caches: dict) -> None:
         if "_suffix_quantized_buffers" in caches:
@@ -946,17 +901,20 @@ class CUDAGraphDecoderWrapper:
                 decode_icl_prefix_batch=self._decode_icl_prefix_batch,
                 decode_xvec_prefix_batch=self._decode_xvec_prefix_batch,
                 decode_suffix_batch=self._decode_suffix_batch,
-                decode_eager=self._decode_request_eager,
+                decode_fallback=self._decode_request_fallback,
             )
         finally:
             self._suppress_stats = previous_suppression
 
-    def _decode_request_eager(self, codes: torch.Tensor, cache: dict) -> torch.Tensor:
+    def _decode_request_fallback(self, codes: torch.Tensor, cache: dict) -> torch.Tensor:
         if "suffix_quantized" not in cache:
             if int(cache["prefix_frames"]) == 0:
                 return self.decoder._decode_xvec_first_chunk(codes, cache)
-            return self._decode_icl_prefix(codes, cache)
-        return self._decode_eager(codes, cache)
+            prefix_frames = int(cache["prefix_frames"])
+            output = self.decoder._decode_icl_first_chunk(codes, cache, prefix_frames)
+            suffix_frames = max(0, int(codes.shape[-1]) - prefix_frames)
+            return output[..., -suffix_frames * self.decoder.total_upsample :]
+        return self._decode_suffix_eager_fallback(codes, cache)
 
     def batched_chunked_decode_with_cudagraph(
         self,
@@ -966,21 +924,11 @@ class CUDAGraphDecoderWrapper:
         chunk_size: int = 300,
         left_context_size: int = 25,
         max_batch_size: int = 0,
-    ) -> torch.Tensor:
+    ) -> list[torch.Tensor]:
         if not self.async_chunk:
             if caches is not None:
                 raise ValueError("caches must be None when async_chunk=False")
-            from .cuda_graph_decoder_wrapper import _batched_chunked_decode
-
-            return _batched_chunked_decode(
-                codes,
-                lengths,
-                decode_fn=lambda chunk: self._decode_stateless(chunk, clone_graph_output=False),
-                total_upsample=self.decoder.total_upsample,
-                chunk_size=chunk_size,
-                left_context_size=left_context_size,
-                max_batch_size=max_batch_size,
-            )
+            return self._batched_stateless_chunked_decode(codes, lengths, chunk_size, left_context_size, max_batch_size)
 
         if caches is None:
             raise ValueError("caches are required when async_chunk=True")
@@ -988,13 +936,87 @@ class CUDAGraphDecoderWrapper:
             raise ValueError("codes, lengths, and caches must have the same batch size")
         codes_list = [codes[row : row + 1, :, :length] for row, length in enumerate(lengths)]
         outputs = self._batched_request_decode(codes_list, caches)
-        max_length = max((int(output.shape[-1]) for output in outputs), default=0)
-        padded = codes.new_zeros((len(outputs), 1, max_length), dtype=outputs[0].dtype if outputs else torch.float32)
-        for row, output in enumerate(outputs):
-            padded[row, :, : output.shape[-1]].copy_(output[0])
-        return padded
+        return [output[0] for output in outputs]
 
-    def _decode_eager(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
+    def _batched_stateless_chunked_decode(
+        self,
+        codes: torch.Tensor,
+        lengths: list[int],
+        chunk_size: int,
+        left_context_size: int,
+        max_batch_size: int,
+    ) -> list[torch.Tensor]:
+        batch_size = int(codes.shape[0])
+        if len(lengths) != batch_size:
+            raise ValueError("codes and lengths must have the same batch size")
+        if any(length < 0 or length > codes.shape[-1] for length in lengths):
+            raise ValueError(f"Decode lengths must be within [0, {codes.shape[-1]}], got {lengths}")
+        max_length = max(lengths, default=0)
+        if max_length == 0:
+            return [codes.new_empty((1, 0), dtype=torch.float32) for _ in range(batch_size)]
+
+        total_upsample = self.decoder.total_upsample
+        wav_out: list[torch.Tensor] | None = None
+        num_rounds = (max_length + chunk_size - 1) // chunk_size
+        for round_index in range(num_rounds):
+            start = round_index * chunk_size
+            groups: dict[int, list[tuple[int, int, int, int, int]]] = {}
+            for request_index, request_length in enumerate(lengths):
+                if start >= request_length:
+                    continue
+                end = min(start + chunk_size, request_length)
+                context = left_context_size if start - left_context_size > 0 else start
+                input_start = start - context
+                actual_frames = end - input_start
+                bucket_index = bisect.bisect_left(self.stateless_capture_sizes, actual_frames)
+                padded_frames = (
+                    self.stateless_capture_sizes[bucket_index]
+                    if bucket_index < len(self.stateless_capture_sizes)
+                    else actual_frames
+                )
+                groups.setdefault(padded_frames, []).append((request_index, input_start, end, start, context))
+
+            for padded_frames, jobs in groups.items():
+                available_batches = {
+                    graph_batch for graph_batch, graph_frames in self.stateless_states if graph_frames == padded_frames
+                }
+                offset = 0
+                while offset < len(jobs):
+                    remaining = len(jobs) - offset
+                    graph_batch = (
+                        max(available_batches)
+                        if available_batches and remaining > max(available_batches)
+                        else self._select_batch_bucket(remaining, available_batches)
+                    )
+                    if graph_batch is not None:
+                        request_count = min(remaining, graph_batch)
+                        decode_batch = graph_batch
+                    else:
+                        request_count = min(remaining, max_batch_size) if max_batch_size > 0 else remaining
+                        decode_batch = request_count
+                    job_batch = jobs[offset : offset + request_count]
+                    codes_chunk = codes.new_zeros((decode_batch, codes.shape[1], padded_frames))
+                    for row, (request_index, input_start, input_end, _, _) in enumerate(job_batch):
+                        chunk = codes[request_index, :, input_start:input_end]
+                        codes_chunk[row, :, : chunk.shape[-1]].copy_(chunk)
+                    wav_chunk = self._decode_stateless(codes_chunk, clone_graph_output=False)
+                    if wav_out is None:
+                        wav_out = [
+                            wav_chunk.new_empty((*wav_chunk.shape[1:-1], length * total_upsample)) for length in lengths
+                        ]
+                    for row, (request_index, _, input_end, chunk_start, context) in enumerate(job_batch):
+                        src_start = context * total_upsample
+                        dst_start = chunk_start * total_upsample
+                        dst_end = input_end * total_upsample
+                        src_end = src_start + dst_end - dst_start
+                        wav_out[request_index][..., dst_start:dst_end].copy_(wav_chunk[row, ..., src_start:src_end])
+                    offset += request_count
+
+        if wav_out is None:
+            return [codes.new_empty((1, 0), dtype=torch.float32) for _ in range(batch_size)]
+        return wav_out
+
+    def _decode_suffix_eager_fallback(self, codes: torch.Tensor, caches: dict) -> torch.Tensor:
         for key in (
             "_suffix_quantized_buffers",
             "_suffix_conv_buffers",
@@ -1045,16 +1067,16 @@ class CUDAGraphDecoderWrapper:
         if not self.async_chunk:
             raise RuntimeError("Incremental decode is unavailable when async_chunk=False")
         if not self.enabled or not self._warmed_up or torch.cuda.is_current_stream_capturing():
-            return self._decode_eager(codes, caches)
+            return self._decode_suffix_eager_fallback(codes, caches)
 
         if int(codes.shape[0]) != 1:
-            return self._decode_eager(codes, caches)
+            return self._decode_suffix_eager_fallback(codes, caches)
 
         suffix_frames = int(codes.shape[-1])
         old_quantized = caches.get("suffix_quantized")
         old_conv = caches.get("suffix_conv")
         if old_quantized is None or old_conv is None:
-            return self._decode_eager(codes, caches)
+            return self._decode_suffix_eager_fallback(codes, caches)
 
         self._ensure_suffix_buffers(caches)
         old_quantized = caches["suffix_quantized"]
@@ -1083,7 +1105,7 @@ class CUDAGraphDecoderWrapper:
             target_frames - self._transitions_for_mode(mode)[target_frames] if target_frames is not None else None
         )
         if graph_key is None or not 0 < new_frames <= expected_new_frames or graph_key not in self.combined_states:
-            return self._decode_eager(codes, caches)
+            return self._decode_suffix_eager_fallback(codes, caches)
 
         request_kv = caches["past_key_values"]
         expected_kv_length = 0 if mode == "xvec" else self.prefix_length
@@ -1094,7 +1116,7 @@ class CUDAGraphDecoderWrapper:
                 expected_kv_length,
                 request_kv.get_seq_length(),
             )
-            return self._decode_eager(codes, caches)
+            return self._decode_suffix_eager_fallback(codes, caches)
 
         new_codes = codes[:, :, -new_frames:]
         state = self.combined_states[graph_key]
@@ -1173,15 +1195,8 @@ class CUDAGraphDecoderWrapper:
             codes_chunk = codes[..., start_index - context_size : end_index]
             if not self.async_chunk:
                 wav_chunk = self._decode_stateless(codes_chunk, clone_graph_output=False)
-            elif "suffix_quantized" not in caches:
-                if int(caches["prefix_frames"]) == 0:
-                    wav_chunk = self.decoder._decode_xvec_first_chunk(codes_chunk, caches)
-                else:
-                    wav_chunk = self._decode_icl_prefix(codes_chunk, caches)
             else:
-                actual_prefix_frames = int(caches.get("prefix_frames", self.prefix_length))
-                codes_chunk = codes_chunk[:, :, actual_prefix_frames:]
-                wav_chunk = self._decode_suffix(codes_chunk, caches, clone_graph_output=False)
+                wav_chunk = self._batched_request_decode([codes_chunk], [caches])[0]
 
             # Keep origin/main's concat semantics: Qwen3-Omni can return a chunk
             # that is shorter than the nominal code_len * total_upsample length.

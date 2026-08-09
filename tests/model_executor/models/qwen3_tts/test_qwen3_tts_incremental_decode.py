@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from transformers.cache_utils import DynamicCache
 
+from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import Qwen3TTSCode2Wav
 from vllm_omni.model_executor.models.qwen3_tts.segmented_graph_wrapper import CUDAGraphDecoderWrapper
 from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2DecoderConfig,
@@ -95,6 +96,68 @@ def _make_stateful_eager_decoder_pair() -> tuple[Qwen3TTSTokenizerV2Decoder, Qwe
     batched_decoder._incremental_chunk_frames = 25
     per_request_decoder._incremental_chunk_frames = 25
     return batched_decoder, per_request_decoder
+
+
+def test_dummy_forward_uses_exact_decode_during_outer_graph_capture(monkeypatch):
+    decoder = _make_small_decoder()
+    codes = torch.zeros(1, decoder.config.num_quantizers, 4, dtype=torch.long)
+    cache = {"prefix_frames": 0, "_is_dummy_run": True}
+    expected = torch.ones(1, 1, 7)
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(decoder, "_forward_exact", lambda _codes: expected)
+
+    def _unexpected_stateful_decode(*_args, **_kwargs):
+        raise AssertionError("capturing dummy run must not initialize decoder state")
+
+    monkeypatch.setattr(decoder, "_decode_xvec_first_chunk", _unexpected_stateful_decode)
+
+    output = decoder(codes, cache)
+
+    assert output is expected
+    assert cache == {"prefix_frames": 0, "_is_dummy_run": True}
+
+
+def test_code2wav_full_graph_dummy_forward_uses_exact_batched_decode(monkeypatch):
+    decoder = _make_small_decoder()
+    expected = torch.arange(7, dtype=torch.float32).view(1, 1, -1)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(decoder, "_forward_exact", lambda _codes: expected)
+
+    def _unexpected_stateful_decode(*_args, **_kwargs):
+        raise AssertionError("FULL graph dummy capture must not initialize decoder state")
+
+    monkeypatch.setattr(decoder, "_decode_xvec_first_chunk", _unexpected_stateful_decode)
+
+    model = Qwen3TTSCode2Wav.__new__(Qwen3TTSCode2Wav)
+    nn.Module.__init__(model)
+    model.decoder = decoder
+    model._async_chunk = True
+    model._num_quantizers = decoder.config.num_quantizers
+    model._total_upsample = decoder.total_upsample
+    model._output_sample_rate = 24000
+    model._decode_chunk_frames = 300
+    model._decode_left_context_frames = 25
+    model._decode_batch_max_size = 0
+    model._decoder_state_cache = {}
+    model._decoder_state_cache_warn_entries = 512
+    model._logged_codec_stats = True
+    model._logged_malformed_codec_lengths = set()
+    model._batch_stats_enabled = False
+    model._batch_stats_log_every = 0
+    model._batch_stats_forwards = 0
+
+    runtime_info = model.get_dummy_runtime_additional_information(1)
+    output = model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),
+        seq_token_counts=[8],
+        runtime_additional_information=runtime_info,
+    )
+
+    torch.testing.assert_close(output.multimodal_outputs["model_outputs"][0], expected[0, 0])
+    assert model._decoder_state_cache == {}
 
 
 def _make_stateful_first_chunk_inputs(
@@ -443,7 +506,7 @@ def test_batched_stateful_first_chunk_matches_per_request(mode):
         batched = batched_decoder.batched_chunked_decode(codes, lengths, caches=batched_caches)
         per_request = _decode_per_request(per_request_decoder, codes, lengths, per_request_caches)
 
-    torch.testing.assert_close(batched, per_request, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(torch.stack(batched), per_request, atol=1e-5, rtol=1e-4)
     for batched_cache, per_request_cache in zip(batched_caches, per_request_caches, strict=True):
         batched_suffix_frames = batched_cache.get("suffix_frames", batched_cache["suffix_quantized"].shape[-1])
         per_request_suffix_frames = per_request_cache.get(
@@ -463,7 +526,7 @@ def test_batched_stateful_growing_suffix_matches_per_request(mode):
         batched = batched_decoder.batched_chunked_decode(codes, [25, 25], caches=batched_caches)
         per_request = _decode_per_request(per_request_decoder, codes, [25, 25], per_request_caches)
 
-    torch.testing.assert_close(batched, per_request, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(torch.stack(batched), per_request, atol=1e-5, rtol=1e-4)
     for batched_cache, per_request_cache in zip(batched_caches, per_request_caches, strict=True):
         assert batched_cache["suffix_frames"] == per_request_cache["suffix_frames"] == 26
         torch.testing.assert_close(batched_cache["suffix_quantized"], per_request_cache["suffix_quantized"])
@@ -492,7 +555,7 @@ def test_batched_stateful_rolling_suffix_matches_per_request(mode):
         batched = batched_decoder.batched_chunked_decode(rolling_codes, [25, 25], caches=batched_caches)
         per_request = _decode_per_request(per_request_decoder, rolling_codes, [25, 25], per_request_caches)
 
-    torch.testing.assert_close(batched, per_request, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(torch.stack(batched), per_request, atol=1e-5, rtol=1e-4)
     for batched_cache, per_request_cache in zip(batched_caches, per_request_caches, strict=True):
         assert batched_cache["suffix_frames"] == per_request_cache["suffix_frames"] == 97
         assert batched_cache["suffix_quantized"].shape[-1] == batched_decoder.config.sliding_window
@@ -572,6 +635,10 @@ def test_icl_prefix_graph_cache_keeps_physical_prefix_length(monkeypatch):
             "output": torch.zeros(batch_size, 1, physical_frames * total_upsample),
             "cache": {
                 "decoder_prefix_frames": prefix_length,
+                "ref_hidden": torch.zeros(batch_size, 2, prefix_length),
+                "ref_conv": torch.zeros(batch_size, prefix_length, 2),
+                "prefix_hidden": torch.zeros(batch_size, prefix_length, 2),
+                "past_key_values": object(),
                 "suffix_quantized": torch.zeros(batch_size, num_quantizers, initial_chunk_frames),
                 "suffix_conv": torch.zeros(batch_size, initial_chunk_frames, 2),
             },
@@ -579,13 +646,23 @@ def test_icl_prefix_graph_cache_keeps_physical_prefix_length(monkeypatch):
     }
     wrapper.prefix_length = prefix_length
     wrapper.initial_chunk_frames = initial_chunk_frames
-    wrapper.decoder = type("_Decoder", (), {"total_upsample": total_upsample})()
+    wrapper.capture_batch_sizes = [1]
+    wrapper.decoder = type(
+        "_Decoder",
+        (),
+        {
+            "total_upsample": total_upsample,
+            "_slice_dynamic_cache": staticmethod(lambda cache, row: cache),
+        },
+    )()
     wrapper._ensure_suffix_buffers = lambda caches: None
 
     caches = {"prefix_frames": 48}
     codes = torch.zeros(batch_size, num_quantizers, caches["prefix_frames"] + initial_chunk_frames)
-    output = wrapper._decode_icl_prefix(codes, caches)
+    outputs = wrapper._decode_icl_prefix_batch([codes], [caches])
 
+    assert outputs is not None
+    output = outputs[0]
     assert caches["prefix_frames"] == 48
     assert caches["prefix_pad_frames"] == 24
     assert output.shape == (batch_size, 1, initial_chunk_frames * total_upsample)
@@ -790,6 +867,86 @@ def test_decode_modes_enforce_cache_contracts():
         stateless_wrapper.chunked_decode_with_cudagraph(codes, caches={})
 
 
+def test_single_request_xvec_first_chunk_uses_batched_graph_router(monkeypatch):
+    wrapper = CUDAGraphDecoderWrapper.__new__(CUDAGraphDecoderWrapper)
+    wrapper.async_chunk = True
+    wrapper.decoder = _decoder_stub(total_upsample=1)
+    codes = torch.zeros(1, 2, 1)
+    cache = {"prefix_frames": 0}
+    calls = []
+
+    def _batched_request_decode(codes_list, request_caches):
+        calls.append((codes_list, request_caches))
+        request_caches[0]["suffix_quantized"] = codes_list[0]
+        return [codes_list[0][:, :1]]
+
+    monkeypatch.setattr(wrapper, "_batched_request_decode", _batched_request_decode)
+
+    output = wrapper.chunked_decode_with_cudagraph(codes, caches=cache)
+
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0][0][0], codes)
+    assert len(calls[0][1]) == 1
+    assert calls[0][1][0] is cache
+    torch.testing.assert_close(output, codes[:, :1])
+
+
+def test_single_request_suffix_uses_batched_graph_router(monkeypatch):
+    wrapper = CUDAGraphDecoderWrapper.__new__(CUDAGraphDecoderWrapper)
+    wrapper.async_chunk = True
+    wrapper.decoder = _decoder_stub(total_upsample=1)
+    codes = torch.arange(6, dtype=torch.float32).reshape(1, 2, 3)
+    cache = {
+        "prefix_frames": 0,
+        "suffix_frames": 1,
+        "suffix_quantized": torch.zeros(1, 2, 1),
+    }
+    calls = []
+
+    def _batched_request_decode(codes_list, request_caches):
+        calls.append((codes_list, request_caches))
+        return [codes_list[0][:, :1]]
+
+    monkeypatch.setattr(wrapper, "_batched_request_decode", _batched_request_decode)
+
+    output = wrapper.chunked_decode_with_cudagraph(codes, caches=cache)
+
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0][0][0], codes)
+    assert calls[0][1][0] is cache
+    torch.testing.assert_close(output, codes[:, :1])
+
+
+def test_stateless_variable_lengths_share_capture_bucket(monkeypatch):
+    wrapper = CUDAGraphDecoderWrapper.__new__(CUDAGraphDecoderWrapper)
+    wrapper.stateless_capture_sizes = [25]
+    wrapper.capture_batch_sizes = [1, 2]
+    wrapper.stateless_states = {(2, 25): {}}
+    wrapper.decoder = _decoder_stub(total_upsample=2)
+    calls = []
+
+    def _decode_stateless(codes_chunk, *, clone_graph_output):
+        calls.append((codes_chunk.clone(), clone_graph_output))
+        return codes_chunk[:, :1].repeat_interleave(2, dim=-1).float()
+
+    monkeypatch.setattr(wrapper, "_decode_stateless", _decode_stateless)
+    codes = torch.arange(100).reshape(2, 2, 25)
+
+    output = wrapper._batched_stateless_chunked_decode(
+        codes,
+        [25, 12],
+        chunk_size=25,
+        left_context_size=0,
+        max_batch_size=0,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0].shape == (2, 2, 25)
+    assert calls[0][1] is False
+    torch.testing.assert_close(output[0], codes[0, :1].repeat_interleave(2, dim=-1).float())
+    torch.testing.assert_close(output[1], codes[1, :1, :12].repeat_interleave(2, dim=-1).float())
+
+
 def test_batched_chunked_decode_groups_exact_phases(monkeypatch):
     wrapper = CUDAGraphDecoderWrapper.__new__(CUDAGraphDecoderWrapper)
     wrapper.async_chunk = True
@@ -953,7 +1110,7 @@ def test_eager_backend_max_batch_size_splits_each_phase_group():
         decode_icl_prefix_batch=None,
         decode_xvec_prefix_batch=decode_xvec,
         decode_suffix_batch=None,
-        decode_eager=lambda *_args: pytest.fail("unexpected per-request fallback"),
+        decode_fallback=lambda *_args: pytest.fail("unexpected per-request fallback"),
         backend_max_batch_size=2,
     )
 
@@ -1022,7 +1179,7 @@ def test_mixed_phase_batch_restores_outputs_and_caches_to_original_slots():
         decode_suffix_batch=lambda mode, target, _codes, group_caches, _new_frames: _outputs_for_slots(
             group_caches, f"suffix:{mode}:{target}"
         ),
-        decode_eager=lambda *_args: pytest.fail("unexpected eager fallback"),
+        decode_fallback=lambda *_args: pytest.fail("unexpected eager fallback"),
     )
 
     assert [int(output.item()) for output in outputs] == [0, 1, 2, 3]
@@ -1092,13 +1249,6 @@ def test_stateful_eager_partial_final_chunk_is_right_trimmed():
 
     full_samples = lengths[0] * batched_decoder.total_upsample
     partial_samples = lengths[1] * batched_decoder.total_upsample
-    assert batched.shape[-1] == full_samples
-    torch.testing.assert_close(batched[0:1], per_request[0], atol=1e-5, rtol=1e-4)
-    torch.testing.assert_close(
-        batched[1:2, :, :partial_samples],
-        per_request[1],
-        atol=1e-5,
-        rtol=1e-4,
-    )
-    torch.testing.assert_close(batched[1:2, :, partial_samples:], torch.zeros_like(batched[1:2, :, partial_samples:]))
-    assert [cache["_last_output_audio_length"] for cache in batched_caches] == [full_samples, partial_samples]
+    assert [output.shape[-1] for output in batched] == [full_samples, partial_samples]
+    torch.testing.assert_close(batched[0], per_request[0][0], atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(batched[1], per_request[1][0], atol=1e-5, rtol=1e-4)

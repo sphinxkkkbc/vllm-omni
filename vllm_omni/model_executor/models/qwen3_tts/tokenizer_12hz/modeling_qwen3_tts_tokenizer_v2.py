@@ -1148,9 +1148,8 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         if codes.shape[1] != self.config.num_quantizers:
             raise ValueError(f"Expected {self.config.num_quantizers} layer of codes, got {codes.shape[1]}")
 
-        if caches is None:
-            wav = self._forward_exact(codes)
-            return wav
+        if caches is None or caches.get("_is_dummy_run", False):
+            return self._forward_exact(codes)
 
         prefix_frames = int(caches["prefix_frames"])
         if prefix_frames < 0:
@@ -1195,21 +1194,15 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             end_index = min(start_index + chunk_size, codes.shape[-1])
             context_size = left_context_size if start_index - left_context_size > 0 else start_index
             codes_chunk = codes[..., start_index - context_size : end_index]
+            is_first_stateful_chunk = caches is not None and "suffix_quantized" not in caches
+            wav_chunk = self(codes_chunk, caches)
             if caches is not None:
-                logical_prefix_frames = int(caches["prefix_frames"])
-                decoder_prefix_frames = int(caches.get("decoder_prefix_frames", logical_prefix_frames))
-                if "suffix_quantized" in caches:
-                    wav_chunk = self.decode_suffix(codes_chunk, caches, decoder_prefix_frames)
-                else:
-                    wav_chunk = self(codes_chunk, caches)
+                if is_first_stateful_chunk:
+                    logical_prefix_frames = int(caches["prefix_frames"])
                     suffix_frames = codes_chunk.shape[-1] - logical_prefix_frames
                     wav_chunk = wav_chunk[..., -suffix_frames * self.total_upsample :]
                 wavs.append(wav_chunk)
             else:
-                wav_chunk = self(codes_chunk, caches)
-                if caches is not None and "suffix_quantized" not in caches:
-                    prefix_frames = int(caches.get("prefix_frames", 0))
-                    wav_chunk = wav_chunk[..., -(codes_chunk.shape[-1] - prefix_frames) * self.total_upsample :]
                 wavs.append(wav_chunk[..., context_size * self.total_upsample :])
             start_index = end_index
         output = torch.cat(wavs, dim=-1)
@@ -1231,17 +1224,20 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             [str, int, list[torch.Tensor], list[dict[str, Any]], list[int]], list[torch.Tensor] | None
         ]
         | None,
-        decode_eager: Callable[[torch.Tensor, dict[str, Any]], torch.Tensor],
+        decode_fallback: Callable[[torch.Tensor, dict[str, Any]], torch.Tensor],
         backend_max_batch_size: int = 0,
     ) -> list[torch.Tensor]:
         """Group stateful requests once, then execute them with a supplied backend.
 
         The grouping policy is shared by CUDA Graph and eager execution.  A
         backend may decline a grouped decode by returning ``None``; requests in
-        that group are then decoded individually through ``decode_eager``.
+        that group are then decoded individually through ``decode_fallback``.
         """
         if len(codes_list) != len(request_caches):
             raise ValueError("codes_list and request_caches must have the same length")
+
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return [self._forward_exact(codes) for codes in codes_list]
 
         outputs: list[torch.Tensor | None] = [None] * len(codes_list)
         groups: dict[tuple[str, int], list[int]] = {}
@@ -1305,10 +1301,11 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
                     group_outputs = decode_suffix_batch(mode, target, group_codes, group_caches, new_frames)
 
                 if group_outputs is None:
-                    group_outputs = [decode_eager(codes_list[index], request_caches[index]) for index in split_indices]
+                    group_outputs = [
+                        decode_fallback(codes_list[index], request_caches[index]) for index in split_indices
+                    ]
                 for index, output in zip(split_indices, group_outputs, strict=True):
                     outputs[index] = output
-                    request_caches[index]["_last_output_audio_length"] = int(output.shape[-1])
 
         if any(output is None for output in outputs):
             raise RuntimeError("stateful batched decode did not produce an output for every request")
@@ -1563,7 +1560,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
                         transitions_by_mode={"icl": transitions, "xvec": transitions},
                     )
                 ),
-                decode_eager=lambda request_codes, cache: self.chunked_decode(
+                decode_fallback=lambda request_codes, cache: self.chunked_decode(
                     request_codes,
                     caches=cache,
                     chunk_size=chunk_size,
@@ -1571,18 +1568,11 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
                 ),
                 backend_max_batch_size=max_batch_size,
             )
-            max_length = max((int(output.shape[-1]) for output in outputs), default=0)
-            padded = codes.new_zeros(
-                (len(outputs), 1, max_length),
-                dtype=outputs[0].dtype if outputs else torch.float32,
-            )
-            for row, output in enumerate(outputs):
-                padded[row, :, : output.shape[-1]].copy_(output[0])
-            return padded
+            return [output[0] for output in outputs]
 
         from ..cuda_graph_decoder_wrapper import _batched_chunked_decode
 
-        return _batched_chunked_decode(
+        padded = _batched_chunked_decode(
             codes,
             lengths,
             decode_fn=self,
@@ -1591,6 +1581,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             left_context_size=left_context_size,
             max_batch_size=max_batch_size,
         )
+        return [padded[row, :, : length * self.total_upsample] for row, length in enumerate(lengths)]
 
 
 class Qwen3TTSTokenizerV2Encoder(MimiModel):

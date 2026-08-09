@@ -83,20 +83,16 @@ class _FakeDecoder(nn.Module):
                     chunk_size=chunk_size,
                     left_context_size=left_context_size,
                 )
-                cache["_last_output_audio_length"] = int(output.shape[-1])
-                outputs.append(output)
-            max_length = max(output.shape[-1] for output in outputs)
-            padded = outputs[0].new_zeros(len(outputs), 1, max_length)
-            for row, output in enumerate(outputs):
-                padded[row, :, : output.shape[-1]] = output[0]
-            return padded
+                outputs.append(output[0])
+            return outputs
 
         batch = codes.shape[0]
         frames = codes.shape[-1]
         wav_len = frames * self.total_upsample + 6
         wav = torch.arange(wav_len, dtype=torch.float32).view(1, 1, -1)
         offsets = torch.arange(batch, dtype=torch.float32).view(batch, 1, 1) * 1000
-        return wav.expand(batch, 1, wav_len) + offsets
+        outputs = wav.expand(batch, 1, wav_len) + offsets
+        return [outputs[row, :, : lengths[row] * self.total_upsample] for row in range(batch)]
 
     def enable_cudagraph(self, **kwargs):
         self.cudagraph_calls.append(kwargs)
@@ -423,9 +419,7 @@ def test_forward_batches_request_aware_decoder_states():
 
     def _batched_chunked_decode(codes, lengths, caches, **kwargs):
         calls.append((codes, lengths, caches))
-        for cache in caches:
-            cache["_last_output_audio_length"] = 16
-        return torch.stack([torch.arange(16, dtype=torch.float32).view(1, -1) + row * 100 for row in range(2)])
+        return [torch.arange(16, dtype=torch.float32).view(1, -1) + row * 100 for row in range(2)]
 
     model.decoder.batched_chunked_decode = _batched_chunked_decode
     per_request = torch.tensor([9, 8, 1, 2, 9, 8, 3, 4], dtype=torch.long)
