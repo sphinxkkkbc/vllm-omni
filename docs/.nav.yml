@@ -68,12 +68,12 @@ nav:
         - Sequence Parallel: user_guide/diffusion/parallelism/sequence_parallel.md
         - Tensor Parallel: user_guide/diffusion/parallelism/tensor_parallel.md
         - VAE Parallelism: user_guide/diffusion/parallelism/vae_parallelism.md
-      - CPU Offloading: user_guide/diffusion/cpu_offload_diffusion.md
+      - CPU Offloading: user_guide/diffusion/cpu_offload.md
       - LoRA: user_guide/diffusion/lora.md
       - Custom Pipeline: features/custom_pipeline.md
       - Execution Modes: user_guide/diffusion/execution_modes.md
     - Quantization:
-      - Overview: user_guide/quantization/overview.md
+      - Quantization: user_guide/quantization/overview.md
       - Online Quantization: user_guide/quantization/online.md
       - Quantized KV Cache: user_guide/quantization/quantized_kvcache.md
       - FP8 W8A8: user_guide/quantization/fp8.md
@@ -106,7 +106,6 @@ nav:
     - Feature Design:
       - Runtime and Stage Execution:
         - Disaggregated Inference: design/feature/disaggregated_inference.md
-        - Ray-based Execution: design/feature/ray_based_execution.md
         - Async Chunk: design/feature/async_chunk.md
         - Async Diffusion Output: design/feature/async_diffusion_output.md
         - Async Omni Output Materialization: design/feature/omni_async_output_materialization.md
@@ -130,20 +129,37 @@ nav:
           - VAE Patch Parallelism: design/feature/vae_parallel.md
         - Attention Backends:
           - Skip-Softmax: design/feature/skip_softmax.md
-        - Quantization: user_guide/quantization/overview.md
+        - Quantization: design/feature/quantization.md
         - Cache-DiT: design/feature/cache_dit.md
         - TeaCache: design/feature/teacache.md
         - Diffusion Continuous Batching: design/feature/diffusion_continuous_batching.md
+        - Distributed Layerwise Offload: design/feature/distributed_layerwise_offload.md
     - Infrastructure and Performance:
       - Prometheus Metrics: design/metrics.md
       - Speech Generation Performance Optimizations: design/qwen3_omni_tts_performance_optimization.md
     - Module Design:
-      - Runtime Modules:
-        - AR Module: design/module/ar_module.md
-        - DIT Module: design/module/dit_module.md
-      - Orchestration:
-        - Entrypoint Module: design/module/entrypoint_module.md
-        - AsyncOmni Architecture: design/module/async_omni_architecture.md
+      - Entrypoints: design/module/entrypoints.md
+      - vLLM-Omni Configuration: design/module/vllm_omni_config.md
+      - Input, Output, and Modality Contracts: design/module/input_output_modality_contracts.md
+      - Error Contracts: design/module/error_contracts.md
+      - Engine Orchestration: design/module/engine_orchestration.md
+      - Stage Runtime: design/module/stage_runtime.md
+      - OmniConnector: design/module/omni_connector.md
+      - Model Integration: design/module/model_integration.md
+      - Autoregressive Runtime: design/module/ar_runtime.md
+      - Diffusion:
+        - Overview: design/module/diffusion/index.md
+        - Runtime: design/module/diffusion/diffusion_runtime.md
+        - Model Integration: design/module/diffusion/diffusion_model_integration.md
+        - Continuous Batching: design/module/diffusion/continuous_batching.md
+        - Parallelism: design/module/diffusion/parallelism.md
+        - Offloader: design/module/diffusion/offloader.md
+      - Execution Platforms: design/module/execution_platforms.md
+      - Cache Management: design/module/cache_management.md
+      - Quantization: design/module/quantization.md
+      - Observability: design/module/observability.md
+      - Profiling: design/module/profiling.md
+      - Benchmarking: design/module/benchmarking.md
   - Docs Guide: contributing/DOCS_GUIDE.md
 - API Reference:
   - api/README.md
