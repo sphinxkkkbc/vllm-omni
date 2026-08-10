@@ -598,7 +598,7 @@ class OmniServerStageCli(OmniServer):
             "serve",
             self.model,
             "--omni",
-            "--stage-configs-path",
+            "--deploy-config",
             self.stage_config_path,
             "--stage-id",
             str(stage_id),
@@ -1244,6 +1244,28 @@ class OpenAIClientHandler:
             err_message=err_message,
         )
         r = self._post_json_endpoint("/v1/chat/completions", cfg, default_timeout=120.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_batched_chat_completions_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """Post to batched chat completions."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_json_endpoint("/v1/chat/completions/batch", cfg, default_timeout=120.0)
         resp = self._http_response_from_requests(r)
         assert_http_error(
             resp,
@@ -3135,7 +3157,7 @@ def iter_omni_server(
                 raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
             if stage_config_path is None:
                 raise ValueError("omni_server with use_stage_cli=True requires a stage_config_path")
-            server_args += ["--stage-configs-path", stage_config_path]
+            server_args += ["--deploy-config", stage_config_path]
 
             with OmniServerStageCli(
                 model,
@@ -3151,7 +3173,7 @@ def iter_omni_server(
                 print("OmniServer stopping...")
         else:
             if stage_config_path is not None:
-                server_args += ["--stage-configs-path", stage_config_path]
+                server_args += ["--deploy-config", stage_config_path]
 
             with (
                 OmniServer(
