@@ -26,15 +26,11 @@ torch._dynamo.config.cache_size_limit = 128
 class Upsample1D(nn.Module):
     """A 1D upsampling layer with an optional convolution.
 
-    Parameters:
-        channels (`int`):
-            number of channels in the inputs and outputs.
-        use_conv (`bool`, default `False`):
-            option to use a convolution.
-        use_conv_transpose (`bool`, default `False`):
-            option to use a convolution transpose.
-        out_channels (`int`, optional):
-            number of output channels. Defaults to `channels`.
+    Args:
+        channels: Number of input channels.
+        out_channels: Number of output channels.
+        stride: Convolution stride and default interpolation scale.
+        scale_factor: Interpolation scale. Defaults to ``stride``.
     """
 
     def __init__(self, channels: int, out_channels: int, stride: int = 2, scale_factor: float = None):
@@ -57,9 +53,9 @@ class Upsample1D(nn.Module):
     ):
         """
         Args:
-            inputs(torch.Tensor): shape (b, c, t)
-            input_length(torch.Tensor): shape (b), can be None
-            cache(torch.Tensor): shape (b, c, cache_t), where cache_t = stride * 2
+            inputs: Input tensor shaped ``(batch, channels, time)``.
+            input_lengths: Optional input lengths shaped ``(batch,)``.
+            cache: Cached input shaped ``(batch, channels, cache_time)``.
         """
         outputs = F.interpolate(inputs, scale_factor=self.scale_factor, mode="nearest")
 

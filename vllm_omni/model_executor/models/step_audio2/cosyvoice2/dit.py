@@ -241,8 +241,8 @@ class RelPositionMultiHeadedAttention(MultiHeadedAttention):
         """Compute relative positional encoding.
 
         Args:
-            x (torch.Tensor): Input tensor (batch, head, time1, 2*time1-1).
-            time1 means the length of query vector.
+            x (torch.Tensor): Input tensor shaped ``(batch, head, time1,
+                2 * time1 - 1)``, where ``time1`` is the query length.
 
         Returns:
             torch.Tensor: Output tensor.

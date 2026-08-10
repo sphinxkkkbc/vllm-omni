@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import io
 import os
 from collections.abc import Iterable
@@ -13,7 +15,6 @@ import torch
 import torch.nn as nn
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
-from hyperpyyaml import load_hyperpyyaml
 
 try:
     from torch.nn.utils.parametrizations import weight_norm
@@ -37,6 +38,8 @@ from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
     STEP_AUDIO2_DEFAULT_PROMPT_WAV,
     STREAM_SOURCE_CACHE_LEN,
 )
+
+from .cosyvoice2.config import load_flow_model
 
 logger = init_logger(__name__)
 
@@ -161,10 +164,8 @@ class StepAudio2Token2WavCore(nn.Module):
         self._spk_model = onnxruntime.InferenceSession(
             f"{self.model_path}/campplus.onnx", sess_options=option, providers=["CPUExecutionProvider"]
         )
+        self._flow = load_flow_model(f"{self.model_path}/flow.yaml")
 
-        with open(f"{self.model_path}/flow.yaml") as f:
-            configs = load_hyperpyyaml(f)
-        self._flow = configs["flow"]
         if self.float16:
             self._flow.half()
         self._flow.load_state_dict(

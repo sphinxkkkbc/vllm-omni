@@ -157,10 +157,10 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         Args:
             token: shape (b, t), with look ahead tokens
             spk: shape (b, 192), speaker embedding
-            cache: dict {
-                'conformer_cnn_cache': xxx,
-                ...
-            }
+            cache: Dictionary containing the Conformer and estimator CNN and
+                attention caches.
+            last_chunk: Whether this is the final streaming chunk.
+            n_timesteps: Number of diffusion inference steps.
         """
         # unpack cache
         conformer_cnn_cache = cache["conformer_cnn_cache"]
