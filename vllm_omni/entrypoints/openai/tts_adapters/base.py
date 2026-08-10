@@ -243,37 +243,10 @@ class DiffusionTTSAdapter(TTSModelAdapter):
         return frozenset(params) if params is not None else frozenset()
 
 
-@dataclass(frozen=True)
-class LegacyDetector:
-    """A model type the serving layer detects but has no adapter for yet.
-
-    Detection has to keep naming these models so ``serving_speech.py`` can route
-    them down its legacy path, but they own none of the adapter contract. Each
-    entry is a migration debt: delete it when the model gets an adapter. The
-    pre-commit gate (``tools/pre_commit/check_tts_adapter.py``) fails if the list
-    grows.
-
-    Exposes the subset of the :class:`TTSModelAdapter` class surface that
-    detection reads, so both kinds live in one sorted sequence.
-    """
-
-    name: str
-    stage_keys: frozenset[str] = frozenset()
-    model_archs: frozenset[str] = frozenset()
-    arch_identifies_entry_stage: bool = False
-    detect_priority: int = 100
-
-    def matches(self, model_stage: str | None, model_arch: str | None) -> bool:
-        if model_arch is not None and model_arch in self.model_archs:
-            return True
-        return model_stage is not None and model_stage in self.stage_keys
-
-
 # Re-exported here to avoid import cycles at call sites.
 __all__ = [
     "ARTTSAdapter",
     "DiffusionTTSAdapter",
-    "LegacyDetector",
     "OutputPolicy",
     "PreparedRequest",
     "SpeechServingContext",
