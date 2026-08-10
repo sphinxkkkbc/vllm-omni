@@ -27,7 +27,6 @@ logger = init_logger(__name__)
 TTS_ADAPTER_REGISTRY: dict[str, type[TTSModelAdapter]] = {}
 
 
-
 def register_tts_adapter(cls: type[TTSModelAdapter]) -> type[TTSModelAdapter]:
     """Class decorator: index ``cls`` under its ``name`` (model-type)."""
     if cls.name in TTS_ADAPTER_REGISTRY:
