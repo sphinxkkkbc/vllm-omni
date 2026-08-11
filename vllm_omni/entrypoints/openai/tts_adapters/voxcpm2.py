@@ -70,3 +70,9 @@ class VoxCPM2Adapter(ARTTSAdapter):
                 additional["voice_name"] = voice_lower
                 additional["voice_created_at"] = server._voice_created_at(voice_lower)
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="voxcpm2")
+
+    def _load_precomputed_speakers_capability(self) -> dict[str, dict]:
+        return self.ctx.server._load_precomputed_speakers()
+
+    def _load_supported_speakers_capability(self) -> set[str]:
+        return {"default"}

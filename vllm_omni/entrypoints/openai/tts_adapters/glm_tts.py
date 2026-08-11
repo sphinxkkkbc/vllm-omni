@@ -46,3 +46,6 @@ class GlmTTSAdapter(ARTTSAdapter):
         # GLM-TTS dynamic-token sampling stays in the orchestrator tail
         # (keyed on _tts_model_type) during this incremental migration.
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="glm_tts")
+
+    def _load_supported_speakers_capability(self) -> set[str]:
+        return set()

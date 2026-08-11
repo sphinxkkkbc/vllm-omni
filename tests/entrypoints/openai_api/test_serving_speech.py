@@ -1382,6 +1382,10 @@ class TestTTSMethods:
         mock_models = mocker.MagicMock()
         mock_models.is_base_model.return_value = True
 
+        mock_stage = mocker.MagicMock()
+        mock_stage.engine_args.model_stage = "qwen3_tts"
+        mock_engine_client.stage_configs = [mock_stage]
+
         server = OmniOpenAIServingSpeech(
             engine_client=mock_engine_client,
             models=mock_models,

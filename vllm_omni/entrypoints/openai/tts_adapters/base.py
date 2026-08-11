@@ -20,6 +20,21 @@ from typing import TYPE_CHECKING, Any, ClassVar
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
+DEFAULT_TTS_LANGUAGES = frozenset(
+    {
+        "Auto",
+        "Chinese",
+        "English",
+        "Japanese",
+        "Korean",
+        "German",
+        "French",
+        "Russian",
+        "Portuguese",
+        "Spanish",
+        "Italian",
+    }
+)
 
 _conditioning_cache_salt_fn: "Callable[..., str] | None" = None
 
@@ -86,6 +101,14 @@ class SpeechServingContext:
     server: Any
     engine_client: Any | None = None
     diffusion_engine: Any | None = None
+
+
+@dataclass
+class TTSCapabilities:
+    precomputed_speakers: dict[str, dict[str, Any]] = field(default_factory=dict)
+    supported_speakers: set[str] = field(default_factory=set)
+    supported_languages: frozenset[str] = DEFAULT_TTS_LANGUAGES
+    codec_frame_rate: float | None = None
 
 
 class TTSModelAdapter(ABC):
@@ -189,6 +212,28 @@ class TTSModelAdapter(ABC):
         stream-coercion -> extra_params -> THIS -> seed. Default: identity.
         """
         return sampling_params_list
+
+    def load_capabilities(self) -> TTSCapabilities:
+        return TTSCapabilities(
+            precomputed_speakers=self._load_precomputed_speakers_capability(),
+            supported_speakers=self._load_supported_speakers_capability(),
+            supported_languages=self._load_supported_languages_capability(),
+            codec_frame_rate=self._load_codec_frame_rate_capability(),
+        )
+
+    def _load_precomputed_speakers_capability(self) -> dict[str, dict[str, Any]]:
+        return {}
+
+    def _load_supported_speakers_capability(self) -> set[str]:
+        # Preserve the legacy default path, which reads talker_config.
+        return self.ctx.server._load_supported_speakers()
+
+    def _load_supported_languages_capability(self) -> frozenset[str]:
+        # None tells the serving layer to use the shared default language set.
+        return DEFAULT_TTS_LANGUAGES
+
+    def _load_codec_frame_rate_capability(self) -> float | None:
+        return self.ctx.server._load_codec_frame_rate()
 
 
 class ARTTSAdapter(TTSModelAdapter):

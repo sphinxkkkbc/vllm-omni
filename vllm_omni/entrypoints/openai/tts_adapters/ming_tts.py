@@ -157,3 +157,39 @@ class MingTTSAdapter(ARTTSAdapter):
                 return f"max_new_tokens cannot exceed {self.max_new_tokens_max}"
 
         return None
+
+    def _load_ming_tts_codec_frame_rate(self):
+        server = self.ctx.server
+        try:
+            from vllm_omni.model_executor.models.ming_tts.config_ming_tts import MingTTSConfig
+
+            hf_config = server.engine_client.model_config.hf_config
+            ming_cfg = MingTTSConfig.from_hf_config(hf_config)
+            patch_size = int(ming_cfg.patch_size)
+            audio_frame_hop = int(ming_cfg.audio_frame_hop)
+            sample_rate = int(ming_cfg.sample_rate)
+            if patch_size <= 0 or audio_frame_hop <= 0 or sample_rate <= 0:
+                raise ValueError(
+                    "Ming config has invalid tokenizer timing values: "
+                    f"patch_size={patch_size}, audio_frame_hop={audio_frame_hop}, sample_rate={sample_rate}"
+                )
+            rate = float(sample_rate) / float(audio_frame_hop * patch_size)
+            logger.info(
+                "Derived Ming codec frame rate: %.1f Hz (sample_rate=%s, audio_frame_hop=%s, patch_size=%s)",
+                rate,
+                sample_rate,
+                audio_frame_hop,
+                patch_size,
+            )
+            return rate
+        except Exception as e:
+            logger.warning(f"Failed to derive Ming codec frame rate from hf_config: {e}")
+
+    def _load_supported_speakers_capability(self) -> set[str]:
+        return set()
+
+    def _load_codec_frame_rate_capability(self) -> float | None:
+        codec_frame_rate = self._load_ming_tts_codec_frame_rate()
+        if codec_frame_rate is None:
+            codec_frame_rate = super()._load_codec_frame_rate_capability()
+        return codec_frame_rate

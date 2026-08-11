@@ -163,3 +163,9 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             model_type=tts_params.get("task_type", ["unknown"])[0],
             warmup_artifact_key=warmup_key,
         )
+
+    def _load_precomputed_speakers_capability(self) -> dict[str, dict]:
+        return self.ctx.server._load_precomputed_speakers()
+
+    def _load_supported_languages_capability(self) -> frozenset[str] | None:
+        return self.ctx.server._load_supported_languages()
