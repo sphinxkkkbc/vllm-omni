@@ -56,6 +56,11 @@ class Qwen3TTSCode2Wav(nn.Module):
 
     input_modalities = "audio"
 
+    # Ask the model runner for the scheduler-side request IDs. Stateful
+    # decoder caches must use the same IDs delivered by on_requests_finished;
+    # payload metadata carries an external ID which may differ.
+    requires_request_ids = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.vllm_config = vllm_config
@@ -274,6 +279,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         ids = input_ids.reshape(-1).to(dtype=torch.long)
         request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
 
+        internal_request_ids = kwargs.get("request_ids")
         valid_codes_qf: list[tuple[str | None, torch.Tensor]] = []
         valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
@@ -326,6 +332,18 @@ class Qwen3TTSCode2Wav(nn.Module):
                     ref_context_included[i] = _meta_bool(meta["ref_context_included"])
                 if "finished" in meta:
                     finished_flags[i] = _meta_bool(meta["finished"])
+
+        # Normal runner calls provide scheduler-side IDs, which are also used
+        # by scheduler_output.finished_req_ids. Direct forward calls and CUDA
+        # Graph dummy runs have no runner IDs, so retain the payload ID as a
+        # fallback for those paths.
+        cache_request_ids = request_state_ids.copy()
+        if internal_request_ids is not None:
+            for i, request_id in enumerate(internal_request_ids):
+                if i >= len(cache_request_ids):
+                    break
+                cache_request_ids[i] = str(request_id)
+
         for i, req_ids in enumerate(request_ids_list):
             runtime_info = runtime_infos[i] if i < len(runtime_infos) else None
             req_ids = _codec_ids_from_payload_or_input(req_ids, runtime_info)
@@ -350,7 +368,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             # [q*F] -> [Q, F] for direct decoder call (decoder expects [B, Q, F])
             codes_qf = flat.reshape(q, frames)
             ref_req_id = ref_context_request_ids[i]
-            state_req_id = request_state_ids[i] if self._async_chunk else None
+            state_req_id = cache_request_ids[i] if self._async_chunk else None
             is_new_state = state_req_id is not None and state_req_id not in self._decoder_state_cache
             if is_new_state and ref_req_id is not None and ref_ctx_frames > 0:
                 if not ref_context_included[i] or frames < ref_ctx_frames:
@@ -386,7 +404,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         num_req = len(request_ids_list)
         if not valid_codes_qf:
             for req_id, finished, segment_finished in zip(
-                request_state_ids,
+                cache_request_ids,
                 finished_flags,
                 segment_finished_flags,
                 strict=False,
@@ -454,7 +472,6 @@ class Qwen3TTSCode2Wav(nn.Module):
             raise ValueError(
                 f"Qwen3-TTS batched decoder returned {len(request_wavs)} outputs for {len(valid_codes_qf)} requests"
             )
-
         wav_tensors: list[torch.Tensor] = []
         for row in range(len(valid_codes_qf)):
             wav = request_wavs[row]
@@ -463,7 +480,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             elif wav.dim() != 1:
                 raise ValueError(f"Qwen3-TTS batched decoder returned unexpected row shape {tuple(wav.shape)}")
             if request_states is None:
-                start = left_context_size[row] * self._total_upsample
+                start = left_context_size[valid_indices[row]] * self._total_upsample
                 wav = wav[start:]
             wav_tensors.append(wav)
 
@@ -483,7 +500,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 audios[idx] = (wav if wav.dtype == torch.float32 else wav.to(torch.float32)).reshape(-1)
 
         for req_id, finished, segment_finished in zip(
-            request_state_ids,
+            cache_request_ids,
             finished_flags,
             segment_finished_flags,
             strict=False,

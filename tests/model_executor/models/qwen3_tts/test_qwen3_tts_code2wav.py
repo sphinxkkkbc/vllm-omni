@@ -199,6 +199,31 @@ def test_forward_uses_decoder_audio_contract_without_context():
     torch.testing.assert_close(audio, expected)
 
 
+@pytest.mark.parametrize("skipped_length", [0, 1], ids=["empty", "malformed"])
+def test_stateless_batch_uses_original_request_index_for_left_context(skipped_length):
+    model = _make_model()
+
+    skipped_request = torch.zeros(skipped_length, dtype=torch.long)
+    valid_request = torch.tensor([9, 8, 1, 2, 9, 8, 3, 4], dtype=torch.long)
+    out = model.forward(
+        input_ids=torch.cat([skipped_request, valid_request]),
+        seq_token_counts=[skipped_length, valid_request.numel()],
+        runtime_additional_information=[
+            {
+                "codes": {"audio": torch.zeros(skipped_length, dtype=torch.float32)},
+                "meta": {"left_context_size": 0},
+            },
+            {
+                "codes": {"audio": torch.zeros(8, dtype=torch.float32)},
+                "meta": {"left_context_size": 2},
+            },
+        ],
+    )
+    wav_output = out.multimodal_outputs["model_outputs"]
+    torch.testing.assert_close(wav_output[0], torch.empty(0))
+    torch.testing.assert_close(wav_output[1], torch.arange(8, 16, dtype=torch.float32))
+
+
 def test_stateless_forward_trims_reference_prefix_from_decoder_output():
     model = _make_model()
 
@@ -383,6 +408,23 @@ def test_decoder_state_cache_capacity_warns_without_evicting_or_failing():
     warning.assert_called_once()
     assert len(model._decoder_state_cache) == 513
     assert "new-request" in model._decoder_state_cache
+
+
+def test_decoder_state_cache_uses_scheduler_request_id_for_finished_cleanup():
+    model = _make_model(async_chunk=True)
+
+    model.forward(
+        input_ids=torch.arange(4, dtype=torch.long),
+        request_ids=["internal-request-id"],
+        runtime_additional_information=[{"meta": {"request_id": "external-request-id"}}],
+    )
+
+    assert "internal-request-id" in model._decoder_state_cache
+    assert "external-request-id" not in model._decoder_state_cache
+
+    model.on_requests_finished(["internal-request-id"])
+
+    assert model._decoder_state_cache == {}
 
 
 def test_forward_batches_equal_length_requests_in_one_decoder_call():
