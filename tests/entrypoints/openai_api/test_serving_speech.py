@@ -209,7 +209,8 @@ def _wav_data_url(samples: np.ndarray, sample_rate: int) -> str:
 
 
 @pytest.fixture
-def test_app(mocker: MockerFixture):
+def test_app(mocker: MockerFixture, tmp_path, monkeypatch):
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
     # Mock the engine client
     mock_engine_client = mocker.MagicMock()
     mock_engine_client.errored = False
@@ -232,6 +233,11 @@ def test_app(mocker: MockerFixture):
         models=mock_models,
         request_logger=mock_request_logger,
     )
+    # Voice endpoint tests exercise generic embedding parsing/persistence with
+    # multiple valid dimensions. Supply the adapter contract without imposing
+    # one real model's fixed embedding dimension on this shared fixture.
+    speech_server._adapter = mocker.MagicMock()
+    speech_server._adapter.validate_tts_embedding_dim.return_value = None
 
     # Skip TTS validation in tests (mock doesn't set up supported_speakers)
     speech_server._validate_tts_request = mocker.MagicMock(return_value=None)
@@ -722,7 +728,8 @@ class TestTTSMethods:
     """Unit tests for TTS validation and parameter building."""
 
     @pytest.fixture
-    def speech_server(self, mocker: MockerFixture):
+    def speech_server(self, mocker, tmp_path, monkeypatch):
+        monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
         mock_engine_client = mocker.MagicMock()
         mock_engine_client.errored = False
         mock_engine_client.stage_configs = []
@@ -890,12 +897,18 @@ class TestTTSMethods:
 
     def test_speaker_embedding_valid_base_task(self, speech_server):
         """speaker_embedding with Base task, x_vector_only_mode, and no ref_audio is accepted."""
+        speech_server.engine_client.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(talker_config=SimpleNamespace(hidden_size=1024))
+        )
         emb = [0.1] * 1024
         req = OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=emb, x_vector_only_mode=True)
         assert speech_server._validate_tts_request(req) is None
 
     def test_speaker_embedding_auto_sets_x_vector_only_mode(self, speech_server):
         """speaker_embedding auto-implies x_vector_only_mode, so validation passes."""
+        speech_server.engine_client.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(talker_config=SimpleNamespace(hidden_size=1024))
+        )
         emb = [0.1] * 1024
         req = OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=emb)
         result = speech_server._validate_tts_request(req)
@@ -967,6 +980,7 @@ class TestTTSMethods:
         """Embedding uploads must match the loaded Qwen3-TTS model before being stored."""
 
         speech_server._tts_model_type = "qwen3_tts"
+        speech_server._adapter = speech_server._get_tts_adapter()
         speech_server.engine_client.model_config = SimpleNamespace(
             hf_config=SimpleNamespace(
                 talker_config=SimpleNamespace(hidden_size=2048),
@@ -985,6 +999,7 @@ class TestTTSMethods:
     def test_upload_ming_voice_embedding_wrong_dims_rejected_without_replacing_existing(self, speech_server):
         """Ming embedding uploads must match the model dimension before replacement."""
         speech_server._tts_model_type = "ming_tts"
+        speech_server._adapter = speech_server._get_tts_adapter()
         invalid_dim = SPEAKER_EMBEDDING_DIM - 1
         existing = {
             "name": "bad_emb_voice",
@@ -1183,8 +1198,9 @@ class TestTTSMethods:
                 talker_config=SimpleNamespace(hidden_size=4),
             )
         )
+        speech_server._adapter = speech_server._get_tts_adapter()
 
-        profiles = speech_server._load_precomputed_speakers()
+        profiles = speech_server._adapter._load_precomputed_speakers_capability()
         assert profiles == {}
 
         speech_server.precomputed_speakers = profiles
@@ -1217,8 +1233,9 @@ class TestTTSMethods:
                 talker_config=SimpleNamespace(hidden_size=4),
             )
         )
+        speech_server._adapter = speech_server._get_tts_adapter()
 
-        profiles = speech_server._load_precomputed_speakers()
+        profiles = speech_server._adapter._load_precomputed_speakers_capability()
         assert profiles == {}
 
         speech_server.precomputed_speakers = profiles
@@ -1238,8 +1255,9 @@ class TestTTSMethods:
         speech_server.engine_client.model_config = SimpleNamespace(
             hf_config=SimpleNamespace(custom_voice_dir=str(tmp_path))
         )
+        speech_server._adapter = speech_server._get_tts_adapter()
 
-        profiles = speech_server._load_precomputed_speakers()
+        profiles = speech_server._adapter._load_precomputed_speakers_capability()
         assert profiles == {}
 
         speech_server.precomputed_speakers = profiles

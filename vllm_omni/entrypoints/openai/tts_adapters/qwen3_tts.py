@@ -8,6 +8,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.utils.speaker_cache import validate_qwen3_tts_profile
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -74,7 +75,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             # Base task validation so callers don't need to pass it explicitly.
             request.x_vector_only_mode = True
             emb_len = len(request.speaker_embedding)
-            dim_err = server._validate_qwen_tts_speaker_embedding_dim(emb_len)
+            dim_err = self.validate_tts_embedding_dim(emb_len)
             if dim_err is not None:
                 return dim_err
         # Validate Base task requirements
@@ -164,8 +165,33 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             warmup_artifact_key=warmup_key,
         )
 
-    def _load_precomputed_speakers_capability(self) -> dict[str, dict]:
-        return self.ctx.server._load_precomputed_speakers()
+    def _get_expected_speaker_embedding_dim(self) -> int:
+        """Return the loaded Qwen3-TTS speaker embedding dim, if known.
 
-    def _load_supported_languages_capability(self) -> frozenset[str] | None:
+        The user-provided speaker embedding is concatenated directly with
+        talker codec embeddings, so the real compatibility requirement is the
+        talker hidden size.
+        """
+        hf_config = self.ctx.engine_client.model_config.hf_config
+        talker_config = hf_config.talker_config
+        return int(talker_config.hidden_size)
+
+    def _load_precomputed_speakers_capability(self) -> dict[str, dict]:
+        server = self.ctx.server
+        return server._load_precomputed_speakers(
+            expected_model_type=self.name,
+            validate_profile=lambda profile, tensors: validate_qwen3_tts_profile(
+                profile,
+                tensors,
+                expected_embedding_dim=self._get_expected_speaker_embedding_dim(),
+            ),
+        )
+
+    def _load_supported_languages_capability(self) -> frozenset[str]:
         return self.ctx.server._load_supported_languages()
+
+    def validate_tts_embedding_dim(self, emb_dim: int) -> str | None:
+        expected_dim = self._get_expected_speaker_embedding_dim()
+        if emb_dim != expected_dim:
+            return f"speaker_embedding has {emb_dim} dimensions; expected {expected_dim} for the loaded Qwen3-TTS model"
+        return None

@@ -158,6 +158,11 @@ class MingTTSAdapter(ARTTSAdapter):
 
         return None
 
+    def validate_tts_embedding_dim(self, emb_dim: int) -> str | None:
+        if emb_dim != SPEAKER_EMBEDDING_DIM:
+            return f"Ming speaker embedding must have {SPEAKER_EMBEDDING_DIM} dims, got {emb_dim}"
+        return None
+
     def _load_ming_tts_codec_frame_rate(self):
         server = self.ctx.server
         try:

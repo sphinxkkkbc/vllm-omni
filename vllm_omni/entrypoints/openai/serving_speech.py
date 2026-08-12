@@ -9,7 +9,7 @@ import re
 import struct
 import time
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
@@ -71,7 +71,6 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
 from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
     create_instruction as ming_create_instruction,
 )
-from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.speaker_cache import (
     get_speaker_cache,
@@ -501,65 +500,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return self._adapter
 
     async def warmup(self) -> None:
-        """Run a synthetic speech request to trigger all first-request warmup.
+        """Run model-specific startup warmup through the resolved adapter.
 
-        Unlike qwen3-tts, whose CUDA Graph warmup targets a standalone tokenizer
-        decoder (no vLLM dependencies) and can complete entirely at model-init
-        time, VoxCPM2 needs to warm up PagedAttention scaffold/residual LLMs.
-        Their CUDA Graph capture requires a vLLM ``ForwardContext``
-        (attn_metadata, slot_mapping, etc.) that only exists during real
-        inference steps.  The same request also pays the one-time torch.compile
-        JIT tax for the LocDiT estimator, feat_encoder, AudioVAE decoder, and
-        projection helpers.
-
-        For VoxCPM2 this shifts ~15s of torch.compile + CUDA Graph capture from
-        the first user request to server startup.
+        Warmup requirements differ by model. For example, Qwen3-TTS can warm up
+        its standalone tokenizer decoder during model initialization, while
+        VoxCPM2 requires a real inference request with an active vLLM
+        ``ForwardContext``. The adapter owns that model-specific lifecycle logic.
         """
-        if self._tts_model_type != "voxcpm2":
-            return
-
-        t0 = time.time()
-        logger.info("Running warmup speech request for model_type=%s", self._tts_model_type)
-        # VoxCPM2 has no predefined speaker presets — "default" means zero-shot
-        # mode (no voice cloning).  The voice field is required by the OpenAI
-        # API schema but semantically ignored by the model.
-        warmup_req = OpenAICreateSpeechRequest(
-            input="Warmup.",
-            voice="default",
-            response_format="wav",
-            speed=1.0,
-            stream=False,
-            model=self.model_name,
-        )
-        try:
-            _audio_bytes, _media_type = await self._generate_audio_bytes(warmup_req, request_id="speech-warmup")
-        except Exception as exc:
-            logger.warning("Speech warmup failed (non-fatal): %s", exc)
-            return
-
-        elapsed = time.time() - t0
-        logger.info("Speech warmup complete in %.1fs", elapsed)
-
-    def _get_qwen_tts_expected_speaker_embedding_dim(self) -> int | None:
-        """Return the loaded Qwen3-TTS speaker embedding dim, if known.
-
-        The user-provided speaker embedding is concatenated directly with
-        talker codec embeddings, so the real compatibility requirement is the
-        talker hidden size.
-        """
-        if self._tts_model_type != "qwen3_tts":
-            return None
-        hf_config = self.engine_client.model_config.hf_config
-        talker_config = hf_config.talker_config
-        return int(talker_config.hidden_size)
-
-    def _validate_qwen_tts_speaker_embedding_dim(self, emb_dim: int) -> str | None:
-        expected_dim = self._get_qwen_tts_expected_speaker_embedding_dim()
-        if expected_dim is None:
-            return None
-        if emb_dim != expected_dim:
-            return f"speaker_embedding has {emb_dim} dimensions; expected {expected_dim} for the loaded Qwen3-TTS model"
-        return None
+        await self._adapter.warmup()
 
     def _load_codec_frame_rate(self) -> float | None:
         """Load codec frame rate from speech tokenizer config for prompt length estimation."""
@@ -655,19 +603,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return value
         return None
 
-    def _load_precomputed_speakers(self) -> dict[str, dict[str, Any]]:
+    def _load_precomputed_speakers(
+        self,
+        *,
+        expected_model_type: str,
+        validate_profile: Callable[[dict[str, Any], dict[str, torch.Tensor]], str | None],
+    ) -> dict[str, dict[str, Any]]:
         """Load precomputed voice names from ``custom_voice_dir`` for API validation."""
         custom_voice_dir = self._get_custom_voice_dir()
         if not custom_voice_dir:
             return {}
 
         profiles: dict[str, dict[str, Any]] = {}
-        qwen3_embedding_dim = self._get_qwen_tts_expected_speaker_embedding_dim()
-        for profile in iter_custom_voice_profiles(custom_voice_dir, expected_model_type=self._tts_model_type):
+        for profile in iter_custom_voice_profiles(custom_voice_dir, expected_model_type=expected_model_type):
             tensors = load_validated_profile_tensors(
                 profile,
-                expected_model_type=self._tts_model_type,
-                qwen3_embedding_dim=qwen3_embedding_dim,
+                expected_model_type=expected_model_type,
+                validate_profile=validate_profile,
             )
             if tensors is None:
                 continue
@@ -676,7 +628,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.info(
                 "Loaded %d precomputed %s voice profile(s) from %s",
                 len(profiles),
-                self._tts_model_type,
+                expected_model_type,
                 custom_voice_dir,
             )
         return profiles
@@ -1294,13 +1246,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
 
         emb_dim = len(embedding)
-        if self._tts_model_type == "ming_tts":
-            if emb_dim != SPEAKER_EMBEDDING_DIM:
-                raise ValueError(f"Ming speaker embedding must have {SPEAKER_EMBEDDING_DIM} dims, got {emb_dim}")
-        else:
-            dim_err = self._validate_qwen_tts_speaker_embedding_dim(emb_dim)
-            if dim_err is not None:
-                raise ValueError(dim_err)
+        dim_err = self._adapter.validate_tts_embedding_dim(emb_dim)
+        if dim_err is not None:
+            raise ValueError(dim_err)
 
         async with self._upload_lock:
             voice_name_lower = name.lower()

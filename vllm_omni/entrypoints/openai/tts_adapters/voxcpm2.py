@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """VoxCPM2 serving adapter (AR base-LM + diffusion side-computation)."""
 
+import time
 from typing import TYPE_CHECKING
+
+from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.utils.speaker_cache import validate_voxcpm2_profile
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -71,8 +77,43 @@ class VoxCPM2Adapter(ARTTSAdapter):
                 additional["voice_created_at"] = server._voice_created_at(voice_lower)
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="voxcpm2")
 
+    async def warmup(self) -> None:
+        """Warm up VoxCPM2 through a synthetic serving request.
+
+        VoxCPM2 needs to warm up its PagedAttention scaffold/residual LLMs. CUDA
+        Graph capture requires a vLLM ``ForwardContext`` containing attention
+        metadata and slot mappings, which is only available during inference. The
+        request also pays the one-time torch.compile cost for LocDiT, feat_encoder,
+        AudioVAE, and projection helpers.
+        """
+        server = self.ctx.server
+        t0 = time.time()
+        logger.info("Running warmup speech request for model_type=%s", self.name)
+        # VoxCPM2 has no predefined speaker presets — "default" means zero-shot
+        # mode (no voice cloning).  The voice field is required by the OpenAI
+        # API schema but semantically ignored by the model.
+        warmup_req = OpenAICreateSpeechRequest(
+            input="Warmup.",
+            voice="default",
+            response_format="wav",
+            speed=1.0,
+            stream=False,
+            model=server.model_name,
+        )
+        try:
+            _audio_bytes, _media_type = await server._generate_audio_bytes(warmup_req, request_id="speech-warmup")
+        except Exception as exc:
+            logger.warning("Speech warmup failed (non-fatal): %s", exc)
+            return
+
+        elapsed = time.time() - t0
+        logger.info("Speech warmup complete in %.1fs", elapsed)
+
     def _load_precomputed_speakers_capability(self) -> dict[str, dict]:
-        return self.ctx.server._load_precomputed_speakers()
+        return self.ctx.server._load_precomputed_speakers(
+            expected_model_type=self.name,
+            validate_profile=validate_voxcpm2_profile,
+        )
 
     def _load_supported_speakers_capability(self) -> set[str]:
         return {"default"}

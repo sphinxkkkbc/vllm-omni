@@ -213,6 +213,12 @@ class TTSModelAdapter(ABC):
         """
         return sampling_params_list
 
+    async def warmup(self) -> None:
+        return
+
+    def validate_tts_embedding_dim(self, emb_dim: int) -> str | None:
+        return None
+
     def load_capabilities(self) -> TTSCapabilities:
         return TTSCapabilities(
             precomputed_speakers=self._load_precomputed_speakers_capability(),
@@ -229,7 +235,6 @@ class TTSModelAdapter(ABC):
         return self.ctx.server._load_supported_speakers()
 
     def _load_supported_languages_capability(self) -> frozenset[str]:
-        # None tells the serving layer to use the shared default language set.
         return DEFAULT_TTS_LANGUAGES
 
     def _load_codec_frame_rate_capability(self) -> float | None:
