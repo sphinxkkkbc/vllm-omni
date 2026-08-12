@@ -7,9 +7,7 @@ model's request normalization, validation, prompt/param building, sampling
 overrides, and output policy, so adding a model means writing one adapter file
 instead of editing the shared serving module in ~10 scattered places.
 
-See the RFC for the full design (issue #4327). This is the foundation landed in
-the first migration PR; Qwen3-TTS is the first model routed through it while the
-remaining models stay on the legacy path until individually migrated.
+See the RFC for the full design (issue #4327).
 """
 
 from abc import ABC, abstractmethod
