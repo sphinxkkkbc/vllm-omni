@@ -332,12 +332,3 @@ class IndexTTS25Adapter(IndexTTS2Adapter):
         speed = request.speed if request.speed is not None else 1.0
         params["duration_factor"] = [1.0 / speed]
         return params
-
-    def apply_sampling_overrides(
-        self,
-        sampling_params_list: list,
-        request: OpenAICreateSpeechRequest,
-        prompt: dict[str, Any] | None = None,
-        request_id: str | None = None,
-    ) -> list:
-        return apply_max_new_tokens(sampling_params_list, request)

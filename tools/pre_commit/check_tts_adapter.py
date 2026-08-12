@@ -133,7 +133,7 @@ def _check(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    # pre-commit passes the staged filenames; we always audit the same two files,
+    # pre-commit passes the staged filenames; we always audit the same file,
     # so they are accepted and ignored.
     parser.add_argument("filenames", nargs="*")
     parser.parse_args(argv)

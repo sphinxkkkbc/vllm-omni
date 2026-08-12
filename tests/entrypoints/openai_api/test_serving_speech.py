@@ -3602,7 +3602,21 @@ class TestCosyVoice3Serving:
         assert error is not None
         assert "max_new_tokens" in error
 
-    def test_prepare_speech_generation_cosyvoice3(self, cosyvoice3_server, mocker: MockerFixture):
+    @pytest.mark.parametrize(
+        ("max_new_tokens", "expected_min_tokens", "expected_max_tokens"),
+        [
+            (None, 10, 2000),
+            (5, 5, 5),
+        ],
+    )
+    def test_prepare_speech_generation_cosyvoice3(
+        self,
+        cosyvoice3_server,
+        mocker: MockerFixture,
+        max_new_tokens: int | None,
+        expected_min_tokens: int,
+        expected_max_tokens: int,
+    ):
         cosyvoice3_server._build_cosyvoice3_prompt = mocker.AsyncMock(
             return_value={
                 "prompt": "Hello",
@@ -3620,12 +3634,13 @@ class TestCosyVoice3Serving:
             input="Hello",
             ref_audio="data:audio/wav;base64,abc",
             ref_text="Reference text",
+            max_new_tokens=max_new_tokens,
         )
         request_id, generator, tts_params = asyncio.run(cosyvoice3_server._prepare_speech_generation(request))
         sampling_params = cosyvoice3_server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
 
-        assert sampling_params.min_tokens == 10
-        assert sampling_params.max_tokens == 2000
+        assert sampling_params.min_tokens == expected_min_tokens
+        assert sampling_params.max_tokens == expected_max_tokens
         assert request_id.startswith("speech-")
         assert generator == "generator"
         assert tts_params == {}
