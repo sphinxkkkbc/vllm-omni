@@ -4,11 +4,17 @@
 import pytest
 import torch
 
+from vllm_omni.model_executor.models.step_audio2.cosyvoice2.cfm import CausalConditionalCFM
 from vllm_omni.model_executor.models.step_audio2.cosyvoice2.dit import DiT
+from vllm_omni.model_executor.models.step_audio2.cosyvoice2.flow import CausalMaskedDiffWithXvec
+from vllm_omni.model_executor.models.step_audio2.cosyvoice2.upsample_encoder import UpsampleConformerEncoderV2
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 external_dit = pytest.importorskip("cosyvoice2.flow.decoder_dit")
+external_cfm = pytest.importorskip("cosyvoice2.flow.flow_matching")
+external_flow = pytest.importorskip("cosyvoice2.flow.flow")
+external_encoder = pytest.importorskip("cosyvoice2.transformer.upsample_encoder_v2")
 
 
 def _make_models() -> tuple[torch.nn.Module, torch.nn.Module]:
@@ -28,6 +34,69 @@ def _make_models() -> tuple[torch.nn.Module, torch.nn.Module]:
     # This is the same strict compatibility guarantee used when loading
     # Step-Audio2's flow.pt checkpoint at runtime.
     vendored.load_state_dict(reference.state_dict(), strict=True)
+    return reference, vendored
+
+
+def _make_flow(flow_cls, cfm_cls, dit_cls, encoder_cls) -> torch.nn.Module:
+    encoder = encoder_cls(
+        input_size=32,
+        output_size=32,
+        pre_lookahead_len=1,
+        num_blocks=1,
+        num_up_blocks=1,
+        up_stride=2,
+        attention_heads=2,
+        linear_units=64,
+        dropout_rate=0.0,
+        positional_dropout_rate=0.0,
+        attention_dropout_rate=0.0,
+    )
+    estimator = dit_cls(
+        in_channels=320,
+        out_channels=80,
+        mlp_ratio=2.0,
+        depth=2,
+        num_heads=2,
+        head_dim=32,
+        hidden_size=64,
+    )
+    decoder = cfm_cls(estimator=estimator)
+
+    # The production buffers reserve space for 600 seconds of audio. Keep the
+    # same cache path while sizing them for this two-chunk CPU parity test.
+    estimator.cnn_cache_buffer = torch.zeros(2, 2, 128, 2)
+    estimator.att_cache_buffer = torch.zeros(2, 2, 2, 32, 64)
+    decoder.rand_noise = torch.randn(1, 80, 32)
+    decoder.cnn_cache_buffer = torch.zeros(2, 2, 2, 128, 2)
+    decoder.att_cache_buffer = torch.zeros(2, 2, 2, 2, 32, 64)
+    return flow_cls(
+        input_size=32,
+        output_size=80,
+        spk_embed_dim=16,
+        vocab_size=64,
+        encoder=encoder,
+        decoder=decoder,
+    ).eval()
+
+
+def _make_flows() -> tuple[torch.nn.Module, torch.nn.Module]:
+    torch.manual_seed(0)
+    reference = _make_flow(
+        external_flow.CausalMaskedDiffWithXvec,
+        external_cfm.CausalConditionalCFM,
+        external_dit.DiT,
+        external_encoder.UpsampleConformerEncoderV2,
+    )
+    vendored = _make_flow(
+        CausalMaskedDiffWithXvec,
+        CausalConditionalCFM,
+        DiT,
+        UpsampleConformerEncoderV2,
+    )
+    vendored.load_state_dict(reference.state_dict(), strict=True)
+    # rand_noise is intentionally non-persistent and therefore is not copied
+    # by load_state_dict, but it is part of Flow inference semantics.
+    vendored.decoder.rand_noise.copy_(reference.decoder.rand_noise)
     return reference, vendored
 
 
@@ -71,12 +140,8 @@ def test_vendored_dit_uncached_chunk_matches_external() -> None:
     vendored_buffers = (inputs[-2].clone(), inputs[-1].clone())
 
     with torch.inference_mode():
-        expected = reference.blocks_forward_chunk(
-            *inputs[:5], *reference_buffers
-        )
-        actual = vendored.blocks_forward_chunk(
-            *inputs[:5], *vendored_buffers
-        )
+        expected = reference.blocks_forward_chunk(*inputs[:5], *reference_buffers)
+        actual = vendored.blocks_forward_chunk(*inputs[:5], *vendored_buffers)
 
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(vendored_buffers[0], reference_buffers[0])
@@ -128,3 +193,23 @@ def test_vendored_dit_cached_chunk_matches_external() -> None:
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(vendored_buffers[0], reference_buffers[0])
     torch.testing.assert_close(vendored_buffers[1], reference_buffers[1])
+
+
+def test_vendored_streaming_flow_matches_external() -> None:
+    reference, vendored = _make_flows()
+    speaker = torch.randn(1, 16)
+    prompt_token = torch.randint(0, 64, (1, 5))
+    prompt_mel = torch.randn(1, 8, 80)
+    next_token = torch.randint(0, 64, (1, 4))
+
+    with torch.inference_mode():
+        reference_cache = reference.setup_cache(prompt_token, prompt_mel, speaker, n_timesteps=2)
+        vendored_cache = vendored.setup_cache(prompt_token, prompt_mel, speaker, n_timesteps=2)
+
+        expected, reference_cache = reference.inference_chunk(next_token, speaker, reference_cache, n_timesteps=2)
+        actual, vendored_cache = vendored.inference_chunk(next_token, speaker, vendored_cache, n_timesteps=2)
+
+    torch.testing.assert_close(actual, expected)
+    assert vendored_cache.keys() == reference_cache.keys()
+    for name in reference_cache:
+        torch.testing.assert_close(vendored_cache[name], reference_cache[name])
