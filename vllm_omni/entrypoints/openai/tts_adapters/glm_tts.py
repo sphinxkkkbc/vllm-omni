@@ -47,5 +47,5 @@ class GlmTTSAdapter(ARTTSAdapter):
         # (keyed on _tts_model_type) during this incremental migration.
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="glm_tts")
 
-    def _load_supported_speakers_capability(self) -> set[str]:
+    def _load_supported_speakers(self) -> set[str]:
         return set()

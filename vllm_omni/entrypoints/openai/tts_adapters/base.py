@@ -221,23 +221,23 @@ class TTSModelAdapter(ABC):
 
     def load_capabilities(self) -> TTSCapabilities:
         return TTSCapabilities(
-            precomputed_speakers=self._load_precomputed_speakers_capability(),
-            supported_speakers=self._load_supported_speakers_capability(),
-            supported_languages=self._load_supported_languages_capability(),
-            codec_frame_rate=self._load_codec_frame_rate_capability(),
+            precomputed_speakers=self._load_precomputed_speakers(),
+            supported_speakers=self._load_supported_speakers(),
+            supported_languages=self._load_supported_languages(),
+            codec_frame_rate=self._load_codec_frame_rate(),
         )
 
-    def _load_precomputed_speakers_capability(self) -> dict[str, dict[str, Any]]:
+    def _load_precomputed_speakers(self) -> dict[str, dict[str, Any]]:
         return {}
 
-    def _load_supported_speakers_capability(self) -> set[str]:
+    def _load_supported_speakers(self) -> set[str]:
         # Preserve the legacy default path, which reads talker_config.
         return self.ctx.server._load_supported_speakers()
 
-    def _load_supported_languages_capability(self) -> frozenset[str]:
+    def _load_supported_languages(self) -> frozenset[str]:
         return DEFAULT_TTS_LANGUAGES
 
-    def _load_codec_frame_rate_capability(self) -> float | None:
+    def _load_codec_frame_rate(self) -> float | None:
         return self.ctx.server._load_codec_frame_rate()
 
 

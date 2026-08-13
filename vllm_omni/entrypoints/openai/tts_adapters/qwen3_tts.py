@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3-TTS serving adapter."""
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import DEFAULT_TTS_LANGUAGES, ARTTSAdapter, PreparedRequest
 from vllm_omni.utils.speaker_cache import validate_qwen3_tts_profile
 
 if TYPE_CHECKING:
@@ -176,7 +177,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         talker_config = hf_config.talker_config
         return int(talker_config.hidden_size)
 
-    def _load_precomputed_speakers_capability(self) -> dict[str, dict]:
+    def _load_precomputed_speakers(self) -> dict[str, dict]:
         server = self.ctx.server
         return server._load_precomputed_speakers(
             expected_model_type=self.name,
@@ -187,8 +188,22 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             ),
         )
 
-    def _load_supported_languages_capability(self) -> frozenset[str]:
-        return self.ctx.server._load_supported_languages()
+    def _load_supported_languages(self) -> frozenset[str]:
+        try:
+            config = self.ctx.engine_client.model_config.hf_config.talker_config
+
+            if isinstance(config, dict):
+                codec_language_id = config.get("codec_language_id")
+            else:
+                codec_language_id = getattr(config, "codec_language_id", None)
+
+            if codec_language_id and isinstance(codec_language_id, Mapping):
+                return frozenset(str(language).title() for language in codec_language_id) | {"Auto"}
+
+            logger.warning("No codec_language_id found in talker_config; falling back to default languages")
+        except Exception as exc:
+            logger.warning("Could not load languages from model config: %s", exc)
+        return DEFAULT_TTS_LANGUAGES
 
     def validate_tts_embedding_dim(self, emb_dim: int) -> str | None:
         expected_dim = self._get_expected_speaker_embedding_dim()

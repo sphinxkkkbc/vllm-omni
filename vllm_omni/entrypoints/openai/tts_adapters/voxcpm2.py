@@ -109,11 +109,11 @@ class VoxCPM2Adapter(ARTTSAdapter):
         elapsed = time.time() - t0
         logger.info("Speech warmup complete in %.1fs", elapsed)
 
-    def _load_precomputed_speakers_capability(self) -> dict[str, dict]:
+    def _load_precomputed_speakers(self) -> dict[str, dict]:
         return self.ctx.server._load_precomputed_speakers(
             expected_model_type=self.name,
             validate_profile=validate_voxcpm2_profile,
         )
 
-    def _load_supported_speakers_capability(self) -> set[str]:
+    def _load_supported_speakers(self) -> set[str]:
         return {"default"}

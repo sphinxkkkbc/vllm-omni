@@ -190,11 +190,11 @@ class MingTTSAdapter(ARTTSAdapter):
         except Exception as e:
             logger.warning(f"Failed to derive Ming codec frame rate from hf_config: {e}")
 
-    def _load_supported_speakers_capability(self) -> set[str]:
+    def _load_supported_speakers(self) -> set[str]:
         return set()
 
-    def _load_codec_frame_rate_capability(self) -> float | None:
+    def _load_codec_frame_rate(self) -> float | None:
         codec_frame_rate = self._load_ming_tts_codec_frame_rate()
         if codec_frame_rate is None:
-            codec_frame_rate = super()._load_codec_frame_rate_capability()
+            codec_frame_rate = super()._load_codec_frame_rate()
         return codec_frame_rate

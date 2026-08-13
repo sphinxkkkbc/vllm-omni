@@ -1200,7 +1200,7 @@ class TestTTSMethods:
         )
         speech_server._adapter = speech_server._get_tts_adapter()
 
-        profiles = speech_server._adapter._load_precomputed_speakers_capability()
+        profiles = speech_server._adapter._load_precomputed_speakers()
         assert profiles == {}
 
         speech_server.precomputed_speakers = profiles
@@ -1235,7 +1235,7 @@ class TestTTSMethods:
         )
         speech_server._adapter = speech_server._get_tts_adapter()
 
-        profiles = speech_server._adapter._load_precomputed_speakers_capability()
+        profiles = speech_server._adapter._load_precomputed_speakers()
         assert profiles == {}
 
         speech_server.precomputed_speakers = profiles
@@ -1257,7 +1257,7 @@ class TestTTSMethods:
         )
         speech_server._adapter = speech_server._get_tts_adapter()
 
-        profiles = speech_server._adapter._load_precomputed_speakers_capability()
+        profiles = speech_server._adapter._load_precomputed_speakers()
         assert profiles == {}
 
         speech_server.precomputed_speakers = profiles
@@ -1437,7 +1437,8 @@ class TestTTSMethods:
                 )
             )
         )
-        assert speech_server._load_supported_languages() == {
+        adapter = speech_server._get_tts_adapter()
+        assert adapter._load_supported_languages() == {
             "Chinese",
             "English",
             "Beijing_Dialect",
@@ -1450,7 +1451,8 @@ class TestTTSMethods:
         speech_server.engine_client.model_config = SimpleNamespace(
             hf_config=SimpleNamespace(talker_config={"codec_language_id": {"chinese": 2055, "english": 2050}})
         )
-        assert speech_server._load_supported_languages() == {"Chinese", "English", "Auto"}
+        adapter = speech_server._get_tts_adapter()
+        assert adapter._load_supported_languages() == {"Chinese", "English", "Auto"}
 
     def test_validate_language_custom_dialect_accepted(self, speech_server):
         """A language present in the model config passes validation, case-insensitively."""
@@ -1475,18 +1477,21 @@ class TestTTSMethods:
         speech_server.engine_client.model_config = SimpleNamespace(
             hf_config=SimpleNamespace(talker_config=SimpleNamespace(codec_language_id={}))
         )
-        assert speech_server._load_supported_languages() == _TTS_LANGUAGES
+        adapter = speech_server._get_tts_adapter()
+        assert adapter._load_supported_languages() == _TTS_LANGUAGES
 
     def test_load_supported_languages_default_on_config_error(self, speech_server):
         """If the model config cannot be read, fall back to the default list."""
         speech_server._tts_model_type = "qwen3_tts"
         speech_server.engine_client = SimpleNamespace()  # no model_config -> AttributeError
-        assert speech_server._load_supported_languages() == _TTS_LANGUAGES
+        speech_server._adapter = None
+        adapter = speech_server._get_tts_adapter()
+        assert adapter._load_supported_languages() == _TTS_LANGUAGES
 
     def test_load_supported_languages_default_for_non_qwen(self, speech_server):
         """Non-qwen3_tts model types get the default language set."""
-        speech_server._tts_model_type = None
-        assert speech_server._load_supported_languages() == _TTS_LANGUAGES
+        adapter = MingTTSAdapter(SpeechServingContext(server=speech_server, engine_client=speech_server.engine_client))
+        assert adapter._load_supported_languages() == _TTS_LANGUAGES
 
     def test_build_tts_params_with_uploaded_voice(self, speech_server, mocker: MockerFixture):
         """Test _build_tts_params auto-sets ref_audio for uploaded voices (x_vector only)."""
