@@ -17,6 +17,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from vllm_omni.entrypoints.openai.tts_adapters.capabilities import TTSCapabilityLoader
+
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
@@ -147,6 +149,8 @@ class TTSModelAdapter(ABC):
 
     def __init__(self, ctx: SpeechServingContext) -> None:
         self.ctx = ctx
+        self.capability_loader = TTSCapabilityLoader(ctx.engine_client)
+        self.capabilities = TTSCapabilities()
 
     @classmethod
     def matches(cls, model_stage: str | None, model_arch: str | None) -> bool:
@@ -222,25 +226,24 @@ class TTSModelAdapter(ABC):
         return None
 
     def load_capabilities(self) -> TTSCapabilities:
-        return TTSCapabilities(
-            precomputed_speakers=self._load_precomputed_speakers(),
-            supported_speakers=self._load_supported_speakers(),
-            supported_languages=self._load_supported_languages(),
-            codec_frame_rate=self._load_codec_frame_rate(),
-        )
+        self.capabilities.precomputed_speakers = self._load_precomputed_speakers()
+        self.capabilities.supported_speakers = self._load_supported_speakers()
+        self.capabilities.supported_languages = self._load_supported_languages()
+        self.capabilities.codec_frame_rate = self._load_codec_frame_rate()
+        return self.capabilities
 
     def _load_precomputed_speakers(self) -> dict[str, dict[str, Any]]:
         return {}
 
     def _load_supported_speakers(self) -> set[str]:
         # Preserve the legacy default path, which reads talker_config.
-        return self.ctx.server._load_supported_speakers()
+        return self.capability_loader.load_supported_speakers()
 
     def _load_supported_languages(self) -> frozenset[str]:
         return DEFAULT_TTS_LANGUAGES
 
     def _load_codec_frame_rate(self) -> float | None:
-        return self.ctx.server._load_codec_frame_rate()
+        return self.capability_loader.load_codec_frame_rate()
 
 
 class ARTTSAdapter(TTSModelAdapter):

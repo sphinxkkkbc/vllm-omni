@@ -32,8 +32,13 @@ class VoxtralTTSAdapter(ARTTSAdapter):
 
         if request.voice is not None:
             request.voice = request.voice.lower()
-            if server.supported_speakers and request.voice not in server.supported_speakers:
-                return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(server.supported_speakers))}"
+            available_speakers = (
+                set(self.capabilities.supported_speakers)
+                | set(self.capabilities.precomputed_speakers)
+                | set(server.uploaded_speakers)
+            )
+            if available_speakers and request.voice not in available_speakers:
+                return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(available_speakers))}"
 
         if request.max_new_tokens is not None:
             if request.max_new_tokens < self.max_new_tokens_min:
@@ -50,6 +55,5 @@ class VoxtralTTSAdapter(ARTTSAdapter):
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="voxtral_tts")
 
     def _load_supported_speakers(self) -> set[str]:
-        server = self.ctx.server
-        config = server.engine_client.model_config.hf_config.audio_config
-        return server._load_supported_speakers(config)
+        config = self.ctx.engine_client.model_config.hf_config.audio_config
+        return self.capability_loader.load_supported_speakers(config)

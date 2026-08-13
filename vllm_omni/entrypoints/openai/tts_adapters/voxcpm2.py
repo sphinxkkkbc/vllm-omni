@@ -37,7 +37,11 @@ class VoxCPM2Adapter(ARTTSAdapter):
 
         if request.voice is not None:
             request.voice = request.voice.lower()
-            available_voices = set(server.uploaded_speakers) | set(server.precomputed_speakers) | {"default"}
+            available_voices = (
+                set(self.capabilities.supported_speakers)
+                | set(self.capabilities.precomputed_speakers)
+                | set(server.uploaded_speakers)
+            )
             if request.voice not in available_voices:
                 supported = ", ".join(sorted(available_voices)) or "none"
                 return f"Invalid voice '{request.voice}'. Supported: {supported}"
@@ -60,7 +64,8 @@ class VoxCPM2Adapter(ARTTSAdapter):
         if request.voice:
             voice_lower = request.voice.lower()
             if voice_lower in server.uploaded_speakers and not has_inline_ref_audio:
-                if server.uploaded_speakers[voice_lower].get("embedding_source") == "direct":
+                speaker_info = server.uploaded_speakers[voice_lower]
+                if speaker_info.get("embedding_source") == "direct":
                     raise ValueError(
                         f"Uploaded voice '{request.voice}' uses a speaker embedding (Qwen3-only). "
                         f"Re-upload with an audio file for VoxCPM2."
@@ -71,7 +76,7 @@ class VoxCPM2Adapter(ARTTSAdapter):
         tts_params = {}
         if request.voice:
             voice_lower = request.voice.lower()
-            if voice_lower in server.uploaded_speakers or voice_lower in server.precomputed_speakers:
+            if voice_lower in server.uploaded_speakers or voice_lower in self.capabilities.precomputed_speakers:
                 additional = prompt.setdefault("additional_information", {})
                 additional["voice_name"] = voice_lower
                 additional["voice_created_at"] = server._voice_created_at(voice_lower)
@@ -110,7 +115,7 @@ class VoxCPM2Adapter(ARTTSAdapter):
         logger.info("Speech warmup complete in %.1fs", elapsed)
 
     def _load_precomputed_speakers(self) -> dict[str, dict]:
-        return self.ctx.server._load_precomputed_speakers(
+        return self.capability_loader.load_precomputed_speakers(
             expected_model_type=self.name,
             validate_profile=validate_voxcpm2_profile,
         )

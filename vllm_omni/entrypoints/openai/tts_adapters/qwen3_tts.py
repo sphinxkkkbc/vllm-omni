@@ -39,7 +39,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         # Normalize voice to lowercase for case-insensitive matching
         if request.voice is not None:
             request.voice = request.voice.lower()
-            if request.task_type is None and request.voice in server.precomputed_speakers:
+            if request.task_type is None and request.voice in self.capabilities.precomputed_speakers:
                 request.task_type = "Base"
         task_type = request.task_type or "CustomVoice"
 
@@ -50,21 +50,27 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         # Validate language (case-insensitive; normalized to the title-cased config form)
         if request.language is not None:
             request.language = request.language.title()
-            if request.language not in server.supported_languages:
+            if request.language not in self.capabilities.supported_languages:
                 return (
-                    f"Invalid language '{request.language}'. Supported: {', '.join(sorted(server.supported_languages))}"
+                    f"Invalid language '{request.language}'. Supported: "
+                    f"{', '.join(sorted(self.capabilities.supported_languages))}"
                 )
 
         # Validate speaker for CustomVoice task
         if task_type == "CustomVoice":
-            if not server.supported_speakers:
+            available_speakers = (
+                set(self.capabilities.supported_speakers)
+                | set(self.capabilities.precomputed_speakers)
+                | set(server.uploaded_speakers)
+            )
+            if not available_speakers:
                 return (
                     "This model does not support CustomVoice task (no speakers configured). "
                     "Use task_type='Base' with ref_audio/ref_text for voice cloning, "
                     "or use a CustomVoice model."
                 )
-            if request.voice is not None and request.voice not in server.supported_speakers:
-                return f"Invalid voice '{request.voice}'. Supported: {', '.join(sorted(server.supported_speakers))}"
+            if request.voice is not None and request.voice not in available_speakers:
+                return f"Invalid voice '{request.voice}'. Supported: {', '.join(sorted(available_speakers))}"
 
         # Validate speaker_embedding constraints
         if request.speaker_embedding is not None:
@@ -105,8 +111,8 @@ class Qwen3TTSAdapter(ARTTSAdapter):
                     file_path = Path(speaker_info["file_path"])
                     if not file_path.exists():
                         return f"Data file for uploaded speaker '{request.voice}' not found on disk"
-                elif voice_lower in server.precomputed_speakers:
-                    profile = server.precomputed_speakers[voice_lower]
+                elif voice_lower in self.capabilities.precomputed_speakers:
+                    profile = self.capabilities.precomputed_speakers[voice_lower]
                     mode = str(profile.get("mode") or "xvec").lower()
                     ref_text = request.ref_text or profile.get("ref_text")
                     if mode == "icl" and (not isinstance(ref_text, str) or not ref_text.strip()):
@@ -178,8 +184,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         return int(talker_config.hidden_size)
 
     def _load_precomputed_speakers(self) -> dict[str, dict]:
-        server = self.ctx.server
-        return server._load_precomputed_speakers(
+        return self.capability_loader.load_precomputed_speakers(
             expected_model_type=self.name,
             validate_profile=lambda profile, tensors: validate_qwen3_tts_profile(
                 profile,

@@ -9,7 +9,6 @@ import re
 import struct
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
@@ -20,7 +19,6 @@ import soundfile as sf
 import torch
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
-from transformers.utils.hub import cached_file
 from vllm.entrypoints.generate.base.serving import GenerateBaseServing as OpenAIServing
 from vllm.entrypoints.launcher import terminate_if_errored
 from vllm.entrypoints.openai.engine.protocol import (
@@ -58,7 +56,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     resolve_adapter,
     tts_entry_stage_archs,
 )
-from vllm_omni.entrypoints.openai.tts_adapters.base import DEFAULT_TTS_LANGUAGES, TTSCapabilities
+from vllm_omni.entrypoints.openai.tts_adapters.base import DEFAULT_TTS_LANGUAGES
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     build_fish_text_only_prompt_ids,
@@ -72,11 +70,7 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
     create_instruction as ming_create_instruction,
 )
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.utils.speaker_cache import (
-    get_speaker_cache,
-    iter_custom_voice_profiles,
-    load_validated_profile_tensors,
-)
+from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
 
@@ -282,9 +276,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except ValueError:
             logger.warning("Invalid SPEAKER_MAX_UPLOADED=%r; using default 1000", _raw_cap)
             self._max_uploaded_speakers = 1000
-        self.uploaded_speakers: dict[str, dict] = {}
-        self.precomputed_speakers: dict[str, dict[str, Any]] = {}
-        self.supported_speakers: set[str] = set()
+        self.uploaded_speakers: dict[str, dict[str, Any]] = {}
         self._ref_audio_data_url_cache: dict[str, str] = {}
         self._ref_audio_resolve_cache: OrderedDict[str, tuple[list[float], int, int, str]] = OrderedDict()
         self._ref_audio_resolve_cache_bytes = 0
@@ -376,7 +368,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             speaker_data.setdefault("name", voice_name_lower)
             speaker_data.setdefault("file_size", int(path.stat().st_size))
             self.uploaded_speakers[voice_name_lower] = speaker_data
-            self.supported_speakers.add(voice_name_lower)
             self._last_upload_ts = max(self._last_upload_ts, int(speaker_data.get("created_at", 0)))
             restored += 1
         if restored:
@@ -428,7 +419,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Determine TTS model type or None
         self._tts_model_type = self._detect_tts_model_type()
-
         # Resolve the per-model serving adapter (RFC #4327), keyed on the
         # detected model-type. Every dedicated TTS model has an adapter; the
         # adapter owns request validation + prompt/param building. Sampling
@@ -443,16 +433,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 logger.info("Resolved TTS serving adapter: %s", adapter_cls.__name__)
 
         adapter = self._adapter
-        tts_capabilities = adapter.load_capabilities() if adapter is not None else TTSCapabilities()
-        # Merge built-in speakers into the set initialized by _init_speaker_storage.
-        self.precomputed_speakers = tts_capabilities.precomputed_speakers
-        self.supported_speakers |= set(self.precomputed_speakers)
-        self.supported_speakers |= set(tts_capabilities.supported_speakers)
-        self.supported_languages = tts_capabilities.supported_languages
-        # Load speech tokenizer codec parameters for prompt length estimation
-        self._codec_frame_rate: float | None = tts_capabilities.codec_frame_rate
-
-        logger.info("Loaded %d supported speakers: %s", len(self.supported_speakers), sorted(self.supported_speakers))
+        if adapter is not None:
+            adapter.load_capabilities()
+        available_speakers = (
+            set(adapter.capabilities.supported_speakers)
+            | set(adapter.capabilities.precomputed_speakers)
+            | set(self.uploaded_speakers)
+            if adapter is not None
+            else set(self.uploaded_speakers)
+        )
+        logger.info("Loaded %d supported speakers: %s", len(available_speakers), sorted(available_speakers))
 
         # Sub-variant inside the full MOSS-TTS family. We collapse all five
         # variants onto the same _tts_model_type="moss_tts" because they share
@@ -506,6 +496,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self._adapter is None or type(self._adapter) is not adapter_cls:
             ctx = SpeechServingContext(server=self, engine_client=self.engine_client)
             self._adapter = adapter_cls(ctx)
+            self._adapter.load_capabilities()
         return self._adapter
 
     def _uses_native_speed_control(self) -> bool:
@@ -527,47 +518,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """
         await self._adapter.warmup()
 
-    def _load_codec_frame_rate(self) -> float | None:
-        """Load codec frame rate from speech tokenizer config for prompt length estimation."""
-        try:
-            model_path = self.engine_client.model_config.model
-            st_config_path = os.path.join(model_path, "speech_tokenizer", "config.json")
-            if not os.path.exists(st_config_path):
-                st_config_path = cached_file(model_path, "speech_tokenizer/config.json")
-            if st_config_path is not None and os.path.exists(st_config_path):
-                with open(st_config_path) as f:
-                    st_config = json.load(f)
-                output_sr = st_config.get("output_sample_rate")
-                downsample = st_config.get("encode_downsample_rate")
-                if output_sr and downsample and downsample > 0:
-                    rate = float(output_sr) / float(downsample)
-                    logger.info(
-                        "Loaded codec frame rate: %.1f Hz (output_sample_rate=%s, encode_downsample_rate=%s)",
-                        rate,
-                        output_sr,
-                        downsample,
-                    )
-                    return rate
-        except Exception as e:
-            logger.warning("Failed to load codec frame rate from speech tokenizer config: %s", e)
-
-        # Fallback: try codec_frame_rate_hz from hf_config
-        try:
-            hf_config = self.engine_client.model_config.hf_config
-            rate = getattr(hf_config, "codec_frame_rate_hz", None)
-            if rate is not None:
-                logger.info("Using codec frame rate from hf_config: %s Hz", rate)
-                return float(rate)
-        except Exception:
-            pass
-        return None
-
     def shutdown(self) -> None:
         """Shut down the TTS thread pool executor."""
         if self._tts_executor is not None:
             self._tts_executor.shutdown(wait=False, cancel_futures=True)
             self._tts_executor = None
-        for name in list(self.uploaded_speakers.keys()):
+        for name in self.uploaded_speakers:
             self._speaker_cache.clear(name)
 
     def _find_tts_stage(self):
@@ -610,47 +566,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             getattr(self._tts_stage.engine_args, "model_arch", None),
         )
 
-    def _get_custom_voice_dir(self) -> str | None:
-        try:
-            value = getattr(self.engine_client.model_config.hf_config, "custom_voice_dir", None)
-        except AttributeError:
-            return None
-        if isinstance(value, os.PathLike):
-            return os.fspath(value)
-        if isinstance(value, str) and value:
-            return value
-        return None
-
-    def _load_precomputed_speakers(
-        self,
-        *,
-        expected_model_type: str,
-        validate_profile: Callable[[dict[str, Any], dict[str, torch.Tensor]], str | None],
-    ) -> dict[str, dict[str, Any]]:
-        """Load precomputed voice names from ``custom_voice_dir`` for API validation."""
-        custom_voice_dir = self._get_custom_voice_dir()
-        if not custom_voice_dir:
-            return {}
-
-        profiles: dict[str, dict[str, Any]] = {}
-        for profile in iter_custom_voice_profiles(custom_voice_dir, expected_model_type=expected_model_type):
-            tensors = load_validated_profile_tensors(
-                profile,
-                expected_model_type=expected_model_type,
-                validate_profile=validate_profile,
-            )
-            if tensors is None:
-                continue
-            profiles[profile["voice_name_lower"]] = profile
-        if profiles:
-            logger.info(
-                "Loaded %d precomputed %s voice profile(s) from %s",
-                len(profiles),
-                expected_model_type,
-                custom_voice_dir,
-            )
-        return profiles
-
     def _compute_max_instructions_length(self) -> int:
         """Compute max instructions length with precedence: CLI > stage config > default.
 
@@ -670,55 +585,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # 3. Default fallback
         return _TTS_MAX_INSTRUCTIONS_LENGTH
 
-    def _load_supported_speakers(self, config: Any = None) -> set[str]:
-        """Load supported speakers (case-insensitive) from the model configuration."""
-        try:
-            if config is None:
-                # Default is qwen3_tts path
-                config = getattr(self.engine_client.model_config.hf_config, "talker_config", None)
-                if config is None:
-                    return set()
-
-            # Check for speakers in either spk_id or speaker_id
-            for attr_name in ["spk_id", "speaker_id"]:
-                if isinstance(config, dict):
-                    speakers_dict = config.get(attr_name)
-                else:
-                    speakers_dict = getattr(config, attr_name, None)
-                if speakers_dict and isinstance(speakers_dict, dict):
-                    return {speaker.lower() for speaker in speakers_dict.keys()}
-
-            logger.warning("No speakers found in config (checked spk_id and speaker_id)")
-        except Exception as e:
-            logger.warning("Could not load speakers from model config: %s", e)
-
-        return set()
-
-    def _load_supported_languages(self) -> frozenset[str]:
-        """Load supported languages (title-cased) from the model configuration"""
-        try:
-            config = self.engine_client.model_config.hf_config.talker_config
-
-            if isinstance(config, dict):
-                codec_language_id = config.get("codec_language_id")
-            else:
-                codec_language_id = getattr(config, "codec_language_id", None)
-
-            if codec_language_id and isinstance(codec_language_id, Mapping):
-                return frozenset(str(language).title() for language in codec_language_id) | {"Auto"}
-
-            logger.warning("No codec_language_id found in talker_config; falling back to default languages")
-        except Exception as e:
-            logger.warning("Could not load languages from model config: %s", e)
-        return _TTS_LANGUAGES
-
     def _estimate_ref_code_len(self, ref_audio: object) -> int | None:
         """Estimate ref_code length from ref_audio waveform without running the codec.
 
         The codec produces one frame per (output_sample_rate / encode_downsample_rate)
         audio samples, so ref_code_len = ceil(duration_seconds * codec_frame_rate).
         """
-        if self._codec_frame_rate is None:
+        codec_frame_rate = self._adapter.capabilities.codec_frame_rate
+        if codec_frame_rate is None:
             return None
         try:
             # ref_audio comes from tts_params as [[wav_array, sr]] or similar nested structure
@@ -743,7 +617,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if sr <= 0 or n_samples <= 0:
                 return None
             duration = n_samples / sr
-            return math.ceil(duration * self._codec_frame_rate)
+            return math.ceil(duration * codec_frame_rate)
         except Exception:
             return None
 
@@ -908,7 +782,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             wav_np, ref_sr = uploaded_ref
             ref_audio = wav_np.tolist()
         elif request.voice is not None:
-            voice_profile = self.precomputed_speakers.get(request.voice.lower())
+            voice_profile = self._adapter.capabilities.precomputed_speakers.get(request.voice.lower())
         return build_voxcpm2_prompt(
             hf_config=self.engine_client.model_config.hf_config,
             tokenizer=self._voxcpm2_tokenizer,
@@ -1059,7 +933,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return None
 
     def _check_upload_cap(self) -> None:
-        if len(self.uploaded_speakers) >= self._max_uploaded_speakers:
+        if len(set(self.uploaded_speakers)) >= self._max_uploaded_speakers:
             raise ValueError(
                 f"Uploaded voice limit reached ({self._max_uploaded_speakers}). "
                 f"Delete an existing voice before registering a new one, or raise "
@@ -1071,7 +945,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if voice_name_lower not in self.uploaded_speakers:
             return
         old = self.uploaded_speakers.pop(voice_name_lower)
-        self.supported_speakers.discard(voice_name_lower)
         self._ref_audio_data_url_cache.pop(voice_name_lower, None)
         old_path = old.get("file_path")
         if old_path:
@@ -1213,7 +1086,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raise ValueError(f"Failed to save voice file: {e}")
 
             self.uploaded_speakers[voice_name_lower] = speaker_data
-            self.supported_speakers.add(voice_name_lower)
 
         logger.info("Uploaded new voice '%s' with consent ID '%s'", name, consent)
 
@@ -1306,7 +1178,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             speaker_data["file_size"] = file_path.stat().st_size
 
             self.uploaded_speakers[voice_name_lower] = speaker_data
-            self.supported_speakers.add(voice_name_lower)
 
         logger.info("Uploaded voice '%s' from speaker embedding (%d-dim)", name, emb_dim)
 
@@ -1336,7 +1207,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return False
 
             speaker_info = self.uploaded_speakers.pop(voice_name_lower)
-            self.supported_speakers.discard(voice_name_lower)
             self._ref_audio_data_url_cache.pop(voice_name_lower, None)
 
             file_path = speaker_info.get("file_path")
@@ -2403,8 +2273,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     logger.info(
                         "Auto-set ref_audio for uploaded voice: %s (icl=%s)", request.voice, bool(stored_ref_text)
                     )
-            elif voice_lower in self.precomputed_speakers and request.ref_audio is None:
-                profile = self.precomputed_speakers[voice_lower]
+            elif voice_lower in self._adapter.capabilities.precomputed_speakers and request.ref_audio is None:
+                profile = self._adapter.capabilities.precomputed_speakers[voice_lower]
                 mode = str(profile.get("mode") or "xvec").lower()
                 params["speaker"] = [voice_lower]
                 params["task_type"] = ["Base"]

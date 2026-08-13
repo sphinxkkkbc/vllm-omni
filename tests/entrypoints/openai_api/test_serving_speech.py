@@ -1483,7 +1483,7 @@ class TestTTSMethods:
         )
 
         assert speech_server._is_tts is False
-        assert speech_server._load_supported_speakers() == set()
+        assert speech_server._tts_capability_loader.load_supported_speakers() == set()
         warning.assert_not_called()
 
     def test_load_supported_languages_from_config(self, speech_server):
