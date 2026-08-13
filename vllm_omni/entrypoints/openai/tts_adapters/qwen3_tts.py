@@ -9,6 +9,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import DEFAULT_TTS_LANGUAGES, ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
 from vllm_omni.utils.speaker_cache import validate_qwen3_tts_profile
 
 if TYPE_CHECKING:
@@ -58,11 +59,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
 
         # Validate speaker for CustomVoice task
         if task_type == "CustomVoice":
-            available_speakers = (
-                set(self.capabilities.supported_speakers)
-                | set(self.capabilities.precomputed_speakers)
-                | set(server.uploaded_speakers)
-            )
+            available_speakers = server._get_available_speakers()
             if not available_speakers:
                 return (
                     "This model does not support CustomVoice task (no speakers configured). "
@@ -184,7 +181,8 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         return int(talker_config.hidden_size)
 
     def _load_precomputed_speakers(self) -> dict[str, dict]:
-        return self.capability_loader.load_precomputed_speakers(
+        return load_precomputed_speakers(
+            self.ctx.engine_client,
             expected_model_type=self.name,
             validate_profile=lambda profile, tensors: validate_qwen3_tts_profile(
                 profile,

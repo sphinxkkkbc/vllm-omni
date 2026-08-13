@@ -8,6 +8,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
 from vllm_omni.utils.speaker_cache import validate_voxcpm2_profile
 
 logger = init_logger(__name__)
@@ -37,11 +38,7 @@ class VoxCPM2Adapter(ARTTSAdapter):
 
         if request.voice is not None:
             request.voice = request.voice.lower()
-            available_voices = (
-                set(self.capabilities.supported_speakers)
-                | set(self.capabilities.precomputed_speakers)
-                | set(server.uploaded_speakers)
-            )
+            available_voices = server._get_available_speakers()
             if request.voice not in available_voices:
                 supported = ", ".join(sorted(available_voices)) or "none"
                 return f"Invalid voice '{request.voice}'. Supported: {supported}"
@@ -115,7 +112,8 @@ class VoxCPM2Adapter(ARTTSAdapter):
         logger.info("Speech warmup complete in %.1fs", elapsed)
 
     def _load_precomputed_speakers(self) -> dict[str, dict]:
-        return self.capability_loader.load_precomputed_speakers(
+        return load_precomputed_speakers(
+            self.ctx.engine_client,
             expected_model_type=self.name,
             validate_profile=validate_voxcpm2_profile,
         )

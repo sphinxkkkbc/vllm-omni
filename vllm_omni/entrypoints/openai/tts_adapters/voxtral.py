@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_supported_speakers
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -32,11 +33,7 @@ class VoxtralTTSAdapter(ARTTSAdapter):
 
         if request.voice is not None:
             request.voice = request.voice.lower()
-            available_speakers = (
-                set(self.capabilities.supported_speakers)
-                | set(self.capabilities.precomputed_speakers)
-                | set(server.uploaded_speakers)
-            )
+            available_speakers = server._get_available_speakers()
             if available_speakers and request.voice not in available_speakers:
                 return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(available_speakers))}"
 
@@ -56,4 +53,4 @@ class VoxtralTTSAdapter(ARTTSAdapter):
 
     def _load_supported_speakers(self) -> set[str]:
         config = self.ctx.engine_client.model_config.hf_config.audio_config
-        return self.capability_loader.load_supported_speakers(config)
+        return load_supported_speakers(self.ctx.engine_client, config)

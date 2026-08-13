@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from vllm_omni.entrypoints.openai.tts_adapters.capabilities import TTSCapabilityLoader
+from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_codec_frame_rate, load_supported_speakers
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -149,7 +149,6 @@ class TTSModelAdapter(ABC):
 
     def __init__(self, ctx: SpeechServingContext) -> None:
         self.ctx = ctx
-        self.capability_loader = TTSCapabilityLoader(ctx.engine_client)
         self.capabilities = TTSCapabilities()
 
     @classmethod
@@ -237,13 +236,13 @@ class TTSModelAdapter(ABC):
 
     def _load_supported_speakers(self) -> set[str]:
         # Preserve the legacy default path, which reads talker_config.
-        return self.capability_loader.load_supported_speakers()
+        return load_supported_speakers(self.ctx.engine_client)
 
     def _load_supported_languages(self) -> frozenset[str]:
         return DEFAULT_TTS_LANGUAGES
 
     def _load_codec_frame_rate(self) -> float | None:
-        return self.capability_loader.load_codec_frame_rate()
+        return load_codec_frame_rate(self.ctx.engine_client)
 
 
 class ARTTSAdapter(TTSModelAdapter):

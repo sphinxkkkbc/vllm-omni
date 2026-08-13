@@ -435,13 +435,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         adapter = self._adapter
         if adapter is not None:
             adapter.load_capabilities()
-        available_speakers = (
-            set(adapter.capabilities.supported_speakers)
-            | set(adapter.capabilities.precomputed_speakers)
-            | set(self.uploaded_speakers)
-            if adapter is not None
-            else set(self.uploaded_speakers)
-        )
+        available_speakers = self._get_available_speakers()
         logger.info("Loaded %d supported speakers: %s", len(available_speakers), sorted(available_speakers))
 
         # Sub-variant inside the full MOSS-TTS family. We collapse all five
@@ -502,6 +496,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _uses_native_speed_control(self) -> bool:
         adapter = self._get_tts_adapter()
         return bool(adapter is not None and adapter.native_speed_control)
+
+    def _get_available_speakers(self) -> set[str]:
+        """Return all built-in, precomputed, and runtime-uploaded speakers."""
+        available_speakers = set(self.uploaded_speakers)
+        if self._adapter is not None:
+            available_speakers.update(self._adapter.capabilities.supported_speakers)
+            available_speakers.update(self._adapter.capabilities.precomputed_speakers)
+        return available_speakers
 
     def _audio_encode_speed(self, request: OpenAICreateSpeechRequest) -> float:
         if self._uses_native_speed_control():
@@ -2240,6 +2242,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Speaker (voice)
         if request.voice is not None:
             voice_lower = request.voice.lower()
+            precomputed_speakers = self._adapter.capabilities.precomputed_speakers if self._adapter is not None else {}
             params["speaker"] = [request.voice]
             params["voice_created_at"] = [self._voice_created_at(voice_lower)]
 
@@ -2273,8 +2276,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     logger.info(
                         "Auto-set ref_audio for uploaded voice: %s (icl=%s)", request.voice, bool(stored_ref_text)
                     )
-            elif voice_lower in self._adapter.capabilities.precomputed_speakers and request.ref_audio is None:
-                profile = self._adapter.capabilities.precomputed_speakers[voice_lower]
+            elif voice_lower in precomputed_speakers and request.ref_audio is None:
+                profile = precomputed_speakers[voice_lower]
                 mode = str(profile.get("mode") or "xvec").lower()
                 params["speaker"] = [voice_lower]
                 params["task_type"] = ["Base"]
@@ -3337,8 +3340,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             if request.voice:
                 voice_lower = request.voice.lower()
-                if voice_lower not in self.uploaded_speakers and voice_lower not in self.supported_speakers:
-                    all_voices = sorted(self.uploaded_speakers.keys() | self.supported_speakers)
+                available_speakers = self._get_available_speakers()
+                if voice_lower not in available_speakers:
+                    all_voices = sorted(available_speakers)
                     raise ValueError(f"Invalid voice '{request.voice}'. Supported: {', '.join(all_voices) or 'none'}")
 
             has_inline_ref_audio = request.ref_audio is not None

@@ -1481,8 +1481,8 @@ async def list_voices(raw_request: Request):
             status_code=HTTPStatus.NOT_FOUND,
         )
 
-    # Get all speakers (both model built-in and uploaded)
-    speakers = sorted(handler.supported_speakers) if handler.supported_speakers else []
+    # Get all speakers (model built-in, precomputed, and uploaded).
+    speakers = sorted(handler._get_available_speakers())
 
     # Get uploaded speakers details
     uploaded_speakers = []
