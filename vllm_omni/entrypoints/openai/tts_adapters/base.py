@@ -105,10 +105,10 @@ class SpeechServingContext:
     diffusion_engine: Any | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class TTSCapabilities:
     precomputed_speakers: dict[str, dict[str, Any]] = field(default_factory=dict)
-    supported_speakers: set[str] = field(default_factory=set)
+    supported_speakers: frozenset[str] = frozenset()
     supported_languages: frozenset[str] = DEFAULT_TTS_LANGUAGES
     codec_frame_rate: float | None = None
 
@@ -225,10 +225,12 @@ class TTSModelAdapter(ABC):
         return None
 
     def load_capabilities(self) -> TTSCapabilities:
-        self.capabilities.precomputed_speakers = self._load_precomputed_speakers()
-        self.capabilities.supported_speakers = self._load_supported_speakers()
-        self.capabilities.supported_languages = self._load_supported_languages()
-        self.capabilities.codec_frame_rate = self._load_codec_frame_rate()
+        self.capabilities = TTSCapabilities(
+            precomputed_speakers=self._load_precomputed_speakers(),
+            supported_speakers=frozenset(self._load_supported_speakers()),
+            supported_languages=self._load_supported_languages(),
+            codec_frame_rate=self._load_codec_frame_rate(),
+        )
         return self.capabilities
 
     def _load_precomputed_speakers(self) -> dict[str, dict[str, Any]]:

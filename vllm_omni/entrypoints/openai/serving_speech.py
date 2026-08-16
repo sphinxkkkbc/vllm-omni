@@ -3341,9 +3341,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """
         if voice is not None:
             voice = voice.lower()
-            if _is_default_voice(voice, self._get_available_speakers()):
-                return None
-            if voice not in self._get_available_speakers():
+            available_speakers = self._get_available_speakers()
+            if voice not in available_speakers:
                 raise ValueError(
                     f"Invalid voice '{voice}'. Supported: {', '.join(sorted(self._get_available_voices()))}"
                 )
