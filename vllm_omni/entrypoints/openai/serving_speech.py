@@ -3505,6 +3505,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if sampling_params_list[0].extra_args is None:
                     sampling_params_list[0].extra_args = {}
                 sampling_params_list[0].extra_args.update(extra)
+
+                sampling = sampling_params_list[0]
+
+                if "num_inference_steps" in extra:
+                    sampling.num_inference_steps = int(extra["num_inference_steps"])
+
+                if "guidance_scale" in extra:
+                    sampling.guidance_scale = float(extra["guidance_scale"])
+                    sampling.guidance_scale_provided = True
                 logger.info("Applied extra_params to diffusion: %s", extra)
 
             generator = self._diffusion_engine.generate(

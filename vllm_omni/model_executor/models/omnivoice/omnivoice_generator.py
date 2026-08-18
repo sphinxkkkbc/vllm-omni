@@ -910,12 +910,10 @@ class OmniVoiceGenerator(nn.Module):
         generator = torch.Generator(device=device).manual_seed(seed)
 
         # Initialize all target tokens as [MASK]
-        tokens = torch.full(
-            (B, num_codebooks, max_target_len),
-            mask_id,
-            dtype=torch.long,
-            device=device,
-        )
+        positions = torch.arange(max_target_len, device=device).unsqueeze(0)
+        valid_target_mask = positions < torch.tensor(target_lens, device=device).unsqueeze(1)
+        tokens = torch.zeros((B, num_codebooks, max_target_len), dtype=torch.long, device=device)
+        tokens.masked_fill_(valid_target_mask.unsqueeze(1), mask_id)
 
         # Compute unmasking schedule
         timesteps = _get_time_steps(0.0, 1.0, num_step + 1, t_shift).tolist()

@@ -21,7 +21,9 @@ import os
 
 import torch
 import torch.nn as nn
+from torch.cuda.graphs import CUDAGraph
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 
@@ -68,6 +70,68 @@ class HiggsAudioRVQ(nn.Module):
         return result
 
 
+class DecoderGraph:
+    def __init__(
+        self,
+        decode_fn,
+        batch_sizes: tuple[int] = (1, 2, 4, 8, 16),
+        bucket_sizes: tuple[int] = (64, 128, 256),
+        device: torch.device = torch.device("cuda"),
+    ):
+        self.graphs: dict[tuple[int, int], CUDAGraph] = {}
+        self.capture_batch_size = batch_sizes
+        self.device = device
+        self.capture_bucket_size = bucket_sizes
+        self.decode_fn = decode_fn
+        self.static_inputs: dict[tuple[int, int], torch.Tensor] = {}
+        self.static_outputs: dict[tuple[int, int], torch.Tensor] = {}
+        self.captured = False
+
+    def warmup(self):
+        for batch_size in self.capture_batch_size:
+            for bucket_size in self.capture_bucket_size:
+                self._capture(batch_size, bucket_size)
+        self.captured = bool(self.graphs)
+
+    def _capture(self, batch_size: int, bucket_size: int):
+        if torch.cuda.is_current_stream_capturing() or self.device.type != "cuda":
+            return
+        static_inputs = torch.zeros((batch_size, 8, bucket_size), device=self.device, dtype=torch.long)
+        self.static_inputs[(batch_size, bucket_size)] = static_inputs
+        for _ in range(3):
+            self.decode_fn(static_inputs)
+        graph = CUDAGraph()
+        with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+            static_outputs = self.decode_fn(static_inputs)
+        self.graphs[(batch_size, bucket_size)] = graph
+        self.static_outputs[(batch_size, bucket_size)] = static_outputs
+        logger.info(f"Captured graph for batch_size={batch_size}, bucket_size={bucket_size}")
+
+    def find_nearest_padding(self, batch, bucket):
+        candidates = [(b, bk) for b, bk in self.graphs.keys() if b >= batch and bk >= bucket]
+        return (
+            min(candidates, key=lambda x: x[0] * x[1])
+            if candidates
+            else max(self.graphs.keys(), key=lambda x: x[0] * x[1])
+        )
+
+    def forward(self, codes):
+        batch_size, _, bucket_size = codes.shape
+        if batch_size > max(self.capture_batch_size) or bucket_size > max(self.capture_bucket_size):
+            return self.decode_fn(codes)
+        if (batch_size, bucket_size) in self.graphs:
+            self.static_inputs[(batch_size, bucket_size)].copy_(codes)
+            self.graphs[(batch_size, bucket_size)].replay()
+            return self.static_outputs[(batch_size, bucket_size)].clone()
+        else:
+            nearest_batch, nearest_bucket = self.find_nearest_padding(batch_size, bucket_size)
+            static_input = self.static_inputs[(nearest_batch, nearest_bucket)]
+            static_input.zero_()
+            static_input[:batch_size, :, :bucket_size].copy_(codes)
+            self.graphs[(nearest_batch, nearest_bucket)].replay()
+            return self.static_outputs[(nearest_batch, nearest_bucket)][:batch_size].clone()
+
+
 class OmniVoiceDecoder(nn.Module):
     """OmniVoice Stage 1: Token-to-audio decoder.
 
@@ -86,8 +150,7 @@ class OmniVoiceDecoder(nn.Module):
         self.fc2 = None
         self.acoustic_decoder = None
 
-    @torch.inference_mode()
-    def forward(self, audio_codes: torch.Tensor) -> torch.Tensor:
+    def _decode_impl(self, audio_codes: torch.Tensor):
         """Decode audio tokens to waveform.
 
         Args:
@@ -96,11 +159,6 @@ class OmniVoiceDecoder(nn.Module):
         Returns:
             waveform: [B, 1, audio_samples] at 24kHz
         """
-        if not self._loaded:
-            raise RuntimeError("Decoder not loaded. Call load_weights() first.")
-
-        device = audio_codes.device
-
         # Transpose: [B, 8, T] → [8, B, T]
         codes = audio_codes.transpose(0, 1).long()
 
@@ -120,7 +178,27 @@ class OmniVoiceDecoder(nn.Module):
         if audio.dim() == 2:
             audio = audio.unsqueeze(1)
 
-        return audio.to(device)
+        return audio
+
+    @torch.inference_mode()
+    def forward(self, audio_codes: torch.Tensor) -> torch.Tensor:
+        """Decode audio tokens to waveform.
+
+        Args:
+            audio_codes: [B, 8, T] - 8-codebook audio token IDs
+
+        Returns:
+            waveform: [B, 1, audio_samples] at 24kHz
+        """
+        if not self._loaded:
+            raise RuntimeError("Decoder not loaded. Call load_weights() first.")
+
+        device = audio_codes.device
+
+        if self.graphs.captured:
+            return self.graphs.forward(audio_codes).to(device)
+        else:
+            return self._decode_impl(audio_codes).to(device)
 
     def _adjust_output_padding(self, decoder: nn.Module):
         """Adjust ConvTranspose1d output_padding (HiggsAudioV2 modification)."""
@@ -209,6 +287,14 @@ class OmniVoiceDecoder(nn.Module):
 
         self.acoustic_decoder.eval()
         self._loaded = True
+
+        self.graphs = DecoderGraph(
+            self._decode_impl,
+            batch_sizes=(1, 2, 4, 8, 16),
+            bucket_sizes=(64, 128, 256),
+            device=device,
+        )
+        self.graphs.warmup()
 
         logger.info(
             "Loaded OmniVoice decoder: %d quantizers, fc2(%d→%d), acoustic decoder (%d weights)",
