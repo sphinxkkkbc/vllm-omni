@@ -3,12 +3,17 @@
 
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import DEFAULT_TTS_LANGUAGES, ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import (
+    DEFAULT_TTS_LANGUAGES,
+    ARTTSAdapter,
+    PreparedRequest,
+    apply_max_new_tokens,
+)
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
 from vllm_omni.utils.speaker_cache import validate_qwen3_tts_profile
 
@@ -213,3 +218,12 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         if emb_dim != expected_dim:
             return f"speaker_embedding has {emb_dim} dimensions; expected {expected_dim} for the loaded Qwen3-TTS model"
         return None
+
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: "OpenAICreateSpeechRequest",
+        prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
+    ) -> list:
+        return apply_max_new_tokens(sampling_params_list, request)

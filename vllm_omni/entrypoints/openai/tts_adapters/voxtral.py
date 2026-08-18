@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Voxtral TTS serving adapter."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_supported_speakers
 
 if TYPE_CHECKING:
@@ -54,3 +54,12 @@ class VoxtralTTSAdapter(ARTTSAdapter):
     def _load_supported_speakers(self) -> set[str]:
         config = self.ctx.engine_client.model_config.hf_config.audio_config
         return load_supported_speakers(self.ctx.engine_client, config)
+
+    def apply_sampling_overrides(
+        self,
+        sampling_params_list: list,
+        request: "OpenAICreateSpeechRequest",
+        prompt: dict[str, Any] | None = None,
+        request_id: str | None = None,
+    ) -> list:
+        return apply_max_new_tokens(sampling_params_list, request)
