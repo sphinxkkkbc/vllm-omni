@@ -396,6 +396,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Diffusion-only instances don't have a TTS stage; set None so any
         # ``_is_tts_model()`` / ``_tts_stage`` access doesn't raise AttributeError.
         instance._tts_stage = None
+        instance._adapter = None
         instance._init_speaker_storage()
         return instance
 
@@ -519,6 +520,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         VoxCPM2 requires a real inference request with an active vLLM
         ``ForwardContext``. The adapter owns that model-specific lifecycle logic.
         """
+        if self._adapter is None:
+            return
         await self._adapter.warmup()
 
     def shutdown(self) -> None:
@@ -1161,7 +1164,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
 
         emb_dim = len(embedding)
-        dim_err = self._adapter.validate_tts_embedding_dim(emb_dim)
+        dim_err = self._adapter.validate_tts_embedding_dim(emb_dim) if self._adapter is not None else None
         if dim_err is not None:
             raise ValueError(dim_err)
 

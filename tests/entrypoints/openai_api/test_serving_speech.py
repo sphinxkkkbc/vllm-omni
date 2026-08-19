@@ -728,6 +728,20 @@ class TestSpeechAPI:
         assert "finite" in response.json()["detail"]
 
     @pytest.mark.asyncio
+    async def test_diffusion_create_speech_with_unknown_voice(self, mocker: MockerFixture):
+        engine_client = mocker.MagicMock()
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=engine_client,
+            model_name="test-model",
+        )
+        assert server._adapter is None
+
+        response = await server.create_speech(OpenAICreateSpeechRequest(input="test-input", voice="test-voice"))
+
+        assert response.status_code == 400
+        assert b"Invalid voice" in response.body
+
+    @pytest.mark.asyncio
     async def test_create_diffusion_speech_extra_params(self, mocker: MockerFixture):
         """Test public diffusion speech success and extra_params propagation."""
         # Mock the engine client
@@ -2267,6 +2281,11 @@ class TestTTSMethods:
         assert request.ref_audio is not None
         assert call.kwargs["has_inline_ref_audio"] is False
 
+    @pytest.mark.asyncio
+    async def test_warmup_with_no_adapter(self, speech_server):
+        assert speech_server._adapter is None
+        await speech_server.warmup()
+
 
 class TestFileValidationFunctions:
     """Unit tests for file validation helper functions."""
@@ -3035,6 +3054,39 @@ def test_api_server_upload_voice_exception_returns_500(mocker: MockerFixture):
         message="Failed to upload voice",
         err_type="InternalServerError",
     )
+
+
+def test_api_server_upload_voice_with_no_adapter(
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
+    _patch_api_server_base(mocker)
+    engine_client = mocker.MagicMock()
+    engine_client.errored = False
+    engine_client.stage_configs = []
+    models = mocker.MagicMock()
+    models.is_base_model.return_value = True
+    handler = OmniOpenAIServingSpeech(
+        engine_client=engine_client,
+        models=models,
+        request_logger=mocker.MagicMock(),
+    )
+    assert handler._adapter is None
+    raw_request = _make_api_server_request(handler)
+
+    response = asyncio.run(
+        api_server_module.upload_voice(
+            raw_request,
+            audio_sample=None,
+            speaker_embedding=json.dumps([0.1] * 1024),
+            consent="cons_test",
+            name="probe",
+        )
+    )
+
+    assert response.status_code == 200
 
 
 def test_api_server_delete_voice_without_speech_handler_returns_404(mocker: MockerFixture):
