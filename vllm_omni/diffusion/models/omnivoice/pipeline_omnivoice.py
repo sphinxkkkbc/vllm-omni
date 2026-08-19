@@ -797,7 +797,7 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             seed=seed,
         )
 
-        audio = self.decoder(tokens)  # [1, 1, target_len * 960]
+        audio = self.decoder(tokens, batch_target_len)  # [B, 1, max_target_len * 960]
         for i in range(len(batch_target_len)):
             audio_output = audio[i : i + 1, :, : batch_target_len[i] * 960]
             outputs.append(DiffusionOutput(output=audio_output))

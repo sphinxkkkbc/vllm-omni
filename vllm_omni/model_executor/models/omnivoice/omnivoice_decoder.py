@@ -74,7 +74,7 @@ class DecoderGraph:
     def __init__(
         self,
         decode_fn,
-        batch_sizes: tuple[int] = (1, 2, 4, 8, 16),
+        batch_sizes: tuple[int] = (1, 2),
         bucket_sizes: tuple[int] = (64, 128, 256),
         device: torch.device = torch.device("cuda"),
     ):
@@ -84,6 +84,7 @@ class DecoderGraph:
         self.capture_bucket_size = bucket_sizes
         self.decode_fn = decode_fn
         self.static_inputs: dict[tuple[int, int], torch.Tensor] = {}
+        self.static_lengths: dict[tuple[int, int], torch.Tensor] = {}
         self.static_outputs: dict[tuple[int, int], torch.Tensor] = {}
         self.captured = False
 
@@ -97,39 +98,44 @@ class DecoderGraph:
         if torch.cuda.is_current_stream_capturing() or self.device.type != "cuda":
             return
         static_inputs = torch.zeros((batch_size, 8, bucket_size), device=self.device, dtype=torch.long)
+        static_lengths = torch.full((batch_size,), bucket_size, device=self.device, dtype=torch.long)
         self.static_inputs[(batch_size, bucket_size)] = static_inputs
+        self.static_lengths[(batch_size, bucket_size)] = static_lengths
         for _ in range(3):
-            self.decode_fn(static_inputs)
+            self.decode_fn(static_inputs, static_lengths)
         graph = CUDAGraph()
         with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
-            static_outputs = self.decode_fn(static_inputs)
+            static_outputs = self.decode_fn(static_inputs, static_lengths)
         self.graphs[(batch_size, bucket_size)] = graph
         self.static_outputs[(batch_size, bucket_size)] = static_outputs
         logger.info(f"Captured graph for batch_size={batch_size}, bucket_size={bucket_size}")
 
     def find_nearest_padding(self, batch, bucket):
-        candidates = [(b, bk) for b, bk in self.graphs.keys() if b >= batch and bk >= bucket]
-        return (
-            min(candidates, key=lambda x: x[0] * x[1])
-            if candidates
-            else max(self.graphs.keys(), key=lambda x: x[0] * x[1])
-        )
+        candidates = [
+            (b, bk) for b in self.capture_batch_size for bk in self.capture_bucket_size if b >= batch and bk >= bucket
+        ]
+        return min(candidates, key=lambda x: x[0] * x[1]) if candidates else None
 
-    def forward(self, codes):
+    def forward(self, codes, lengths):
         batch_size, _, bucket_size = codes.shape
         if batch_size > max(self.capture_batch_size) or bucket_size > max(self.capture_bucket_size):
-            return self.decode_fn(codes)
-        if (batch_size, bucket_size) in self.graphs:
-            self.static_inputs[(batch_size, bucket_size)].copy_(codes)
-            self.graphs[(batch_size, bucket_size)].replay()
-            return self.static_outputs[(batch_size, bucket_size)].clone()
-        else:
-            nearest_batch, nearest_bucket = self.find_nearest_padding(batch_size, bucket_size)
-            static_input = self.static_inputs[(nearest_batch, nearest_bucket)]
-            static_input.zero_()
-            static_input[:batch_size, :, :bucket_size].copy_(codes)
-            self.graphs[(nearest_batch, nearest_bucket)].replay()
-            return self.static_outputs[(nearest_batch, nearest_bucket)][:batch_size].clone()
+            return self.decode_fn(codes, lengths)
+
+        graph_key = self.find_nearest_padding(batch_size, bucket_size)
+        if graph_key is None:
+            return self.decode_fn(codes, lengths)
+
+        if graph_key not in self.graphs:
+            return self.decode_fn(codes, lengths)
+
+        static_input = self.static_inputs[graph_key]
+        static_lengths = self.static_lengths[graph_key]
+        static_input.zero_()
+        static_lengths.zero_()
+        static_input[:batch_size, :, :bucket_size].copy_(codes)
+        static_lengths[:batch_size].copy_(lengths)
+        self.graphs[graph_key].replay()
+        return self.static_outputs[graph_key][:batch_size].clone()
 
 
 class OmniVoiceDecoder(nn.Module):
@@ -149,8 +155,48 @@ class OmniVoiceDecoder(nn.Module):
         self.quantizer = None
         self.fc2 = None
         self.acoustic_decoder = None
+        self.graphs: DecoderGraph | None = None
 
-    def _decode_impl(self, audio_codes: torch.Tensor):
+    @staticmethod
+    def _mask_by_lengths(hidden_states: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        positions = torch.arange(hidden_states.shape[-1], device=hidden_states.device)
+        valid = positions.unsqueeze(0) < lengths.unsqueeze(1)
+        return hidden_states.masked_fill(~valid.unsqueeze(1), 0.0)
+
+    def _decode_acoustic_length_aware(
+        self,
+        hidden_states: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the non-causal DAC decoder while zeroing padded activations."""
+        decoder = self.acoustic_decoder
+        hidden_states = self._mask_by_lengths(hidden_states, lengths)
+        hidden_states = decoder.conv1(hidden_states)
+        hidden_states = self._mask_by_lengths(hidden_states, lengths)
+
+        for block in decoder.block:
+            hidden_states = block.snake1(hidden_states)
+            hidden_states = block.conv_t1(hidden_states)
+            stride = block.conv_t1.stride[0]
+            lengths = lengths * stride
+            hidden_states = self._mask_by_lengths(hidden_states, lengths)
+
+            for residual_unit in (block.res_unit1, block.res_unit2, block.res_unit3):
+                hidden_states = residual_unit(hidden_states)
+                hidden_states = self._mask_by_lengths(hidden_states, lengths)
+
+        hidden_states = decoder.snake1(hidden_states)
+        hidden_states = self._mask_by_lengths(hidden_states, lengths)
+        hidden_states = decoder.conv2(hidden_states)
+        hidden_states = self._mask_by_lengths(hidden_states, lengths)
+        hidden_states = decoder.tanh(hidden_states)
+        return self._mask_by_lengths(hidden_states, lengths)
+
+    def _decode_impl(
+        self,
+        audio_codes: torch.Tensor,
+        target_lens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Decode audio tokens to waveform.
 
         Args:
@@ -172,7 +218,12 @@ class OmniVoiceDecoder(nn.Module):
         quantized = self.fc2(quantized.transpose(1, 2).to(self.fc2.weight.dtype)).transpose(1, 2).float()
 
         # Acoustic decoder: [B, 256, T] → [B, 1, T*960]
-        audio = self.acoustic_decoder(quantized)
+        if target_lens is None or not all(
+            hasattr(self.acoustic_decoder, name) for name in ("conv1", "block", "snake1", "conv2", "tanh")
+        ):
+            audio = self.acoustic_decoder(quantized)
+        else:
+            audio = self._decode_acoustic_length_aware(quantized, target_lens)
 
         # Ensure [B, 1, samples]
         if audio.dim() == 2:
@@ -181,7 +232,11 @@ class OmniVoiceDecoder(nn.Module):
         return audio
 
     @torch.inference_mode()
-    def forward(self, audio_codes: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        audio_codes: torch.Tensor,
+        target_lens: list[int] | torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Decode audio tokens to waveform.
 
         Args:
@@ -194,11 +249,30 @@ class OmniVoiceDecoder(nn.Module):
             raise RuntimeError("Decoder not loaded. Call load_weights() first.")
 
         device = audio_codes.device
-
-        if self.graphs.captured:
-            return self.graphs.forward(audio_codes).to(device)
+        if target_lens is None:
+            lengths = torch.full(
+                (audio_codes.shape[0],),
+                audio_codes.shape[-1],
+                dtype=torch.long,
+                device=device,
+            )
+        elif isinstance(target_lens, torch.Tensor):
+            lengths = target_lens.to(device=device, dtype=torch.long)
         else:
-            return self._decode_impl(audio_codes).to(device)
+            lengths = torch.tensor(target_lens, device=device, dtype=torch.long)
+
+        if lengths.shape != (audio_codes.shape[0],):
+            raise ValueError(
+                f"Expected one target length per request, got shape {tuple(lengths.shape)} "
+                f"for batch size {audio_codes.shape[0]}."
+            )
+        if torch.any(lengths <= 0) or torch.any(lengths > audio_codes.shape[-1]):
+            raise ValueError(f"Target lengths must be in [1, {audio_codes.shape[-1]}], got {lengths.tolist()}.")
+
+        if self.graphs is not None and self.graphs.captured:
+            return self.graphs.forward(audio_codes, lengths).to(device)
+        else:
+            return self._decode_impl(audio_codes, lengths).to(device)
 
     def _adjust_output_padding(self, decoder: nn.Module):
         """Adjust ConvTranspose1d output_padding (HiggsAudioV2 modification)."""
@@ -290,8 +364,6 @@ class OmniVoiceDecoder(nn.Module):
 
         self.graphs = DecoderGraph(
             self._decode_impl,
-            batch_sizes=(1, 2, 4, 8, 16),
-            bucket_sizes=(64, 128, 256),
             device=device,
         )
         self.graphs.warmup()
