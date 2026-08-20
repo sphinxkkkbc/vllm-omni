@@ -245,7 +245,6 @@ def _build_padded_decoder() -> OmniVoiceDecoder:
     decoder._adjust_output_padding(decoder.acoustic_decoder)
     decoder.acoustic_decoder.tanh = nn.Identity()
 
-    decoder.graphs = None
     decoder._loaded = True
     return decoder
 
