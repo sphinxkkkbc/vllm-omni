@@ -31,10 +31,7 @@ pytestmark = [pytest.mark.slow, pytest.mark.tts]
 MODEL = "k2-fsa/OmniVoice"
 
 STAGE_CONFIG = get_deploy_config_path("omnivoice.yaml")
-EXTRA_ARGS = [
-    "--trust-remote-code",
-    "--disable-log-stats",
-]
+EXTRA_ARGS = ["--trust-remote-code", "--disable-log-stats", "--max-num-seqs", "8"]
 TEST_PARAMS = [
     OmniServerParams(
         model=MODEL,
@@ -42,7 +39,18 @@ TEST_PARAMS = [
         server_args=EXTRA_ARGS,
     )
 ]
-
+STEP_EXECUTION_ARGS = [
+    "--trust-remote-code",
+    "--enforce-eager",
+    "--step-execution",
+]
+STEP_EXECUTION_PARAMS = [
+    OmniServerParams(
+        model=MODEL,
+        stage_config_path=STAGE_CONFIG,
+        server_args=STEP_EXECUTION_ARGS,
+    )
+]
 # Lower this in ``request_config`` via ``min_audio_bytes`` if a run produces legitimately short WAVs.
 _DEFAULT_MIN_AUDIO_BYTES = 5000
 
@@ -73,6 +81,43 @@ class TestOmniVoiceTTS:
             "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
         }
         online_client.send_audio_speech_request(request_config)
+
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_speech_auto_voice_batch(self, omni_server, openai_client) -> None:
+        """The same seeded request must match in request-batch and per-request execution."""
+        batch_request_config = {
+            "model": omni_server.model,
+            "input": get_prompt("text"),
+            "response_format": "wav",
+            "seed": 42,
+            "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
+        }
+        single_request_config = dict(batch_request_config)
+        batch_r = openai_client.send_audio_speech_request(batch_request_config, request_num=2)
+        single_r = openai_client.send_audio_speech_request(single_request_config)[0]
+        assert len(batch_r) == 2
+        assert batch_r[0].audio_bytes == single_r.audio_bytes
+        assert batch_r[1].audio_bytes == single_r.audio_bytes
+
+
+@pytest.mark.parametrize("omni_server", STEP_EXECUTION_PARAMS, indirect=True)
+class TestOmniVoiceStepExecution:
+    """E2E tests for OmniVoice TTS model."""
+
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_speech_auto_voice_step_execution(self, omni_server, openai_client) -> None:
+        """Test auto voice TTS generation (text only, no reference audio)."""
+        request_config = {
+            "model": omni_server.model,
+            "input": get_prompt("text"),
+            "response_format": "wav",
+            "timeout": 180.0,
+            "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
+            "extra_params": {
+                "num_inference_steps": 32,
+            },
+        }
+        openai_client.send_audio_speech_request(request_config)
 
 
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
