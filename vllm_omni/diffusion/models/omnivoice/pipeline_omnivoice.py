@@ -407,6 +407,13 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         pairs = torch.stack([x[:batch_size], x[batch_size:]], dim=1)
         return pairs.reshape(2 * batch_size, *x.shape[1:])
 
+    @staticmethod
+    def _split_audio_outputs(audio: torch.Tensor, target_lens: Sequence[int]) -> list[DiffusionOutput]:
+        """Split a padded waveform batch into one length-trimmed output per request."""
+        return [
+            DiffusionOutput(output=audio[i : i + 1, :, : target_len * 960]) for i, target_len in enumerate(target_lens)
+        ]
+
     def prepare_state_batch(self, states: list[StepRequestState], new_request_ids: list[str]) -> list[StepRequestState]:
         if not new_request_ids:
             return states
@@ -637,7 +644,6 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
           {"text": "...", "ref_audio": (samples, sr), "ref_text": "...",
            "lang": "...", "instruct": "..."}
         """
-        outputs: list[DiffusionOutput] = []
         prepared_requests: list[_PreparedOmniVoiceRequest] = []
         for request in req.requests:
             prompt = request.prompt if request.prompt else ""
@@ -666,10 +672,7 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         )
 
         audio = self.decoder(tokens, batch_target_len)  # [B, 1, max_target_len * 960]
-        for i in range(len(batch_target_len)):
-            audio_output = audio[i : i + 1, :, : batch_target_len[i] * 960]
-            outputs.append(DiffusionOutput(output=audio_output))
-        return outputs
+        return self._split_audio_outputs(audio, batch_target_len)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights from model directory (not from the iterator).
