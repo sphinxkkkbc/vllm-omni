@@ -190,7 +190,7 @@ class MingTTSAdapter(ARTTSAdapter):
             return f"Ming speaker embedding must have {SPEAKER_EMBEDDING_DIM} dims, got {emb_dim}"
         return None
 
-    def _load_ming_tts_codec_frame_rate(self):
+    def _load_ming_tts_codec_frame_rate(self) -> float | None:
         server = self.ctx.server
         try:
             from vllm_omni.model_executor.models.ming_tts.config_ming_tts import MingTTSConfig

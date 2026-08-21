@@ -2,19 +2,17 @@
 """VoxCPM2 serving adapter (AR base-LM + diffusion side-computation)."""
 
 import time
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from vllm.logger import init_logger
 
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
 from vllm_omni.utils.speaker_cache import validate_voxcpm2_profile
 
 logger = init_logger(__name__)
-
-if TYPE_CHECKING:
-    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
 
 @register_tts_adapter
@@ -61,8 +59,7 @@ class VoxCPM2Adapter(ARTTSAdapter):
         if request.voice:
             voice_lower = request.voice.lower()
             if voice_lower in server.uploaded_speakers and not has_inline_ref_audio:
-                speaker_info = server.uploaded_speakers[voice_lower]
-                if speaker_info.get("embedding_source") == "direct":
+                if server.uploaded_speakers[voice_lower].get("embedding_source") == "direct":
                     raise ValueError(
                         f"Uploaded voice '{request.voice}' uses a speaker embedding (Qwen3-only). "
                         f"Re-upload with an audio file for VoxCPM2."

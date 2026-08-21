@@ -56,7 +56,6 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     resolve_adapter,
     tts_entry_stage_archs,
 )
-from vllm_omni.entrypoints.openai.tts_adapters.base import DEFAULT_TTS_LANGUAGES
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     build_fish_text_only_prompt_ids,
@@ -97,7 +96,6 @@ _COSYVOICE3_PROMPT_PREFIX = f"You are a helpful assistant.{_COSYVOICE3_PROMPT_DE
 # payloads and must fail the request, never serialize as a successful empty
 # WAV. Covers both the TTS ("audex") and TTA ("audex_tta") pipelines.
 _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES = frozenset({"audex", "audex_tta"})
-_TTS_LANGUAGES = DEFAULT_TTS_LANGUAGES
 _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 256
@@ -529,7 +527,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self._tts_executor is not None:
             self._tts_executor.shutdown(wait=False, cancel_futures=True)
             self._tts_executor = None
-        for name in self.uploaded_speakers:
+        for name in list(self.uploaded_speakers):
             self._speaker_cache.clear(name)
 
     def _find_tts_stage(self):
@@ -961,7 +959,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return None
 
     def _check_upload_cap(self) -> None:
-        if len(set(self.uploaded_speakers)) >= self._max_uploaded_speakers:
+        if len(self.uploaded_speakers) >= self._max_uploaded_speakers:
             raise ValueError(
                 f"Uploaded voice limit reached ({self._max_uploaded_speakers}). "
                 f"Delete an existing voice before registering a new one, or raise "

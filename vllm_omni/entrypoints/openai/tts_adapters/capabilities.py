@@ -27,7 +27,7 @@ def load_supported_speakers(engine_client: Any, config: Any = None) -> set[str]:
         for attr_name in ("spk_id", "speaker_id"):
             speakers = config.get(attr_name) if isinstance(config, dict) else getattr(config, attr_name, None)
             if speakers and isinstance(speakers, dict):
-                return {str(speaker).lower() for speaker in speakers}
+                return {speaker.lower() for speaker in speakers}
 
         logger.warning("No speakers found in config (checked spk_id and speaker_id)")
     except Exception as exc:

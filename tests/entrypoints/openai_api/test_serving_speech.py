@@ -39,11 +39,10 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     StreamingSpeechSessionConfig,
 )
 from vllm_omni.entrypoints.openai.serving_speech import (
-    _TTS_LANGUAGES,
     OmniOpenAIServingSpeech,
     _create_wav_header,
 )
-from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest, SpeechServingContext
+from vllm_omni.entrypoints.openai.tts_adapters.base import DEFAULT_TTS_LANGUAGES, PreparedRequest, SpeechServingContext
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_supported_speakers
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import MingTTSAdapter
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
@@ -1634,7 +1633,7 @@ class TestTTSMethods:
             hf_config=SimpleNamespace(talker_config=SimpleNamespace(codec_language_id={}))
         )
         adapter = speech_server._get_tts_adapter()
-        assert adapter._load_supported_languages() == _TTS_LANGUAGES
+        assert adapter._load_supported_languages() == DEFAULT_TTS_LANGUAGES
 
     def test_load_supported_languages_default_on_config_error(self, speech_server):
         """If the model config cannot be read, fall back to the default list."""
@@ -1642,12 +1641,12 @@ class TestTTSMethods:
         speech_server.engine_client = SimpleNamespace()  # no model_config -> AttributeError
         speech_server._adapter = None
         adapter = speech_server._get_tts_adapter()
-        assert adapter._load_supported_languages() == _TTS_LANGUAGES
+        assert adapter._load_supported_languages() == DEFAULT_TTS_LANGUAGES
 
     def test_load_supported_languages_default_for_non_qwen(self, speech_server):
         """Non-qwen3_tts model types get the default language set."""
         adapter = MingTTSAdapter(SpeechServingContext(server=speech_server, engine_client=speech_server.engine_client))
-        assert adapter._load_supported_languages() == _TTS_LANGUAGES
+        assert adapter._load_supported_languages() == DEFAULT_TTS_LANGUAGES
 
     def test_build_tts_params_with_uploaded_voice(self, speech_server, mocker: MockerFixture):
         """Test _build_tts_params auto-sets ref_audio for uploaded voices (x_vector only)."""
@@ -2284,6 +2283,23 @@ class TestTTSMethods:
     @pytest.mark.asyncio
     async def test_warmup_with_no_adapter(self, speech_server):
         assert speech_server._adapter is None
+        await speech_server.warmup()
+
+    @pytest.mark.asyncio
+    async def test_voxcpm2_warmup_successfully(self, speech_server, mocker):
+        speech_server._tts_model_type = "voxcpm2"
+        speech_server._adapter = speech_server._get_tts_adapter()
+        speech_server.uploaded_speakers = {}
+        speech_server._adapter.capabilities = replace(
+            speech_server._adapter.capabilities,
+            precomputed_speakers={},
+        )
+        speech_server.engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
+        speech_server.engine_client.generate = mocker.MagicMock(return_value=iter(()))
+        speech_server._build_voxcpm2_prompt = mocker.AsyncMock(
+            return_value={"prompt_token_ids": [1], "additional_information": {}}
+        )
+
         await speech_server.warmup()
 
 
