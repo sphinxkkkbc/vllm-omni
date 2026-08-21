@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import pack, repeat
+from vllm.model_executor.layers.linear import QKVParallelLinear
 
 # Conformer support layers
 
@@ -71,9 +72,17 @@ class MultiHeadedAttention(nn.Module):
         # We assume d_v always equals d_k
         self.d_k = n_feat // n_head
         self.h = n_head
-        self.linear_q = nn.Linear(n_feat, n_feat)
-        self.linear_k = nn.Linear(n_feat, n_feat, bias=key_bias)
-        self.linear_v = nn.Linear(n_feat, n_feat)
+        if not key_bias:
+            raise ValueError("QKVParallel Conformer requires key_bias=True")
+        self.linear_qkv = QKVParallelLinear(
+            hidden_size=n_feat,
+            head_size=self.d_k,
+            total_num_heads=self.h,
+            total_num_kv_heads=self.h,
+            bias=True,
+            disable_tp=True,
+            return_bias=False,
+        )
         self.linear_out = nn.Linear(n_feat, n_feat)
         self.dropout = nn.Dropout(p=dropout_rate)
 
@@ -97,9 +106,13 @@ class MultiHeadedAttention(nn.Module):
 
         """
         n_batch = query.size(0)
-        q = self.linear_q(query).view(n_batch, -1, self.h, self.d_k)
-        k = self.linear_k(key).view(n_batch, -1, self.h, self.d_k)
-        v = self.linear_v(value).view(n_batch, -1, self.h, self.d_k)
+        if query is not key or query is not value:
+            raise ValueError("Fused Conformer QKV requires self-attention inputs")
+        qkv = self.linear_qkv(query)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(n_batch, -1, self.h, self.d_k)
+        k = k.view(n_batch, -1, self.h, self.d_k)
+        v = v.view(n_batch, -1, self.h, self.d_k)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
@@ -388,9 +401,15 @@ class DiTAttention(torch.nn.Module):
         self.inner_dim = num_heads * head_dim
         self.scale = head_dim**-0.5
 
-        self.to_q = nn.Linear(dim, self.inner_dim, bias=qkv_bias)
-        self.to_k = nn.Linear(dim, self.inner_dim, bias=qkv_bias)
-        self.to_v = nn.Linear(dim, self.inner_dim, bias=qkv_bias)
+        self.to_qkv = QKVParallelLinear(
+            hidden_size=dim,
+            head_size=self.head_dim,
+            total_num_heads=self.num_heads,
+            total_num_kv_heads=self.num_heads,
+            bias=qkv_bias,
+            disable_tp=True,
+            return_bias=False,
+        )
 
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
@@ -410,9 +429,11 @@ class DiTAttention(torch.nn.Module):
         """
         b, t, c = x.shape
 
-        q = self.to_heads(self.to_q(x))
-        k = self.to_heads(self.to_k(x))
-        v = self.to_heads(self.to_v(x))
+        qkv = self.to_qkv(x)
+        q, k, v = qkv.split([self.inner_dim] * 3, dim=-1)
+        q = self.to_heads(q)
+        k = self.to_heads(k)
+        v = self.to_heads(v)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -437,9 +458,11 @@ class DiTAttention(torch.nn.Module):
         """
         b, t, c = x.shape
 
-        q = self.to_heads(self.to_q(x))
-        k = self.to_heads(self.to_k(x))
-        v = self.to_heads(self.to_v(x))
+        qkv = self.to_qkv(x)
+        q, k, v = qkv.split([self.inner_dim] * 3, dim=-1)
+        q = self.to_heads(q)
+        k = self.to_heads(k)
+        v = self.to_heads(v)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -480,28 +503,31 @@ class TimestepEmbedder(nn.Module):
         self.frequency_embedding_size = frequency_embedding_size
         # from SinusoidalPosEmb
         self.scale = 1000
+        half = frequency_embedding_size // 2
+        freqs = torch.exp(
+            -math.log(10000)
+            * torch.arange(half, dtype=torch.float32)
+            / half
+        )
+        self.register_buffer("freqs", freqs, persistent=False)
 
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
+    def timestep_embedding(self, t):
         """
         Create sinusoidal timestep embeddings.
         :param t: a 1-D Tensor of N indices, one per batch element.
                           These may be fractional.
-        :param dim: the dimension of the output.
-        :param max_period: controls the minimum frequency of the embeddings.
         :return: an (N, D) Tensor of positional embeddings.
         """
         # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
-        half = dim // 2
-        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half) / half).to(t)
+        freqs = self.freqs.to(t)
         args = t[:, None] * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
+        if self.frequency_embedding_size % 2:
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
     def forward(self, t):
-        t_freq = self.timestep_embedding(t * self.scale, self.frequency_embedding_size)
+        t_freq = self.timestep_embedding(t * self.scale)
         t_emb = self.mlp(t_freq)
         return t_emb
 

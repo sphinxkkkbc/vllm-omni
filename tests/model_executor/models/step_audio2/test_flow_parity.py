@@ -8,6 +8,7 @@ from vllm_omni.model_executor.models.step_audio2.cosyvoice2.cfm import CausalCon
 from vllm_omni.model_executor.models.step_audio2.cosyvoice2.dit import DiT
 from vllm_omni.model_executor.models.step_audio2.cosyvoice2.flow import CausalMaskedDiffWithXvec
 from vllm_omni.model_executor.models.step_audio2.cosyvoice2.upsample_encoder import UpsampleConformerEncoderV2
+from vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav import _load_flow_state_dict_strict
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -15,6 +16,16 @@ external_dit = pytest.importorskip("cosyvoice2.flow.decoder_dit")
 external_cfm = pytest.importorskip("cosyvoice2.flow.flow_matching")
 external_flow = pytest.importorskip("cosyvoice2.flow.flow")
 external_encoder = pytest.importorskip("cosyvoice2.transformer.upsample_encoder_v2")
+
+
+@pytest.fixture(autouse=True)
+def _qkv_parallel_test_environment(init_fake_tp_group, mocker):
+    from vllm.model_executor.layers.utils import default_unquantized_gemm
+
+    mocker.patch(
+        "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
+        return_value=default_unquantized_gemm,
+    )
 
 
 def _make_models() -> tuple[torch.nn.Module, torch.nn.Module]:
@@ -33,7 +44,7 @@ def _make_models() -> tuple[torch.nn.Module, torch.nn.Module]:
 
     # This is the same strict compatibility guarantee used when loading
     # Step-Audio2's flow.pt checkpoint at runtime.
-    vendored.load_state_dict(reference.state_dict(), strict=True)
+    _load_flow_state_dict_strict(vendored, reference.state_dict())
     return reference, vendored
 
 
@@ -93,7 +104,7 @@ def _make_flows() -> tuple[torch.nn.Module, torch.nn.Module]:
         DiT,
         UpsampleConformerEncoderV2,
     )
-    vendored.load_state_dict(reference.state_dict(), strict=True)
+    _load_flow_state_dict_strict(vendored, reference.state_dict())
     # rand_noise is intentionally non-persistent and therefore is not copied
     # by load_state_dict, but it is part of Flow inference semantics.
     vendored.decoder.rand_noise.copy_(reference.decoder.rand_noise)
