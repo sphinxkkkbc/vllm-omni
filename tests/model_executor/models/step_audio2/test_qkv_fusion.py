@@ -30,10 +30,7 @@ def _force_default_gemm(mocker):
 
 
 def _reference_projections(dim: int) -> dict[str, nn.Linear]:
-    return {
-        shard_id: nn.Linear(dim, dim, bias=True)
-        for shard_id in ("q", "k", "v")
-    }
+    return {shard_id: nn.Linear(dim, dim, bias=True) for shard_id in ("q", "k", "v")}
 
 
 def _load_qkv_shards(qkv: nn.Module, references: dict[str, nn.Linear]) -> None:
@@ -75,9 +72,7 @@ def test_conformer_qkv_matches_three_linears(init_fake_tp_group) -> None:
     hidden_states = torch.randn(2, 7, dim)
     actual = attention.forward_qkv(hidden_states, hidden_states, hidden_states)
     expected = tuple(
-        references[name](hidden_states)
-        .view(2, 7, num_heads, dim // num_heads)
-        .transpose(1, 2)
+        references[name](hidden_states).view(2, 7, num_heads, dim // num_heads).transpose(1, 2)
         for name in ("q", "k", "v")
     )
 
@@ -91,11 +86,7 @@ def test_timestep_frequency_buffer_matches_original_formula(init_fake_tp_group) 
     timestep = torch.tensor([0.0, 0.25, 0.75])
     scaled = timestep * embedder.scale
     half = embedder.frequency_embedding_size // 2
-    frequencies = torch.exp(
-        -math.log(10000)
-        * torch.arange(start=0, end=half)
-        / half
-    ).to(timestep)
+    frequencies = torch.exp(-math.log(10000) * torch.arange(start=0, end=half) / half).to(timestep)
     arguments = scaled[:, None] * frequencies[None]
     original_embedding = torch.cat(
         [torch.cos(arguments), torch.sin(arguments)],
@@ -155,18 +146,10 @@ def test_strict_loader_packs_qkv_and_loads_all_parameters(
 
     _load_flow_weights_strict(model, str(checkpoint_path))
 
-    expected_dit_weight = torch.cat(
-        [checkpoint[f"block.attn.to_{name}.weight"] for name in ("q", "k", "v")]
-    )
-    expected_dit_bias = torch.cat(
-        [checkpoint[f"block.attn.to_{name}.bias"] for name in ("q", "k", "v")]
-    )
-    expected_conformer_weight = torch.cat(
-        [checkpoint[f"block.linear_{name}.weight"] for name in ("q", "k", "v")]
-    )
-    expected_conformer_bias = torch.cat(
-        [checkpoint[f"block.linear_{name}.bias"] for name in ("q", "k", "v")]
-    )
+    expected_dit_weight = torch.cat([checkpoint[f"block.attn.to_{name}.weight"] for name in ("q", "k", "v")])
+    expected_dit_bias = torch.cat([checkpoint[f"block.attn.to_{name}.bias"] for name in ("q", "k", "v")])
+    expected_conformer_weight = torch.cat([checkpoint[f"block.linear_{name}.weight"] for name in ("q", "k", "v")])
+    expected_conformer_bias = torch.cat([checkpoint[f"block.linear_{name}.bias"] for name in ("q", "k", "v")])
     torch.testing.assert_close(model.block.attn.to_qkv.weight, expected_dit_weight)
     torch.testing.assert_close(model.block.attn.to_qkv.bias, expected_dit_bias)
     torch.testing.assert_close(model.block.linear_qkv.weight, expected_conformer_weight)

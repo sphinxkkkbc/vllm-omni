@@ -504,11 +504,7 @@ class TimestepEmbedder(nn.Module):
         # from SinusoidalPosEmb
         self.scale = 1000
         half = frequency_embedding_size // 2
-        freqs = torch.exp(
-            -math.log(10000)
-            * torch.arange(half, dtype=torch.float32)
-            / half
-        )
+        freqs = torch.exp(-math.log(10000) * torch.arange(half, dtype=torch.float32) / half)
         self.register_buffer("freqs", freqs, persistent=False)
 
     def timestep_embedding(self, t):

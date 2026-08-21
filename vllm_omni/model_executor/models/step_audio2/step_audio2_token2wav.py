@@ -80,9 +80,7 @@ def _load_flow_state_dict_strict(flow: nn.Module, state_dict: dict[str, torch.Te
 
     missing = sorted(set(params) - loaded_params)
     incomplete_shards = {
-        name: sorted({"q", "k", "v"} - shards)
-        for name, shards in loaded_shards.items()
-        if shards != {"q", "k", "v"}
+        name: sorted({"q", "k", "v"} - shards) for name, shards in loaded_shards.items() if shards != {"q", "k", "v"}
     }
     if incomplete_shards:
         raise RuntimeError(f"Missing Flow checkpoint QKV shards: {incomplete_shards}")
