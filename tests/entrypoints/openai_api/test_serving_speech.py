@@ -45,6 +45,7 @@ from vllm_omni.entrypoints.openai.serving_speech import (
 from vllm_omni.entrypoints.openai.tts_adapters.base import DEFAULT_TTS_LANGUAGES, PreparedRequest, SpeechServingContext
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_supported_speakers
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import MingTTSAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
     build_fish_voice_clone_prompt_ids,
@@ -270,31 +271,9 @@ def test_app(mocker: MockerFixture, tmp_path, monkeypatch):
     speech_server.create_speech = awaitable_patched_create_speech
 
     app = FastAPI()
+    app.state.openai_serving_speech = speech_server
     app.add_api_route("/v1/audio/speech", speech_server.create_speech, methods=["POST"], response_model=None)
-
-    # Add list_voices endpoint
-    async def list_voices():
-        speakers = sorted(speech_server._adapter.capabilities.supported_speakers)
-        uploaded_voices = []
-        if hasattr(speech_server, "uploaded_speakers"):
-            for voice_name, info in speech_server.uploaded_speakers.items():
-                voice_entry = {
-                    "name": info.get("name", voice_name),
-                    "consent": info.get("consent", ""),
-                    "created_at": info.get("created_at", 0),
-                    "file_size": info.get("file_size", 0),
-                    "mime_type": info.get("mime_type", ""),
-                    "embedding_source": info.get("embedding_source", "audio"),
-                    "embedding_dim": info.get("embedding_dim"),
-                }
-                if info.get("ref_text"):
-                    voice_entry["ref_text"] = info["ref_text"]
-                if info.get("speaker_description"):
-                    voice_entry["speaker_description"] = info["speaker_description"]
-                uploaded_voices.append(voice_entry)
-        return {"voices": speakers, "uploaded_voices": uploaded_voices}
-
-    app.add_api_route("/v1/audio/voices", list_voices, methods=["GET"])
+    app.add_api_route("/v1/audio/voices", api_server_module.list_voices, methods=["GET"])
     app.add_api_route("/v1/audio/speech/batch", speech_server.create_speech_batch, methods=["POST"])
 
     # Add upload_voice endpoint
@@ -466,9 +445,31 @@ class TestSpeechAPI:
         assert audio_obj.speed == 2.5
 
     def test_list_voices_endpoint(self, client):
+        handler = client.app.state.openai_serving_speech
+        handler._adapter.capabilities.supported_speakers = frozenset({"alice"})
+        handler._adapter.capabilities.precomputed_speakers = {"bob": {"name": "Bob"}}
+        handler.uploaded_speakers = {
+            "carol": {
+                "name": "Carol",
+                "created_at": 1,
+            }
+        }
+
         response = client.get("/v1/audio/voices")
+
         assert response.status_code == 200
-        assert "voices" in response.json()
+        assert response.json()["voices"] == ["alice", "bob", "carol", "default"]
+        assert response.json()["uploaded_voices"] == [
+            {
+                "name": "Carol",
+                "consent": "",
+                "created_at": 1,
+                "file_size": 0,
+                "mime_type": "",
+                "embedding_source": "audio",
+                "embedding_dim": None,
+            }
+        ]
 
     def test_upload_voice_success(self, client, tmp_path):
         """Test successful voice upload without ref_text."""
@@ -4156,6 +4157,32 @@ class TestTTSAsyncOffloading:
         yield server
         server.shutdown()
 
+    def test_voxtral_loads_supported_speakers(self, mocker: MockerFixture):
+        engine_client = mocker.MagicMock()
+        engine_client.model_config.hf_config.audio_config = {
+            "speaker_id": {
+                "Alice": 0,
+                "Bob": 1,
+            }
+        }
+
+        server = mocker.MagicMock()
+        adapter = VoxtralTTSAdapter(
+            SpeechServingContext(
+                server=server,
+                engine_client=engine_client,
+            )
+        )
+
+        adapter.load_capabilities()
+
+        assert adapter.capabilities.supported_speakers == frozenset(
+            {
+                "alice",
+                "bob",
+            }
+        )
+
     def test_prepare_speech_generation_awaits_voxtral_async(self, voxtral_server, mocker: MockerFixture):
         """Voxtral path in _prepare_speech_generation should call the async wrapper."""
         voxtral_server._build_voxtral_prompt_async = mocker.AsyncMock(
@@ -4232,9 +4259,7 @@ class TestTTSAsyncOffloading:
 
         assert adapter_model_type != legacy_tts_model_type
         assert any(
-            call.args
-            and call.args[0] == "TTS speech request %s: text=%r, model=%s"
-            and call.args[3] == adapter_model_type
+            call.args and call.args[0] == "TTS speech request %s: model=%s" and call.args[2] == adapter_model_type
             for call in log_info.call_args_list
         )
 
