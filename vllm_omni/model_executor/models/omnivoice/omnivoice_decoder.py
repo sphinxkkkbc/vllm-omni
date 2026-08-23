@@ -86,47 +86,8 @@ class OmniVoiceDecoder(nn.Module):
         self.fc2 = None
         self.acoustic_decoder = None
 
-    @staticmethod
-    def _mask_by_lengths(hidden_states: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        positions = torch.arange(hidden_states.shape[-1], device=hidden_states.device)
-        valid = positions.unsqueeze(0) < lengths.unsqueeze(1)
-        return hidden_states.masked_fill(~valid.unsqueeze(1), 0.0)
-
-    def _decode_acoustic_length_aware(
-        self,
-        hidden_states: torch.Tensor,
-        lengths: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run the non-causal DAC decoder while zeroing padded activations."""
-        decoder = self.acoustic_decoder
-        hidden_states = self._mask_by_lengths(hidden_states, lengths)
-        hidden_states = decoder.conv1(hidden_states)
-        hidden_states = self._mask_by_lengths(hidden_states, lengths)
-
-        for block in decoder.block:
-            hidden_states = block.snake1(hidden_states)
-            hidden_states = block.conv_t1(hidden_states)
-            stride = block.conv_t1.stride[0]
-            lengths = lengths * stride
-            hidden_states = self._mask_by_lengths(hidden_states, lengths)
-
-            for residual_unit in (block.res_unit1, block.res_unit2, block.res_unit3):
-                hidden_states = residual_unit(hidden_states)
-                hidden_states = self._mask_by_lengths(hidden_states, lengths)
-
-        hidden_states = decoder.snake1(hidden_states)
-        hidden_states = self._mask_by_lengths(hidden_states, lengths)
-        hidden_states = decoder.conv2(hidden_states)
-        hidden_states = self._mask_by_lengths(hidden_states, lengths)
-        hidden_states = decoder.tanh(hidden_states)
-        return self._mask_by_lengths(hidden_states, lengths)
-
     @torch.inference_mode()
-    def forward(
-        self,
-        audio_codes: torch.Tensor,
-        target_lens: list[int] | torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def forward(self, audio_codes: torch.Tensor) -> torch.Tensor:
         """Decode audio tokens to waveform.
 
         Args:
@@ -139,25 +100,6 @@ class OmniVoiceDecoder(nn.Module):
             raise RuntimeError("Decoder not loaded. Call load_weights() first.")
 
         device = audio_codes.device
-        if target_lens is None:
-            lengths = torch.full(
-                (audio_codes.shape[0],),
-                audio_codes.shape[-1],
-                dtype=torch.long,
-                device=device,
-            )
-        elif isinstance(target_lens, torch.Tensor):
-            lengths = target_lens.to(device=device, dtype=torch.long)
-        else:
-            lengths = torch.tensor(target_lens, device=device, dtype=torch.long)
-
-        if lengths.shape != (audio_codes.shape[0],):
-            raise ValueError(
-                f"Expected one target length per request, got shape {tuple(lengths.shape)} "
-                f"for batch size {audio_codes.shape[0]}."
-            )
-        if torch.any(lengths <= 0) or torch.any(lengths > audio_codes.shape[-1]):
-            raise ValueError(f"Target lengths must be in [1, {audio_codes.shape[-1]}], got {lengths.tolist()}.")
 
         # Transpose: [B, 8, T] → [8, B, T]
         codes = audio_codes.transpose(0, 1).long()
@@ -165,18 +107,19 @@ class OmniVoiceDecoder(nn.Module):
         # RVQ decode: sum codebook embeddings → [B, 1024, T]
         quantized = self.quantizer.decode(codes)
 
-        # Project: [B, 1024, T] → fc2 → [B, 256, T]. Keep the acoustic
-        # decoder in float32 to avoid ConvTranspose1d intermediate overflow.
+        # Project: [B, 1024, T] → fc2 → [B, 256, T]
+        # Cast to fc2 weight dtype (may be fp16 when checkpoint stores weights as fp16),
+        # then upcast back to float32 — acoustic decoder ConvTranspose1d upsampling
+        # produces intermediate values that exceed the fp16 range (~65504), causing NaN.
         quantized = self.fc2(quantized.transpose(1, 2).to(self.fc2.weight.dtype)).transpose(1, 2).float()
 
         # Acoustic decoder: [B, 256, T] → [B, 1, T*960]
-        if all(hasattr(self.acoustic_decoder, name) for name in ("conv1", "block", "snake1", "conv2", "tanh")):
-            audio = self._decode_acoustic_length_aware(quantized, lengths)
-        else:
-            audio = self.acoustic_decoder(quantized)
+        audio = self.acoustic_decoder(quantized)
 
+        # Ensure [B, 1, samples]
         if audio.dim() == 2:
             audio = audio.unsqueeze(1)
+
         return audio.to(device)
 
     def _adjust_output_padding(self, decoder: nn.Module):

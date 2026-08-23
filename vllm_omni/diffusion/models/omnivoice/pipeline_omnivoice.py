@@ -606,7 +606,7 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         target_offset = 0
         for target_len in batch_target_len:
             request_tokens = tokens[:, :, target_offset : target_offset + target_len]
-            audio = self.decoder(request_tokens, [target_len])
+            audio = self.decoder(request_tokens)
             outputs.append(DiffusionOutput(output=audio))
             target_offset += target_len
         return outputs
