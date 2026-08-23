@@ -244,7 +244,7 @@ def _gumbel_sample(logits: torch.Tensor, temperature: float, generator: torch.Ge
 
 
 # ---------------------------------------------------------------------------
-# Qwen3-style transformer blocks using PyTorch SDPA
+# Qwen3-style transformer blocks using PyTorch variable-length attention
 # ---------------------------------------------------------------------------
 
 
@@ -934,19 +934,25 @@ class OmniVoiceGenerator(nn.Module):
         """Run the full 32-step iterative unmasking generation.
 
         Args:
-            input_ids: [T, 8] packed as [cond0, uncond0, ...]
-            audio_mask: [T] - True for audio positions
-            cond_lens: conditional lengths per request
-            target_lens: List of target audio lengths per batch item
-            num_step: Number of unmasking steps
-            guidance_scale: CFG scale
-            t_shift: Time shift for schedule
-            layer_penalty_factor: Penalty for later codebooks
-            position_temperature: Gumbel temperature for position selection
-            class_temperature: Temperature for token prediction (0=greedy)
+            input_ids: Packed token IDs with shape ``[total_seq_len, 8]`` in
+                request-major ``[cond0, uncond0, ...]`` order.
+            audio_mask: Boolean audio-position mask with shape
+                ``[total_seq_len]``.
+            cond_lens: Conditional sequence length for each request.
+            target_lens: Target length for each request; also the corresponding
+                unconditional sequence length.
+            seed: One seed per request, a shared scalar seed, or ``None``.
+            num_step: Number of iterative unmasking steps.
+            guidance_scale: Classifier-free guidance scale.
+            t_shift: Time shift used to construct the unmasking schedule.
+            layer_penalty_factor: Penalty applied to later codebooks.
+            position_temperature: Gumbel temperature for position selection.
+            class_temperature: Token sampling temperature; zero selects greedy
+                decoding.
 
         Returns:
-            tokens: [1, 8, sum(target_lens)] - generated audio tokens
+            Packed generated audio tokens with shape
+            ``[1, 8, sum(target_lens)]``.
         """
         B = len(target_lens)
         device = input_ids.device

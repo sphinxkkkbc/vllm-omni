@@ -463,11 +463,10 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         layer_penalty_factor = self.layer_penalty_factor
 
         if use_cuda_graph:
-            # Float mask skips per-layer conversion; fp32 cast deferred to the per-item slices below.
+            # Replay a fixed packed-token bucket with dynamic varlen metadata.
             batch_logits = self.generator._cuda_graph_fwd(input_ids, audio_masks, cu_seqs, B)
         else:
-            # Recompute embeddings and RoPE from the current dynamically
-            # padded/reordered batch.
+            # Run packed eager attention for the current active requests.
             inputs_embeds = self.generator._prepare_embeddings(input_ids, audio_masks)
             hidden_states = self.generator._transformer_forward(inputs_embeds, cu_seqs)
             # fp32 cast deferred to the per-item slices below.
