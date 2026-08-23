@@ -37,6 +37,7 @@ from vllm_omni.model_executor.models.omnivoice.duration import RuleDurationEstim
 from vllm_omni.model_executor.models.omnivoice.omnivoice_decoder import OmniVoiceDecoder
 from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import (
     OmniVoiceGenerator,
+    _build_cu_seqs,
     _get_time_steps,
     _gumbel_sample,
 )
@@ -57,7 +58,7 @@ logger = init_logger(__name__)
 class _PreparedOmniVoiceRequest:
     input_ids: torch.Tensor
     audio_mask: torch.Tensor
-    attention_mask: torch.Tensor
+    cond_len: int
     target_len: int
     seed: int | None
 
@@ -331,29 +332,16 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         )
         cond_len = cond_ids.shape[1]
         uncond_ids = target_ids.clone()
-        uncond_len = target_len
-        max_len = max(cond_len, uncond_len)
-        if uncond_len < max_len:
-            pad = torch.full(
-                (num_cb, max_len - uncond_len),
-                mask_id,
-                dtype=torch.long,
-                device=self.device,
-            )
-            uncond_ids = torch.cat([uncond_ids, pad], dim=1)
+        input_ids = torch.cat([cond_ids, uncond_ids], dim=1).transpose(0, 1).contiguous()
 
-        input_ids = torch.stack([cond_ids, uncond_ids])
-        audio_mask = torch.zeros(2, max_len, dtype=torch.bool, device=self.device)
-        audio_mask[0, text_len:cond_len] = True
-        audio_mask[1, :uncond_len] = True
-        attention_mask = torch.zeros(2, 1, max_len, max_len, dtype=torch.bool, device=self.device)
-        attention_mask[0, :, :cond_len, :cond_len] = True
-        attention_mask[1, :, :uncond_len, :uncond_len] = True
+        max_len = input_ids.shape[0]
+        audio_mask = torch.zeros(max_len, dtype=torch.bool, device=self.device)
+        audio_mask[text_len:] = True
 
         return _PreparedOmniVoiceRequest(
             input_ids=input_ids,
             audio_mask=audio_mask,
-            attention_mask=attention_mask,
+            cond_len=cond_len,
             target_len=target_len,
             seed=seed,
         )
@@ -361,83 +349,24 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
     def _collate_request_inputs(
         self,
         prepared_requests: Sequence[_PreparedOmniVoiceRequest],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Right-pad requests and arrange rows as all cond followed by all uncond."""
-        max_len = max(request.input_ids.shape[-1] for request in prepared_requests)
-        input_pairs: list[torch.Tensor] = []
-        audio_mask_pairs: list[torch.Tensor] = []
-        attention_mask_pairs: list[torch.Tensor] = []
-        mask_id = self.config.audio_mask_id
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+        """Pack request-major [cond, uncond] token sequences."""
+        input_ids: list[torch.Tensor] = []
+        audio_masks: list[torch.Tensor] = []
+        cond_lens: list[int] = []
 
         for request in prepared_requests:
-            pad_len = max_len - request.input_ids.shape[-1]
-            input_ids = request.input_ids
+            input_id = request.input_ids
             audio_mask = request.audio_mask
-            attention_mask = request.attention_mask
-            if pad_len:
-                input_ids = F.pad(input_ids, (0, pad_len), value=mask_id)
-                audio_mask = F.pad(audio_mask, (0, pad_len), value=False)
-                attention_mask = F.pad(attention_mask, (0, pad_len, 0, pad_len), value=False)
-            input_pairs.append(input_ids)
-            audio_mask_pairs.append(audio_mask)
-            attention_mask_pairs.append(attention_mask)
+            cond_len = request.cond_len
+            input_ids.append(input_id)
+            audio_masks.append(audio_mask)
+            cond_lens.append(cond_len)
 
-        input_pairs_tensor = torch.stack(input_pairs, dim=0)
-        audio_mask_pairs_tensor = torch.stack(audio_mask_pairs, dim=0)
-        attention_mask_pairs_tensor = torch.stack(attention_mask_pairs, dim=0)
-        return (
-            torch.cat([input_pairs_tensor[:, 0], input_pairs_tensor[:, 1]], dim=0),
-            torch.cat([audio_mask_pairs_tensor[:, 0], audio_mask_pairs_tensor[:, 1]], dim=0),
-            torch.cat([attention_mask_pairs_tensor[:, 0], attention_mask_pairs_tensor[:, 1]], dim=0),
-        )
+        input_ids = torch.cat(input_ids, dim=0)
+        audio_masks = torch.cat(audio_masks, dim=0)
 
-    @staticmethod
-    def _request_major_to_cfg_major(x: torch.Tensor, batch_size: int) -> torch.Tensor:
-        """Convert [cond0, uncond0, ...] to [cond0, ..., uncond0, ...]."""
-        if x.shape[0] != 2 * batch_size:
-            raise ValueError(f"Expected {2 * batch_size} CFG rows for batch size {batch_size}, got {x.shape[0]}.")
-        pairs = x.reshape(batch_size, 2, *x.shape[1:])
-        return torch.cat([pairs[:, 0], pairs[:, 1]], dim=0)
-
-    @staticmethod
-    def _cfg_major_to_request_major(x: torch.Tensor, batch_size: int) -> torch.Tensor:
-        """Convert [cond0, ..., uncond0, ...] to [cond0, uncond0, ...]."""
-        if x.shape[0] != 2 * batch_size:
-            raise ValueError(f"Expected {2 * batch_size} CFG rows for batch size {batch_size}, got {x.shape[0]}.")
-        pairs = torch.stack([x[:batch_size], x[batch_size:]], dim=1)
-        return pairs.reshape(2 * batch_size, *x.shape[1:])
-
-    @staticmethod
-    def _split_audio_outputs(audio: torch.Tensor, target_lens: Sequence[int]) -> list[DiffusionOutput]:
-        """Split a padded waveform batch into one length-trimmed output per request."""
-        return [
-            DiffusionOutput(output=audio[i : i + 1, :, : target_len * 960]) for i, target_len in enumerate(target_lens)
-        ]
-
-    def prepare_state_batch(self, states: list[StepRequestState], new_request_ids: list[str]) -> list[StepRequestState]:
-        if not new_request_ids:
-            return states
-        else:
-            max_target_len = max([state.latents.shape[-1] for state in states])
-            if states[0].extra.get("max_target_len", None) == max_target_len:
-                states_to_repad = [state for state in states if state.request_id in new_request_ids]
-                self.repadding_state(states_to_repad, max_target_len)
-                return states
-
-            self.repadding_state(states, max_target_len)
-            return states
-
-    def repadding_state(self, states: list[StepRequestState], max_new_target_len: int) -> list[StepRequestState]:
-        for state in states:
-            num_pads = max_new_target_len - state.latents.shape[-1]
-            state.latents = F.pad(
-                state.latents,
-                (0, num_pads),
-                value=self.config.audio_mask_id,
-            )
-            state.extra["audio_mask"] = F.pad(state.extra["audio_mask"], (0, num_pads), value=False)
-            state.extra["attn_mask"] = F.pad(state.extra["attn_mask"], (0, num_pads, 0, num_pads), value=False)
-        return states
+        return input_ids, audio_masks, cond_lens
 
     def prepare_encode(self, state: StepRequestState) -> DiffusionRequestBatch:
         prompt = state.prompt if state.prompt else ""
@@ -447,10 +376,10 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             return prepared
         prepared_request = prepared
 
-        target_lens = prepared_request.target_len
+        cond_len = prepared_request.cond_len
+        target_len = prepared_request.target_len
         input_ids = prepared_request.input_ids
         audio_mask = prepared_request.audio_mask
-        attn_mask = prepared_request.attention_mask
         seed = prepared_request.seed
         device = self.device
         mask_id = self.config.audio_mask_id
@@ -461,16 +390,13 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         t_shift = self.t_shift
 
         # Initialize all target tokens as [MASK]
-        positions = torch.arange(target_lens, device=device).unsqueeze(0)
-        valid_target_mask = positions < torch.tensor(target_lens, device=device)
-        tokens = torch.zeros((1, num_codebooks, target_lens), dtype=torch.long, device=device)
-        tokens.masked_fill_(valid_target_mask.unsqueeze(1), mask_id)
+        tokens = torch.full((1, num_codebooks, target_len), mask_id, dtype=torch.long, device=device)
 
         timesteps = _get_time_steps(0.0, 1.0, num_step + 1, t_shift)
 
         # Compute unmasking schedule
         schedules = []
-        total_mask = target_lens * num_codebooks
+        total_mask = target_len * num_codebooks
         rem = total_mask
         sched = []
         for step in range(num_step):
@@ -496,9 +422,9 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         state.extra["layer_ids"] = layer_ids
         state.extra["generator"] = generator
         state.extra["t_shift"] = t_shift
-        state.extra["target_len"] = target_lens
+        state.extra["cond_len"] = cond_len
+        state.extra["target_len"] = target_len
         state.extra["audio_mask"] = audio_mask
-        state.extra["attn_mask"] = attn_mask
         state.extra["tokens"] = tokens
 
     def denoise_step(self, input_batch: InputBatch, *, states: Sequence[StepRequestState] | None = None, **kwargs: Any):
@@ -506,83 +432,84 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         input_ids = input_batch.latents
         layer_ids = states[0].extra["layer_ids"]
 
-        batch_audio_mask: list[torch.Tesor] = []
-        batch_attn_mask: list[torch.Tensor] = []
-        batch_target_len: list[int] = []
+        audio_masks: list[torch.Tensor] = []
+        target_lens: list[int] = []
         batch_tokens: list[torch.Tensor] = []
+        cond_lens: list[int] = []
 
         steps: list[int] = []
         schedules: list[torch.Tensor] = []
         generators: list[torch.Generator] = []
+        guidance_scales: list[float] = []
 
         for state in states:
-            batch_audio_mask.append(state.extra.get("audio_mask", None))
-            batch_attn_mask.append(state.extra.get("attn_mask", None))
-            guidance_scale = state.extra.get("guidance", self.guidance_scale)
-            batch_target_len.append(state.extra["target_len"])
+            audio_masks.append(state.extra.get("audio_mask", None))
+            cond_lens.append(state.extra["cond_len"])
+            target_lens.append(state.extra["target_len"])
             batch_tokens.append(state.extra["tokens"])
+            guidance_scales.append(state.extra.get("guidance", self.guidance_scale))
             generators.append(state.extra.get("generator", None))
             schedules.append(state.extra["schedules"])
             steps.append(state.step_index)
-        if len(batch_audio_mask) == 1:
-            batch_audio_mask = batch_audio_mask[0]
-            batch_attn_mask = batch_attn_mask[0]
-        else:
-            batch_audio_mask = torch.stack(batch_audio_mask, dim=0)
-            batch_attn_mask = torch.stack(batch_attn_mask, dim=0)
 
-        if len(batch_target_len) > 1:
-            batch_audio_mask = batch_audio_mask.reshape(-1, *batch_audio_mask.shape[2:])
-            batch_attn_mask = batch_attn_mask.reshape(-1, *batch_attn_mask.shape[2:])
+        audio_masks = torch.cat(audio_masks, dim=0)
 
-        B = len(batch_target_len)
-        target_lens = batch_target_len
-        input_ids = self._request_major_to_cfg_major(input_ids, B)
-        batch_audio_mask = self._request_major_to_cfg_major(batch_audio_mask, B)
-        batch_attn_mask = self._request_major_to_cfg_major(batch_attn_mask, B)
+        B = len(target_lens)
+        cu_seqs = _build_cu_seqs(cond_lens, target_lens, input_ids.device)
 
         mask_id = self.config.audio_mask_id
         position_temperature = self.position_temperature
         class_temperature = self.class_temperature
         layer_penalty_factor = self.layer_penalty_factor
 
-        c_lens = batch_attn_mask[:B, 0, 0].sum(dim=-1).tolist()
-
-        # Materialize the SDPA float mask once so the captured graph (and eager path) skip per-layer conversion.
-        sdpa_attn_mask = torch.zeros_like(batch_attn_mask, dtype=torch.float32).masked_fill_(
-            ~batch_attn_mask, float("-inf")
-        )
         if use_cuda_graph:
             # Float mask skips per-layer conversion; fp32 cast deferred to the per-item slices below.
-            batch_logits = self.generator._cuda_graph_fwd(input_ids, batch_audio_mask, sdpa_attn_mask)
+            batch_logits = self.generator._cuda_graph_fwd(input_ids, audio_masks, cu_seqs, B)
         else:
             # Recompute embeddings and RoPE from the current dynamically
             # padded/reordered batch.
-            inputs_embeds = self.generator._prepare_embeddings(input_ids, batch_audio_mask)
-            hidden_states = self.generator._transformer_forward(inputs_embeds, sdpa_attn_mask)
+            inputs_embeds = self.generator._prepare_embeddings(input_ids, audio_masks)
+            hidden_states = self.generator._transformer_forward(inputs_embeds, cu_seqs)
             # fp32 cast deferred to the per-item slices below.
             batch_logits = self.generator._get_logits(hidden_states)
-        # batch_logits: [2*B, 8, S, 1025]
+        # batch_logits: [8, total_seq_len, 1025]
+
+        target_offsets: list[int] = []
+        target_offset = 0
+        for target_len in target_lens:
+            target_offsets.append(target_offset)
+            target_offset += target_len
+
+        sequence_offsets: list[int] = []
+        sequence_offset = 0
+        for cond_len, target_len in zip(cond_lens, target_lens):
+            sequence_offsets.append(sequence_offset)
+            sequence_offset += cond_len + target_len
 
         for i in range(B):
             k = schedules[i][steps[i]]
             if k <= 0:
                 continue
 
-            c_len = c_lens[i]
+            c_len = cond_lens[i]
             t_len = target_lens[i]
 
             # Extract logits for target region; upcast only the slices we actually consume.
-            c_logits = batch_logits[i : i + 1, :, c_len - t_len : c_len, :].to(torch.float32)
-            u_logits = batch_logits[B + i : B + i + 1, :, :t_len, :].to(torch.float32)
+            request_start = sequence_offsets[i]
+            cond_end = request_start + c_len
+            uncond_start = cond_end
+
+            # Extract logits for target region; upcast only the slices we actually consume.
+            c_logits = batch_logits[:, cond_end - t_len : cond_end, :].unsqueeze(0).to(torch.float32)
+            u_logits = batch_logits[:, uncond_start : uncond_start + t_len, :].unsqueeze(0).to(torch.float32)
 
             # Classifier-free guidance. Fuse the chain: the two inner
             # log_softmax normalizers are per-position scalars that the final
             # shift-invariant log_softmax cancels, so guide on the raw logits
             # with a single softmax: log_softmax((1+s)*c - s*u). Exact.
-            if guidance_scale != 0:
+            if guidance_scales[i] != 0:
                 log_probs = F.log_softmax(
-                    (1.0 + guidance_scale) * c_logits - guidance_scale * u_logits,
+                    (1.0 + guidance_scales[i]) * c_logits - guidance_scales[i] * u_logits,
                     dim=-1,
                 )
             else:
@@ -620,10 +547,15 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             states[i].extra["tokens"] = sample_tokens
 
             # Mirror update into both cond and uncond input_ids halves for the next step.
-            input_ids[i, :, c_len - t_len : c_len] = sample_tokens.squeeze(0)
-            input_ids[B + i, :, :t_len] = sample_tokens.squeeze(0)
+            packed_sample_tokens = sample_tokens.squeeze(0).transpose(0, 1)
+            input_ids[cond_end - t_len : cond_end] = packed_sample_tokens
+            input_ids[uncond_start : uncond_start + t_len] = packed_sample_tokens
 
-        return self._cfg_major_to_request_major(input_ids, B)
+        # InputBatch reuses its latents buffer across steps. Returning that
+        # same storage would make the Runner persist per-request views into the
+        # cached destination; the next make_batch() would then copy overlapping
+        # source/destination slices. Break the alias at the lifecycle boundary.
+        return input_ids.clone()
 
     def step_scheduler(self, state: StepRequestState, noise_pred: torch.Tensor, **kwargs: Any):
         state.latents = noise_pred
@@ -654,13 +586,13 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             prepared_requests.append(prepared)
 
         batch_target_len = [request.target_len for request in prepared_requests]
-        seed = prepared_requests[-1].seed
-        batch_input_ids, batch_audio_mask, batch_attn_mask = self._collate_request_inputs(prepared_requests)
+        batch_seeds = [request.seed for request in prepared_requests]
+        batch_input_ids, batch_audio_mask, batch_cond_lens = self._collate_request_inputs(prepared_requests)
         # Run 32-step iterative unmasking
         tokens = self.generator(
             input_ids=batch_input_ids,
             audio_mask=batch_audio_mask,
-            attention_mask=batch_attn_mask,
+            cond_lens=batch_cond_lens,
             target_lens=batch_target_len,
             num_step=self.num_step,
             guidance_scale=self.guidance_scale,
@@ -668,11 +600,17 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             layer_penalty_factor=self.layer_penalty_factor,
             position_temperature=self.position_temperature,
             class_temperature=self.class_temperature,
-            seed=seed,
+            seed=batch_seeds,
         )
 
-        audio = self.decoder(tokens, batch_target_len)  # [B, 1, max_target_len * 960]
-        return self._split_audio_outputs(audio, batch_target_len)
+        outputs: list[DiffusionOutput] = []
+        target_offset = 0
+        for target_len in batch_target_len:
+            request_tokens = tokens[:, :, target_offset : target_offset + target_len]
+            audio = self.decoder(request_tokens, [target_len])
+            outputs.append(DiffusionOutput(output=audio))
+            target_offset += target_len
+        return outputs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights from model directory (not from the iterator).
