@@ -119,6 +119,26 @@ class TestOmniVoiceStepExecution:
         }
         openai_client.send_audio_speech_request(request_config)
 
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    def test_speech_auto_voice_batch_step_execution(self, omni_server, openai_client) -> None:
+        """The same seeded request must match in step-execution-batch and per-request execution."""
+        batch_request_config = {
+            "model": omni_server.model,
+            "input": get_prompt("text"),
+            "response_format": "wav",
+            "seed": 42,
+            "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
+            "extra_params": {
+                "num_inference_steps": 32,
+            },
+        }
+        single_request_config = dict(batch_request_config)
+        batch_r = openai_client.send_audio_speech_request(batch_request_config, request_num=2)
+        single_r = openai_client.send_audio_speech_request(single_request_config)[0]
+        assert len(batch_r) == 2
+        assert batch_r[0].audio_bytes == single_r.audio_bytes
+        assert batch_r[1].audio_bytes == single_r.audio_bytes
+
 
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 class TestOmniVoiceSeed:
