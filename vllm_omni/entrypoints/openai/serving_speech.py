@@ -3508,12 +3508,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
                 sampling = sampling_params_list[0]
 
+                # This change allows StepScheduler read total_steps from upper
+                # sampling.num_inference_steps, check diffusion/sched/step_scheduler:_get_total_steps
                 if "num_inference_steps" in extra:
-                    sampling.num_inference_steps = int(extra["num_inference_steps"])
+                    value = extra["num_inference_steps"]
+                    try:
+                        sampling.num_inference_steps = int(value)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("num_inference_steps must be an integer") from exc
 
                 if "guidance_scale" in extra:
-                    sampling.guidance_scale = float(extra["guidance_scale"])
-                    sampling.guidance_scale_provided = True
+                    value = extra["guidance_scale"]
+                    try:
+                        sampling.guidance_scale = float(value)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("guidance_scale must be a number") from exc
+
                 logger.info("Applied extra_params to diffusion: %s", extra)
 
             generator = self._diffusion_engine.generate(

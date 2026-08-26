@@ -916,6 +916,44 @@ class OmniVoiceGenerator(nn.Module):
         hidden_states = self._transformer_forward(hidden_states, cu_seqs, rope_table=rope_table)
         return self._get_logits(hidden_states)
 
+    def _unmask_one_request(
+        self,
+        c_logits: torch.Tensor,
+        u_logits: torch.Tensor,
+        sample_tokens: torch.Tensor,
+        *,
+        num_to_unmask: int | torch.Tensor,
+        guidance_scale: float,
+        generator: torch.Generator,
+        class_temperature: float,
+        position_temperature: float,
+        layer_penalty_factor: float,
+        layer_ids: torch.Tensor,
+    ) -> None:
+        """Sample and unmask one request in place from FP32 target logits."""
+        mask_id = self.config.audio_mask_id
+        if guidance_scale != 0:
+            log_probs = F.log_softmax(
+                (1.0 + guidance_scale) * c_logits - guidance_scale * u_logits,
+                dim=-1,
+            )
+        else:
+            log_probs = F.log_softmax(c_logits, dim=-1)
+        log_probs[..., mask_id] = -float("inf")
+        if class_temperature > 0.0:
+            pred_tokens = _gumbel_sample(log_probs, class_temperature, generator).argmax(dim=-1)
+        else:
+            pred_tokens = log_probs.argmax(dim=-1)
+        scores = log_probs.max(dim=-1)[0]
+        scores = scores - (layer_ids * layer_penalty_factor)
+        if position_temperature > 0.0:
+            scores = _gumbel_sample(scores, position_temperature, generator)
+        scores.masked_fill_(sample_tokens != mask_id, -float("inf"))
+        _, topk_idx = torch.topk(scores.flatten(), num_to_unmask)
+        flat_tokens = sample_tokens.flatten()
+        flat_tokens[topk_idx] = pred_tokens.flatten()[topk_idx]
+        sample_tokens.copy_(flat_tokens.view_as(sample_tokens))
+
     @torch.inference_mode()
     def forward(
         self,
