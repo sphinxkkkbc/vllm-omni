@@ -22,7 +22,6 @@ from typing import Any, ClassVar
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from tokenizers import Tokenizer as HFTokenizer
 from torch import nn
 from vllm.logger import init_logger
@@ -39,7 +38,6 @@ from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import (
     OmniVoiceGenerator,
     _build_cu_seqs,
     _get_time_steps,
-    _gumbel_sample,
 )
 from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 from vllm_omni.utils.speaker_cache import get_speaker_cache
@@ -174,7 +172,7 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         self.config = OmniVoiceConfig(**hf_config)
 
         # Build generator and decoder
-        self.generator = OmniVoiceGenerator(self.config)
+        self.generator = OmniVoiceGenerator(self.config, od_config)
         self.decoder = OmniVoiceDecoder(self.config)
 
         # Tokenizer (low-level, avoids HF tokenizer extra_special_tokens issue)
@@ -368,14 +366,15 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
 
         return input_ids, audio_masks, cond_lens
 
-    def prepare_encode(self, state: StepRequestState) -> DiffusionRequestBatch:
+    def prepare_encode(self, state: StepRequestState) -> StepRequestState:
         prompt = state.prompt if state.prompt else ""
         extra = state.sampling.extra_args or {}
         prepared = self._prepare_request_input(prompt, extra)
         if isinstance(prepared, DiffusionOutput):
-            return prepared
-        prepared_request = prepared
+            state.error = prepared.error
+            return state
 
+        prepared_request = prepared
         cond_len = prepared_request.cond_len
         target_len = prepared_request.target_len
         input_ids = prepared_request.input_ids
@@ -386,7 +385,10 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         num_codebooks = self.config.num_audio_codebook
         if seed is None:
             seed = random.randint(0, 2**63 - 1)
-        num_step = self.num_step
+        num_step = (
+            state.sampling.num_inference_steps if state.sampling.num_inference_steps is not None else self.num_step
+        )
+
         t_shift = self.t_shift
 
         # Initialize all target tokens as [MASK]
@@ -415,9 +417,12 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         layer_ids = torch.arange(num_codebooks, device=device).view(1, -1, 1)
         generator = torch.Generator(device=device).manual_seed(seed)
 
+        guidance_scale = (
+            state.sampling.guidance_scale if state.sampling.guidance_scale is not None else self.guidance_scale
+        )
         state.latents = input_ids
         state.timesteps = schedules
-        state.guidance = self.guidance_scale
+        state.guidance = guidance_scale
         state.extra["schedules"] = schedules
         state.extra["layer_ids"] = layer_ids
         state.extra["generator"] = generator
@@ -426,10 +431,11 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         state.extra["target_len"] = target_len
         state.extra["audio_mask"] = audio_mask
         state.extra["tokens"] = tokens
+        return state
 
     def denoise_step(self, input_batch: InputBatch, *, states: Sequence[StepRequestState] | None = None, **kwargs: Any):
-        use_cuda_graph = self.generator._cuda_graph_fwd is not None
         input_ids = input_batch.latents
+        use_cuda_graph = self.generator._cuda_graph_fwd is not None and input_ids.is_cuda
         layer_ids = states[0].extra["layer_ids"]
 
         audio_masks: list[torch.Tensor] = []
@@ -447,7 +453,7 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             cond_lens.append(state.extra["cond_len"])
             target_lens.append(state.extra["target_len"])
             batch_tokens.append(state.extra["tokens"])
-            guidance_scales.append(state.extra.get("guidance", self.guidance_scale))
+            guidance_scales.append(state.guidance)
             generators.append(state.extra.get("generator", None))
             schedules.append(state.extra["schedules"])
             steps.append(state.step_index)
@@ -457,18 +463,20 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         B = len(target_lens)
         cu_seqs = _build_cu_seqs(cond_lens, target_lens, input_ids.device)
 
-        mask_id = self.config.audio_mask_id
         position_temperature = self.position_temperature
         class_temperature = self.class_temperature
         layer_penalty_factor = self.layer_penalty_factor
-
         if use_cuda_graph:
             # Replay a fixed packed-token bucket with dynamic varlen metadata.
             batch_logits = self.generator._cuda_graph_fwd(input_ids, audio_masks, cu_seqs, B)
         else:
             # Run packed eager attention for the current active requests.
             inputs_embeds = self.generator._prepare_embeddings(input_ids, audio_masks)
-            hidden_states = self.generator._transformer_forward(inputs_embeds, cu_seqs)
+            hidden_states = self.generator._transformer_forward(
+                inputs_embeds,
+                cu_seqs,
+                max_seqlen=max(cond_lens),
+            )
             # fp32 cast deferred to the per-item slices below.
             batch_logits = self.generator._get_logits(hidden_states)
         # batch_logits: [8, total_seq_len, 1025]
@@ -501,54 +509,26 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             # Extract logits for target region; upcast only the slices we actually consume.
             c_logits = batch_logits[:, cond_end - t_len : cond_end, :].unsqueeze(0).to(torch.float32)
             u_logits = batch_logits[:, uncond_start : uncond_start + t_len, :].unsqueeze(0).to(torch.float32)
-
-            # Classifier-free guidance. Fuse the chain: the two inner
-            # log_softmax normalizers are per-position scalars that the final
-            # shift-invariant log_softmax cancels, so guide on the raw logits
-            # with a single softmax: log_softmax((1+s)*c - s*u). Exact.
-            if guidance_scales[i] != 0:
-                log_probs = F.log_softmax(
-                    (1.0 + guidance_scales[i]) * c_logits - guidance_scales[i] * u_logits,
-                    dim=-1,
-                )
-            else:
-                log_probs = F.log_softmax(c_logits, dim=-1)
-
-            # Prevent predicting [MASK]
-            log_probs[..., mask_id] = -float("inf")
-
-            # Token prediction
-            if class_temperature > 0.0:
-                pred_tokens = _gumbel_sample(log_probs, class_temperature, generators[i]).argmax(dim=-1)
-            else:
-                pred_tokens = log_probs.argmax(dim=-1)  # [1, 8, T]
-
-            # Confidence scores
-            scores = log_probs.max(dim=-1)[0]  # [1, 8, T]
-
-            # Layer penalty (earlier codebooks get higher priority)
-            scores = scores - (layer_ids * layer_penalty_factor)
-
-            # Gumbel noise for position selection
-            if position_temperature > 0.0:
-                scores = _gumbel_sample(scores, position_temperature, generators[i])
-
-            # Mask out already unmasked positions
             sample = batch_tokens[i]
             sample_tokens = sample[..., :t_len]
-            scores.masked_fill_(sample_tokens != mask_id, -float("inf"))
-
-            # Select top-k positions to unmask. .flatten() on this non-contiguous view already copies.
-            _, topk_idx = torch.topk(scores.flatten(), k)
-            flat_tokens = sample_tokens.flatten()
-            flat_tokens[topk_idx] = pred_tokens.flatten()[topk_idx]
-            sample_tokens.copy_(flat_tokens.view_as(sample_tokens))
-            states[i].extra["tokens"] = sample_tokens
+            self.generator._unmask_one_request(
+                c_logits,
+                u_logits,
+                sample_tokens,
+                num_to_unmask=k,
+                guidance_scale=guidance_scales[i],
+                generator=generators[i],
+                class_temperature=class_temperature,
+                position_temperature=position_temperature,
+                layer_penalty_factor=layer_penalty_factor,
+                layer_ids=layer_ids,
+            )
 
             # Mirror update into both cond and uncond input_ids halves for the next step.
             packed_sample_tokens = sample_tokens.squeeze(0).transpose(0, 1)
             input_ids[cond_end - t_len : cond_end] = packed_sample_tokens
             input_ids[uncond_start : uncond_start + t_len] = packed_sample_tokens
+            states[i].extra["tokens"] = sample_tokens
 
         # InputBatch reuses its latents buffer across steps. Returning that
         # same storage would make the Runner persist per-request views into the
@@ -576,25 +556,35 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
            "lang": "...", "instruct": "..."}
         """
         prepared_requests: list[_PreparedOmniVoiceRequest] = []
-        for request in req.requests:
+        outputs = [None] * len(req.requests)
+        prepared_indices: list[int] = []
+        for i, request in enumerate(req.requests):
             prompt = request.prompt if request.prompt else ""
             extra = request.sampling_params.extra_args or {}
             prepared = self._prepare_request_input(prompt, extra)
             if isinstance(prepared, DiffusionOutput):
-                return prepared
+                outputs[i] = prepared
+                continue
+            prepared_indices.append(i)
             prepared_requests.append(prepared)
+
+        if not prepared_requests:
+            return outputs
 
         batch_target_len = [request.target_len for request in prepared_requests]
         batch_seeds = [request.seed for request in prepared_requests]
         batch_input_ids, batch_audio_mask, batch_cond_lens = self._collate_request_inputs(prepared_requests)
         # Run 32-step iterative unmasking
+        sampling = req.requests[0].sampling_params
+        num_step = sampling.num_inference_steps if sampling.num_inference_steps is not None else self.num_step
+        guidance_scale = sampling.guidance_scale if sampling.guidance_scale is not None else self.guidance_scale
         tokens = self.generator(
             input_ids=batch_input_ids,
             audio_mask=batch_audio_mask,
             cond_lens=batch_cond_lens,
             target_lens=batch_target_len,
-            num_step=self.num_step,
-            guidance_scale=self.guidance_scale,
+            num_step=num_step,
+            guidance_scale=guidance_scale,
             t_shift=self.t_shift,
             layer_penalty_factor=self.layer_penalty_factor,
             position_temperature=self.position_temperature,
@@ -602,12 +592,11 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             seed=batch_seeds,
         )
 
-        outputs: list[DiffusionOutput] = []
         target_offset = 0
-        for target_len in batch_target_len:
+        for i, target_len in enumerate(batch_target_len):
             request_tokens = tokens[:, :, target_offset : target_offset + target_len]
             audio = self.decoder(request_tokens)
-            outputs.append(DiffusionOutput(output=audio))
+            outputs[prepared_indices[i]] = DiffusionOutput(output=audio)
             target_offset += target_len
         return outputs
 

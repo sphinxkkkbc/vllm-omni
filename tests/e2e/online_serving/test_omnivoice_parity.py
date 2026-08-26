@@ -19,16 +19,17 @@ MODEL = "k2-fsa/OmniVoice"
 STAGE_CONFIG = get_deploy_config_path("omnivoice.yaml")
 PROMPT = "The weather is nice today, perfect for a walk in the park."
 
+payload = {
+    "model": MODEL,
+    "input": PROMPT,
+    "language": "English",
+    "seed": 42,
+    "response_format": "wav",
+    "extra_params": {"num_inference_steps": 32},
+}
 
-def _generate_once(server_args: list[str]) -> bytes:
-    payload = {
-        "model": MODEL,
-        "input": PROMPT,
-        "language": "English",
-        "seed": 42,
-        "response_format": "wav",
-        "extra_params": {"num_inference_steps": 32},
-    }
+
+def _generate_without_graph(server_args: list[str]) -> bytes:
     with OmniServer(
         MODEL,
         server_args,
@@ -45,10 +46,25 @@ def _generate_once(server_args: list[str]) -> bytes:
         return response.content
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_request_mode_and_step_execution_b1_parity() -> None:
-    """B=1 request mode and step execution must produce identical seeded WAV bytes."""
-    common_args = [
+def _generate_with_graph(server_args: list[str]) -> bytes:
+    with OmniServer(
+        MODEL,
+        server_args,
+        use_omni=True,
+    ) as server:
+        response = requests.post(
+            f"http://{server.host}:{server.port}/v1/audio/speech",
+            json=payload,
+            timeout=600,
+        )
+        response.raise_for_status()
+        assert response.content.startswith(b"RIFF")
+        return response.content
+
+
+def _common_args() -> list[str]:
+    """Return the shared B=1 server arguments for parity tests."""
+    return [
         "--trust-remote-code",
         "--disable-log-stats",
         "--deploy-config",
@@ -57,7 +73,24 @@ def test_request_mode_and_step_execution_b1_parity() -> None:
         "1",
     ]
 
-    request_audio = _generate_once(common_args)
-    step_audio = _generate_once([*common_args, "--step-execution", "--enforce-eager"])
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_request_mode_and_step_execution_b1_parity_without_graph() -> None:
+    """B=1 eager request and step modes must produce identical seeded WAV bytes."""
+    common_args = _common_args()
+
+    request_audio = _generate_without_graph(common_args)
+    step_audio = _generate_without_graph([*common_args, "--step-execution", "--enforce-eager"])
+
+    assert request_audio == step_audio
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_request_mode_and_step_execution_b1_parity_with_graph() -> None:
+    """B=1 Graph request and step modes must produce identical seeded WAV bytes."""
+    common_args = _common_args()
+
+    request_audio = _generate_with_graph(common_args)
+    step_audio = _generate_with_graph([*common_args, "--step-execution", "--enforce-eager"])
 
     assert request_audio == step_audio

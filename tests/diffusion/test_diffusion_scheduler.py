@@ -272,6 +272,7 @@ class TestGetRequestBatchSamplingParamsKey:
     def _make(
         *,
         num_inference_steps: int = 2,
+        guidance_scale: float | None = None,
         seed: int | None = 123,
         generator: torch.Generator | None = None,
         extra_args: dict | None = None,
@@ -279,6 +280,7 @@ class TestGetRequestBatchSamplingParamsKey:
     ) -> OmniDiffusionRequest:
         sp = OmniDiffusionSamplingParams(
             num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
             seed=seed,
             generator=generator,
             extra_args=extra_args or {},
@@ -836,6 +838,35 @@ class TestRequestScheduler:
         first = scheduler.schedule()
 
         assert _new_ids(first) == [req_id_a]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 1
+
+    def test_batches_different_guidance_scales_separately(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        first_id = scheduler.add_request(
+            _make_step_request(
+                "guidance-2",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=2,
+                    guidance_scale=2.0,
+                ),
+            )
+        )
+        scheduler.add_request(
+            _make_step_request(
+                "guidance-7",
+                sampling_params=OmniDiffusionSamplingParams(
+                    num_inference_steps=2,
+                    guidance_scale=7.0,
+                ),
+            )
+        )
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == [first_id]
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 1
 
