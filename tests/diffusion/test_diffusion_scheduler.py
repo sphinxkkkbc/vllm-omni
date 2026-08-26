@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import queue
@@ -141,7 +141,7 @@ class _StubScheduler:
         self._output = output
         self.initialized_with = None
         self._request_id = request.request_id
-        self._state = None
+        self._state: SimpleNamespace | None = None
         self._scheduled = False
         self.max_num_running_reqs = 1
 
@@ -272,7 +272,6 @@ class TestGetRequestBatchSamplingParamsKey:
     def _make(
         *,
         num_inference_steps: int = 2,
-        guidance_scale: float | None = None,
         seed: int | None = 123,
         generator: torch.Generator | None = None,
         extra_args: dict | None = None,
@@ -280,7 +279,6 @@ class TestGetRequestBatchSamplingParamsKey:
     ) -> OmniDiffusionRequest:
         sp = OmniDiffusionSamplingParams(
             num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
             seed=seed,
             generator=generator,
             extra_args=extra_args or {},
