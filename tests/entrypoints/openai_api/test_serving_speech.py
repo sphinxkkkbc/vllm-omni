@@ -1783,14 +1783,14 @@ class TestTTSMethods:
         )
         speech_server.engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
         speech_server.engine_client.generate = mocker.MagicMock(return_value="generator")
-        speech_server._build_voxcpm2_prompt = mocker.AsyncMock(
+        speech_server._adapter._build_prompt = mocker.AsyncMock(
             return_value={"prompt_token_ids": [1], "additional_information": {}}
         )
 
         with pytest.raises(ValueError, match="Invalid voice 'bob'"):
             asyncio.run(speech_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="Hello", voice="Bob")))
 
-        speech_server._build_voxcpm2_prompt.assert_not_awaited()
+        speech_server._adapter._build_prompt.assert_not_awaited()
         speech_server.engine_client.generate.assert_not_called()
 
     def test_prepare_voxcpm2_accepts_default_voice(self, speech_server, mocker):
@@ -2677,7 +2677,7 @@ class TestTTSMethods:
         )
         speech_server.engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
         speech_server.engine_client.generate = mocker.MagicMock(return_value=iter(()))
-        speech_server._build_voxcpm2_prompt = mocker.AsyncMock(
+        speech_server._adapter._build_prompt = mocker.AsyncMock(
             return_value={"prompt_token_ids": [1], "additional_information": {}}
         )
 
@@ -3866,7 +3866,7 @@ class TestFishSpeechServing:
         assert "<|speaker:0|>你好，[laughing]欢迎回来。<|speaker:1|>我也来了。" in encoded_texts
         assert all(allowed_special is None for _, _, allowed_special in tokenizer.calls)
 
-    async def test_build_fish_clone_prompt_normalizes_text_fields(self, fish_speech_server, mocker: MockerFixture):
+    def test_build_fish_clone_prompt_normalizes_text_fields(self, fish_speech_server, mocker: MockerFixture):
         fish_speech_server._adapter._tokenizer = _FakeFishTokenizer()
         fish_speech_server._adapter._estimate_prompt_len = mocker.MagicMock(return_value=123)
 
@@ -4454,16 +4454,12 @@ class TestMingFlashOmniTTSServing:
         assert "ref_audio" in error
 
     def test_ming_flash_omni_tts_adapter_builds_prompt(self, ming_flash_omni_tts_server, mocker: MockerFixture):
-        ming_flash_omni_tts_server._adapter.build = mocker.AsyncMock(
-            return_value=PreparedRequest(
-                prompt={"prompt_token_ids": [1, 2, 3], "additional_information": {"voice": ["test"]}},
-                tts_params={},
-                model_type="ming_flash_omni_tts",
-            ),
+        ming_flash_omni_tts_server._adapter._build_prompt = mocker.MagicMock(
+            return_value={"prompt_token_ids": [1, 2, 3], "additional_information": {"voice": ["test"]}}
         )
         request = OpenAICreateSpeechRequest(input="Hello", voice="test")
         asyncio.run(ming_flash_omni_tts_server._prepare_speech_generation(request))
-        ming_flash_omni_tts_server._adapter.build.assert_called_once()
+        ming_flash_omni_tts_server._adapter._build_prompt.assert_called_once_with(request)
 
 
 class TestTTSAsyncOffloading:
@@ -4765,7 +4761,7 @@ class TestTTSAsyncOffloading:
         """Base explicit true should reach the model prompt additional_information."""
         qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
         qwen3_tts_server._resolve_ref_audio = mocker.AsyncMock(return_value=([0.0] * 48000, 24000, "fake_cache_key"))
-        qwen3_tts_server._adapter._get_resolved_ref_audio_artifact_key = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._get_resolved_ref_audio_artifact_key = mocker.MagicMock(return_value=None)
         qwen3_tts_server._adapter._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
 
         request = OpenAICreateSpeechRequest(
