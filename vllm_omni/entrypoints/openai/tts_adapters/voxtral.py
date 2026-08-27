@@ -21,7 +21,6 @@ class VoxtralTTSAdapter(ARTTSAdapter):
 
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
-        self._tokenizer = None
         self._build_prompt_async = make_async(self._build_prompt, executor=getattr(ctx.server, "_tts_executor", None))
 
     def _build_prompt(self, request: "OpenAICreateSpeechRequest") -> dict[str, Any]:
@@ -33,16 +32,21 @@ class VoxtralTTSAdapter(ARTTSAdapter):
             raise ValueError("Voxtral requires either a voice name or ref_audio.")
         if isinstance(ref_audio, str) and ref_audio.startswith("data:"):
             _, _, ref_audio = ref_audio.partition(",")
-        if self._tokenizer is None:
+        server = self.ctx.server
+        if server._tts_tokenizer is None:
             from vllm.tokenizers import cached_tokenizer_from_config
 
-            self._tokenizer = cached_tokenizer_from_config(self.ctx.engine_client.model_config).instruct
+            server._tts_tokenizer = cached_tokenizer_from_config(self.ctx.engine_client.model_config).instruct
         if request.voice is not None:
-            tokenized = self._tokenizer.encode_speech_request(SpeechRequest(input=request.input, voice=request.voice))
+            tokenized = server._tts_tokenizer.encode_speech_request(
+                SpeechRequest(input=request.input, voice=request.voice)
+            )
             prompt = tokens_input(prompt_token_ids=tokenized.tokens)
             prompt["additional_information"] = {"voice": [request.voice]}
             return prompt
-        tokenized = self._tokenizer.encode_speech_request(SpeechRequest(input=request.input, ref_audio=ref_audio))
+        tokenized = server._tts_tokenizer.encode_speech_request(
+            SpeechRequest(input=request.input, ref_audio=ref_audio)
+        )
         audio = tokenized.audios[0]
         return {
             "prompt_token_ids": tokenized.tokens,

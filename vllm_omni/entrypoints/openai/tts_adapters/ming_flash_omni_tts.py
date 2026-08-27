@@ -61,9 +61,7 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
             return "'max_new_tokens' must be a positive integer"
         return None
 
-    async def build(
-        self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
-    ) -> PreparedRequest:
+    def _build_prompt(self, request: "OpenAICreateSpeechRequest") -> dict:
         from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
             DEFAULT_PROMPT,
             create_instruction,
@@ -88,6 +86,12 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
             info["spk_emb"] = list(request.speaker_embedding)
         prompt = tokens_input(prompt_token_ids=[0])
         prompt["additional_information"] = info
+        return prompt
+
+    async def build(
+        self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
+    ) -> PreparedRequest:
+        prompt = self._build_prompt(request)
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="ming_flash_omni_tts")
 
     def _load_supported_speakers(self) -> set[str]:
