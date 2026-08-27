@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Deterministic unit tests for higgs-audio v3.
 
 These tests verify AC-1 (config), AC-3 (prompt), AC-4 (fused modules),
@@ -10,13 +11,15 @@ import asyncio
 import json
 import os
 import time
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+from vllm_omni.entrypoints.openai.tts_adapters.higgs_audio_v3 import HiggsAudioV3Adapter
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -1471,31 +1474,21 @@ class TestVoiceCloneReferenceCache:
         assert tok._resolve_audio_tokenizer_dir() is None
 
     def test_higgs_v3_ref_code_cache_returns_clone(self):
-        from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
-
-        serving = object.__new__(OmniOpenAIServingSpeech)
-        serving._higgs_audio_v3_ref_code_cache = OrderedDict()
-        serving._higgs_audio_v3_ref_code_cache_bytes = 0
-        serving._higgs_audio_v3_ref_code_inflight = {}
+        adapter = HiggsAudioV3Adapter(SpeechServingContext(server=SimpleNamespace()))
 
         codes = torch.arange(16, dtype=torch.long).reshape(2, 8)
-        serving._put_higgs_audio_v3_ref_codes("ref-a", codes)
+        adapter._put_higgs_audio_v3_ref_codes("ref-a", codes)
 
-        cached = serving._get_higgs_audio_v3_ref_codes("ref-a")
+        cached = adapter._get_higgs_audio_v3_ref_codes("ref-a")
         assert cached is not None
         cached.fill_(0)
 
-        cached_again = serving._get_higgs_audio_v3_ref_codes("ref-a")
+        cached_again = adapter._get_higgs_audio_v3_ref_codes("ref-a")
         assert cached_again is not None
         assert torch.equal(cached_again, codes)
 
     def test_higgs_v3_ref_code_inflight_deduplicates_concurrent_encode(self):
-        from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
-
-        serving = object.__new__(OmniOpenAIServingSpeech)
-        serving._higgs_audio_v3_ref_code_cache = OrderedDict()
-        serving._higgs_audio_v3_ref_code_cache_bytes = 0
-        serving._higgs_audio_v3_ref_code_inflight = {}
+        adapter = HiggsAudioV3Adapter(SpeechServingContext(server=SimpleNamespace()))
         calls = 0
 
         def encode_reference_audio(_wav, _sr):
@@ -1510,7 +1503,7 @@ class TestVoiceCloneReferenceCache:
         async def run():
             return await asyncio.gather(
                 *[
-                    serving._resolve_higgs_audio_v3_ref_codes(
+                    adapter._resolve_higgs_audio_v3_ref_codes(
                         "ref-a",
                         object(),
                         24000,
@@ -1529,7 +1522,7 @@ class TestVoiceCloneReferenceCache:
             assert torch.equal(codes, torch.arange(16, dtype=torch.long).reshape(2, 8) + 1)
 
         cached, cache_hit, inflight_wait = asyncio.run(
-            serving._resolve_higgs_audio_v3_ref_codes(
+            adapter._resolve_higgs_audio_v3_ref_codes(
                 "ref-a",
                 object(),
                 24000,

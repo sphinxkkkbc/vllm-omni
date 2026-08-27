@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Base contract for per-model TTS serving adapters.
 
 This package factors the per-model ``if self._tts_model_type == ...`` dispatch
@@ -10,8 +11,8 @@ instead of editing the shared serving module in ~10 scattered places.
 See the RFC for the full design (issue #4327).
 """
 
+import hashlib
 from abc import ABC, abstractmethod
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -36,22 +37,38 @@ DEFAULT_TTS_LANGUAGES = frozenset(
     }
 )
 
-_conditioning_cache_salt_fn: "Callable[..., str] | None" = None
 
-
-def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: dict) -> str:
-    """Return the conditioning cache salt for ``request`` + ``tts_params``.
-
-    Lazily imports and caches ``serving_speech._conditioning_cache_salt`` on first
-    use: the import is deferred to break the adapters<->serving_speech import
-    cycle, and cached so it resolves once instead of on every ``build()`` call.
-    """
-    global _conditioning_cache_salt_fn
-    if _conditioning_cache_salt_fn is None:
-        from vllm_omni.entrypoints.openai.serving_speech import _conditioning_cache_salt
-
-        _conditioning_cache_salt_fn = _conditioning_cache_salt
-    return _conditioning_cache_salt_fn(request, tts_params)
+def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: dict | None = None) -> str:
+    """Hash the effective Stage-0 conditioning used with placeholder prompts."""
+    h = hashlib.sha256()
+    for part in (
+        request.input,
+        request.task_type,
+        request.language,
+        request.voice,
+        request.ref_text,
+        request.ref_audio,
+        request.instructions,
+        request.x_vector_only_mode,
+        request.speaker_embedding,
+    ):
+        h.update(b"\x00")
+        if part is not None:
+            h.update(repr(part).encode("utf-8"))
+    for key in (
+        "voice_created_at",
+        "task_type",
+        "speaker",
+        "ref_text",
+        "x_vector_only_mode",
+        "ref_audio_cache_key",
+        "ref_audio_2_cache_key",
+    ):
+        h.update(b"\x00")
+        value = tts_params.get(key) if tts_params is not None else None
+        if value is not None:
+            h.update(repr(value).encode("utf-8"))
+    return h.hexdigest()[:32]
 
 
 def apply_max_new_tokens(
