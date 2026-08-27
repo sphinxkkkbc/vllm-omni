@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -14,8 +14,31 @@ from vllm_omni.diffusion.models.omnivoice.pipeline_omnivoice import (
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import (
+    _attention_metadata_from_cu_seqs,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_sdpa_fallback_mask_preserves_packed_sequence_boundaries() -> None:
+    cu_seqs = torch.tensor([0, 2, 3, 6, 6], dtype=torch.int32)
+
+    metadata = _attention_metadata_from_cu_seqs(cu_seqs, 6, needs_sdpa_mask=True)
+
+    assert metadata.attn_mask is not None
+    expected = torch.tensor(
+        [
+            [1, 1, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0],
+            [0, 0, 0, 1, 1, 1],
+            [0, 0, 0, 1, 1, 1],
+            [0, 0, 0, 1, 1, 1],
+        ],
+        dtype=torch.bool,
+    )
+    torch.testing.assert_close(metadata.attn_mask[0, 0], expected)
 
 
 def test_request_batch_prepare_error_does_not_skip_valid_request() -> None:
