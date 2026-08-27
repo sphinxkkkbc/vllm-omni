@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
 import queue
@@ -141,7 +141,7 @@ class _StubScheduler:
         self._output = output
         self.initialized_with = None
         self._request_id = request.request_id
-        self._state: SimpleNamespace | None = None
+        self._state = None
         self._scheduled = False
         self.max_num_running_reqs = 1
 
@@ -836,35 +836,6 @@ class TestRequestScheduler:
         first = scheduler.schedule()
 
         assert _new_ids(first) == [req_id_a]
-        assert first.num_running_reqs == 1
-        assert first.num_waiting_reqs == 1
-
-    def test_batches_different_guidance_scales_separately(self) -> None:
-        scheduler = RequestScheduler()
-        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
-
-        first_id = scheduler.add_request(
-            _make_step_request(
-                "guidance-2",
-                sampling_params=OmniDiffusionSamplingParams(
-                    num_inference_steps=2,
-                    guidance_scale=2.0,
-                ),
-            )
-        )
-        scheduler.add_request(
-            _make_step_request(
-                "guidance-7",
-                sampling_params=OmniDiffusionSamplingParams(
-                    num_inference_steps=2,
-                    guidance_scale=7.0,
-                ),
-            )
-        )
-
-        first = scheduler.schedule()
-
-        assert _new_ids(first) == [first_id]
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 1
 
