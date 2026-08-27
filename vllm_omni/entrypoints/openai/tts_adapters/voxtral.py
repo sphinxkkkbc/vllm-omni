@@ -44,9 +44,7 @@ class VoxtralTTSAdapter(ARTTSAdapter):
             prompt = tokens_input(prompt_token_ids=tokenized.tokens)
             prompt["additional_information"] = {"voice": [request.voice]}
             return prompt
-        tokenized = server._tts_tokenizer.encode_speech_request(
-            SpeechRequest(input=request.input, ref_audio=ref_audio)
-        )
+        tokenized = server._tts_tokenizer.encode_speech_request(SpeechRequest(input=request.input, ref_audio=ref_audio))
         audio = tokenized.audios[0]
         return {
             "prompt_token_ids": tokenized.tokens,
