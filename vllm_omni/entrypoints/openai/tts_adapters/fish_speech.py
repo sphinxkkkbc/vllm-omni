@@ -79,6 +79,12 @@ class FishSpeechAdapter(ARTTSAdapter):
         ref_audio_data: tuple[list[float], int] | None,
         has_inline_ref_audio: bool,
     ) -> dict[str, Any]:
+        """Build either the text-only or structured Fish Speech clone prompt.
+
+        Structured clone metadata uses concrete scalar fields because model-side
+        preprocess consumes one request directly; text-only metadata retains the
+        legacy single-item list representation used across EngineCore IPC.
+        """
         from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
             build_fish_text_only_prompt_ids,
             normalize_fish_voice_clone_texts,
@@ -90,26 +96,29 @@ class FishSpeechAdapter(ARTTSAdapter):
             info: dict[str, Any] = {"text": [normalized_text]}
             if request.max_new_tokens is not None:
                 info["max_new_tokens"] = [request.max_new_tokens]
-        else:
-            wav_samples, sr = ref_audio_data
-            normalized_text, normalized_ref_text = normalize_fish_voice_clone_texts(request.input, request.ref_text)
-            prompt_ids = [1] * self._estimate_prompt_len(normalized_text, normalized_ref_text, ref_audio_data)
-            info = {
-                "text": normalized_text,
-                "ref_text": normalized_ref_text,
-                "ref_audio_wav": torch.from_numpy(np.asarray(wav_samples, dtype=np.float32)),
-                "ref_audio_sr": int(sr),
-                "fish_structured_voice_clone": True,
-            }
-            server = self.ctx.server
-            if request.voice is not None:
-                voice_lower = request.voice.lower()
-                if voice_lower in server.uploaded_speakers and not has_inline_ref_audio:
-                    info["voice_name"] = voice_lower
-                    info["voice_created_at"] = server._voice_created_at(voice_lower)
-            if request.max_new_tokens is not None:
-                info["max_new_tokens"] = request.max_new_tokens
-        prompt = tokens_input(prompt_token_ids=prompt_ids)
+            prompt = tokens_input(prompt_token_ids=prompt_ids)
+            prompt["additional_information"] = info
+            return prompt
+
+        wav_samples, sr = ref_audio_data
+        normalized_text, normalized_ref_text = normalize_fish_voice_clone_texts(request.input, request.ref_text)
+        ph_len = self._estimate_prompt_len(normalized_text, normalized_ref_text, ref_audio_data)
+        info = {
+            "text": normalized_text,
+            "ref_text": normalized_ref_text,
+            "ref_audio_wav": torch.from_numpy(np.asarray(wav_samples, dtype=np.float32)),
+            "ref_audio_sr": int(sr),
+            "fish_structured_voice_clone": True,
+        }
+        server = self.ctx.server
+        if request.voice is not None:
+            voice_lower = request.voice.lower()
+            if voice_lower in server.uploaded_speakers and not has_inline_ref_audio:
+                info["voice_name"] = voice_lower
+                info["voice_created_at"] = server._voice_created_at(voice_lower)
+        if request.max_new_tokens is not None:
+            info["max_new_tokens"] = request.max_new_tokens
+        prompt = tokens_input(prompt_token_ids=[1] * ph_len)
         prompt["additional_information"] = info
         return prompt
 

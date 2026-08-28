@@ -1294,14 +1294,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _tts_x_vector_only(tts_params: dict[str, Any]) -> bool:
         return bool((tts_params.get("x_vector_only_mode") or [False])[0])
 
-    def _qwen3_tts_can_use_ref_audio_artifact_only(self, tts_params: dict[str, Any], artifact_key: str | None) -> bool:
-        if self._tts_model_type != "qwen3_tts":
-            return False
-        x_vector_only = self._tts_x_vector_only(tts_params)
-        if not artifact_key or (artifact_key, x_vector_only) not in self._ref_audio_model_artifact_ready:
-            return False
-        return (tts_params.get("task_type") or ["CustomVoice"])[0] == "Base"
-
     def _track_ref_audio_artifact_warmup(
         self, request_id: str, artifact_key: str | None, x_vector_only: bool = False
     ) -> None:
@@ -1707,18 +1699,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if stage0_params.extra_args is None:
                 stage0_params.extra_args = {}
             stage0_params.extra_args["tts_local_seed"] = request.seed
-
-        if self._tts_model_type == "qwen3_tts" and sampling_params_list:
-            stage0_params = sampling_params_list[0]
-            default_seed = getattr(stage0_params, "seed", None)
-            if default_seed is not None:
-                import copy
-
-                sampling_params_list = copy.deepcopy(sampling_params_list)
-                stage0_params = sampling_params_list[0]
-                if stage0_params.extra_args is None:
-                    stage0_params.extra_args = {}
-                stage0_params.extra_args.setdefault("tts_local_seed", int(default_seed))
 
         # When word_timestamps is requested, also ask for the aligner stage's
         # output so the orchestrator drives the request through the forced-aligner

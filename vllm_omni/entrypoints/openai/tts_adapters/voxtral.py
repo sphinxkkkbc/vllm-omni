@@ -24,6 +24,7 @@ class VoxtralTTSAdapter(ARTTSAdapter):
         self._build_prompt_async = make_async(self._build_prompt, executor=getattr(ctx.server, "_tts_executor", None))
 
     def _build_prompt(self, request: "OpenAICreateSpeechRequest") -> dict[str, Any]:
+        """Build a Voxtral prompt for either a preset voice or inline reference audio."""
         from mistral_common.protocol.speech.request import SpeechRequest
         from vllm.inputs import tokens_input
 

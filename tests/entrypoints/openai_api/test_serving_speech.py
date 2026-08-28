@@ -4453,22 +4453,18 @@ class TestMingFlashOmniTTSServing:
         assert error is not None
         assert "ref_audio" in error
 
-    def test_ming_flash_omni_tts_adapter_builds_prompt(self, ming_flash_omni_tts_server, mocker: MockerFixture):
-        ming_flash_omni_tts_server._adapter._build_prompt = mocker.MagicMock(
-            return_value={"prompt_token_ids": [1, 2, 3], "additional_information": {"voice": ["test"]}}
-        )
+    def test_ming_flash_omni_tts_adapter_builds_prompt(self, ming_flash_omni_tts_server):
         request = OpenAICreateSpeechRequest(input="Hello", voice="test")
         asyncio.run(ming_flash_omni_tts_server._prepare_speech_generation(request))
-        ming_flash_omni_tts_server._adapter._build_prompt.assert_called_once_with(request)
+
+        prompt = ming_flash_omni_tts_server.engine_client.generate.call_args.kwargs["prompt"]
+        assert prompt["prompt_token_ids"] == [0]
+        assert prompt["additional_information"]["text"] == "Hello"
+        assert prompt["additional_information"]["voice_name"] == "test"
 
 
 class TestTTSAsyncOffloading:
     """Tests for event-loop-safe offloading of blocking TTS operations."""
-
-    def test_build_voxtral_prompt_is_sync(self, mocker: MockerFixture):
-        """_build_voxtral_prompt should be a regular function, not a coroutine."""
-        adapter = VoxtralTTSAdapter(ctx=mocker.MagicMock())
-        assert not asyncio.iscoroutinefunction(adapter._build_prompt)
 
     @pytest.fixture
     def voxtral_server(self, mocker: MockerFixture):
@@ -4880,7 +4876,7 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-xvec")
 
         icl_params = {"task_type": ["Base"], "x_vector_only_mode": [False]}
-        assert qwen3_tts_server._qwen3_tts_can_use_ref_audio_artifact_only(icl_params, "artifact-a") is False
+        assert qwen3_tts_server._adapter._qwen3_tts_can_use_ref_audio_artifact_only(icl_params, "artifact-a") is False
 
     def test_qwen3_xvector_ready_artifact_still_reusable_by_xvector_request(self, qwen3_tts_server):
         qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
@@ -4888,7 +4884,7 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-xvec")
 
         xvec_params = {"task_type": ["Base"], "x_vector_only_mode": [True]}
-        assert qwen3_tts_server._qwen3_tts_can_use_ref_audio_artifact_only(xvec_params, "artifact-a") is True
+        assert qwen3_tts_server._adapter._qwen3_tts_can_use_ref_audio_artifact_only(xvec_params, "artifact-a") is True
 
     def test_qwen3_icl_ready_artifact_enables_icl_artifact_only(self, qwen3_tts_server):
         qwen3_tts_server._put_resolved_ref_audio("ref-a", [0.0] * 8, 24000, "artifact-a")
@@ -4896,7 +4892,7 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server._mark_ref_audio_artifact_ready_for_request("req-icl")
 
         icl_params = {"task_type": ["Base"], "x_vector_only_mode": [False]}
-        assert qwen3_tts_server._qwen3_tts_can_use_ref_audio_artifact_only(icl_params, "artifact-a") is True
+        assert qwen3_tts_server._adapter._qwen3_tts_can_use_ref_audio_artifact_only(icl_params, "artifact-a") is True
 
     def test_shutdown_is_idempotent(self, mocker: MockerFixture):
         """Calling shutdown() twice should not raise."""

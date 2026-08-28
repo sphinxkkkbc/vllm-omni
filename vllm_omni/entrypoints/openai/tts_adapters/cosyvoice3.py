@@ -16,6 +16,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Without this delimiter the talker re-speaks the reference transcript instead
+# of emitting target-only speech (issue #4644). Matches the offline example and
+# upstream demo.
+_PROMPT_DELIMITER = "<|endofprompt|>"
+_PROMPT_PREFIX = f"You are a helpful assistant.{_PROMPT_DELIMITER}"
+
 
 @register_tts_adapter
 class CosyVoice3Adapter(ARTTSAdapter):
@@ -24,17 +30,20 @@ class CosyVoice3Adapter(ARTTSAdapter):
 
     def __init__(self, ctx) -> None:
         super().__init__(ctx)
+        # Cache the resolved Qwen tokenizer used for dynamic-token sizing.
+        # Rebuilding it would repeat snapshot resolution and add ~100 ms to the
+        # TTFP-critical sampling override on every request.
         self._tokenizer = None
 
     async def _build_prompt(
         self, request: "OpenAICreateSpeechRequest", *, has_inline_ref_audio: bool = False
     ) -> dict[str, Any]:
+        """Build the multimodal CosyVoice3 voice-cloning prompt."""
         server = self.ctx.server
         wav_samples, sr, _ = await server._resolve_ref_audio(request.ref_audio)
         ref_text = request.ref_text or ""
-        delimiter = "<|endofprompt|>"
-        if delimiter not in ref_text:
-            ref_text = f"You are a helpful assistant.{delimiter}{ref_text}"
+        if _PROMPT_DELIMITER not in ref_text:
+            ref_text = f"{_PROMPT_PREFIX}{ref_text}"
         mm_kwargs: dict[str, Any] = {"prompt_text": ref_text, "sample_rate": sr}
         if request.voice:
             voice_lower = request.voice.lower()

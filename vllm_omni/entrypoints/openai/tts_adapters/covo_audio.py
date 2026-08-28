@@ -35,6 +35,12 @@ class CovoAudioAdapter(ARTTSAdapter):
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
+        """Build the tokenized chat prompt expected by Covo-Audio-Chat.
+
+        The model requires a specific system prompt instructing it to
+        interleave text and audio tokens. Passing token IDs avoids a second
+        engine-side tokenization step.
+        """
         from transformers import AutoTokenizer
 
         from vllm_omni.model_executor.models.covo_audio.prompt_utils import build_covo_audio_prompt_token_ids

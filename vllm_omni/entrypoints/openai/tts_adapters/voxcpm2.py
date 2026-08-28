@@ -57,6 +57,11 @@ class VoxCPM2Adapter(ARTTSAdapter):
         request: "OpenAICreateSpeechRequest",
         uploaded_ref: tuple[np.ndarray, int] | None = None,
     ) -> dict[str, Any]:
+        """Build the full-length VoxCPM2 prefill prompt.
+
+        ``uploaded_ref`` supplies an uploaded voice waveform when the request
+        has no explicit ``ref_audio`` so prefill-length accounting includes it.
+        """
         from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import build_voxcpm2_prompt
 
         server = self.ctx.server

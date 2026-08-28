@@ -31,6 +31,11 @@ class StepAudio2Adapter(ARTTSAdapter):
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
+        """Build a chat prompt ending at ``<tts_start>``.
+
+        The assistant turn deliberately omits ``<|im_end|>`` so the thinker
+        continues by generating audio tokens.
+        """
         system_prompt = request.instructions or "You are a voice assistant. Read the text aloud."
         prompt = {
             "prompt": (

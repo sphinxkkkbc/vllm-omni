@@ -64,6 +64,12 @@ class GlmTTSAdapter(ARTTSAdapter):
     async def _build_prompt(
         self, request: "OpenAICreateSpeechRequest", *, has_inline_ref_audio: bool = False
     ) -> dict[str, Any]:
+        """Build GLM-TTS multimodal voice-cloning input and prefill metadata.
+
+        AR preprocess constructs PromptText, Text, BOA and prompt speech tokens;
+        the DiT consumes the resulting prompt tokens, features and embedding as
+        conditioning.
+        """
         server = self.ctx.server
         if request.ref_audio is None or not request.ref_text:
             raise ValueError("GLM-TTS requires ref_audio and ref_text for voice cloning.")

@@ -39,7 +39,20 @@ DEFAULT_TTS_LANGUAGES = frozenset(
 
 
 def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: dict | None = None) -> str:
-    """Hash the effective Stage-0 conditioning used with placeholder prompts."""
+    """Stable hash of the real Stage 0 conditioning for the prefix cache.
+
+    The talker's vLLM prompt is placeholder token ids; the real inputs are
+    rebuilt from text / ref_audio / ref_text into inputs_embeds. vLLM hashes
+    token ids (folded with cache_salt) for prefix caching, so without a salt
+    every request collides and a hit could reuse KV from a semantically
+    different input.
+
+    Raw request fields alone are not enough for uploaded voices: resolved
+    conditioning such as ``voice_created_at`` and content-aware ref-audio
+    cache keys must also be folded in. This distinguishes delete/re-upload of
+    the same voice and same-path local audio rewrites without hashing decoded
+    waveform arrays.
+    """
     h = hashlib.sha256()
     for part in (
         request.input,
@@ -55,6 +68,7 @@ def conditioning_cache_salt(request: "OpenAICreateSpeechRequest", tts_params: di
         h.update(b"\x00")
         if part is not None:
             h.update(repr(part).encode("utf-8"))
+    # Fold conditioning derived by adapters and absent from the raw request.
     for key in (
         "voice_created_at",
         "task_type",

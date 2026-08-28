@@ -349,6 +349,13 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             logger.warning("Failed to estimate TTS prompt length, using fallback 2048: %s", e)
             return 2048
 
+    def _qwen3_tts_can_use_ref_audio_artifact_only(self, tts_params: dict[str, Any], artifact_key: str | None) -> bool:
+        server = self.ctx.server
+        x_vector_only = server._tts_x_vector_only(tts_params)
+        if not artifact_key or (artifact_key, x_vector_only) not in server._ref_audio_model_artifact_ready:
+            return False
+        return (tts_params.get("task_type") or ["CustomVoice"])[0] == "Base"
+
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
@@ -376,7 +383,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             ref_code_length = self._estimate_ref_code_len([wav_list, sr])
             if ref_code_length is not None:
                 tts_params["ref_code_length"] = [int(ref_code_length)]
-            if server._qwen3_tts_can_use_ref_audio_artifact_only(tts_params, artifact_key):
+            if self._qwen3_tts_can_use_ref_audio_artifact_only(tts_params, artifact_key):
                 logger.debug("Using Qwen3-TTS ref_audio artifact-only path: %s", artifact_key)
             else:
                 tts_params["ref_audio"] = [[wav_list, sr]]
@@ -445,4 +452,14 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         prompt: dict[str, Any] | None = None,
         request_id: str | None = None,
     ) -> list:
+        stage0_params = sampling_params_list[0]
+        default_seed = getattr(stage0_params, "seed", None)
+        if default_seed is not None:
+            import copy
+
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            stage0_params = sampling_params_list[0]
+            if stage0_params.extra_args is None:
+                stage0_params.extra_args = {}
+            stage0_params.extra_args.setdefault("tts_local_seed", int(default_seed))
         return apply_max_new_tokens(sampling_params_list, request)
