@@ -41,6 +41,20 @@ def test_sdpa_fallback_mask_preserves_packed_sequence_boundaries() -> None:
     torch.testing.assert_close(metadata.attn_mask[0, 0], expected)
 
 
+def test_eager_attention_metadata_honors_exact_max_seqlen() -> None:
+    cu_seqs = torch.tensor([0, 2, 3, 6, 6], dtype=torch.int32)
+
+    metadata = _attention_metadata_from_cu_seqs(
+        cu_seqs,
+        6,
+        needs_sdpa_mask=False,
+        max_seqlen=3,
+    )
+
+    assert metadata.extra["max_seqlen_q"] == 3
+    assert metadata.extra["max_seqlen_k"] == 3
+
+
 def test_request_batch_prepare_error_does_not_skip_valid_request() -> None:
     """A malformed request must not prevent another request from completing."""
     prepared = _PreparedOmniVoiceRequest(
