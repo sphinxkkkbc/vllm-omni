@@ -332,9 +332,13 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             if voice_lower in server.uploaded_speakers and not has_inline_ref_audio:
                 tts_params["voice_name"] = [voice_lower]
                 tts_params["voice_created_at"] = [server._voice_created_at(voice_lower)]
-        # MOSS reads the resolved seed at build time (it samples internally).
-        if sampling_params_list and getattr(sampling_params_list[0], "seed", None) is not None:
-            tts_params["seed"] = [sampling_params_list[0].seed]
+        # MOSS samples internally from additional_information. build() runs
+        # before the shared path applies request.seed to SamplingParams.
+        seed = request.seed
+        if seed is None and sampling_params_list:
+            seed = getattr(sampling_params_list[0], "seed", None)
+        if seed is not None:
+            tts_params["seed"] = [int(seed)]
         if isinstance(tts_params.get("prompt_token_ids"), list):
             prompt_token_ids = tts_params.pop("prompt_token_ids")
             prompt = tokens_input(prompt_token_ids=prompt_token_ids)
