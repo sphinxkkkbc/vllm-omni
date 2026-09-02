@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -26,7 +26,6 @@ class _FakeDecoder(nn.Module):
         self.decode_calls: list[dict[str, int]] = []
         self.batched_decode_calls: list[dict[str, object]] = []
         self.decode_codes: list[torch.Tensor] = []
-        self.cudagraph_calls: list[dict[str, int | torch.device]] = []
 
     def to(self, *args, **kwargs):
         return self
@@ -93,9 +92,6 @@ class _FakeDecoder(nn.Module):
         offsets = torch.arange(batch, dtype=torch.float32).view(batch, 1, 1) * 1000
         outputs = wav.expand(batch, 1, wav_len) + offsets
         return [outputs[row, :, : lengths[row] * self.total_upsample] for row in range(batch)]
-
-    def enable_cudagraph(self, **kwargs):
-        self.cudagraph_calls.append(kwargs)
 
 
 def _fake_dec_config():
@@ -325,11 +321,17 @@ def test_decode_chunking_can_be_overridden_separately():
             "extra": {
                 "codec_chunk_frames": 25,
                 "codec_left_context_frames": 72,
-                "decode_chunk_frames": 400,
-                "decode_left_context_frames": 17,
             }
         },
     )
+    model.vllm_config.model_config.vocoder_cudagraph_config = {
+        "targets": {
+            "qwen3_tts.stateless": {
+                "decode_chunk_frames": 400,
+                "decode_left_context_frames": 17,
+            }
+        }
+    }
 
     _load_weights_noop(model)
 
@@ -380,7 +382,7 @@ def test_dummy_runtime_information_provides_finished_request_state():
     assert all(info["meta"]["finished"] for info in runtime_info)
 
 
-def test_dummy_request_state_is_marked_for_graph_stats_suppression():
+def test_dummy_request_does_not_record_pre_capture_shape_fallback():
     model = _make_model(async_chunk=True)
     runtime_info = model.get_dummy_runtime_additional_information(1)
 
@@ -491,6 +493,16 @@ def test_forward_batches_request_aware_decoder_states():
     torch.testing.assert_close(audios[1], torch.arange(100, 116, dtype=torch.float32))
 
 
+def test_decode_modes_enforce_cache_contracts():
+    async_model = _make_model(async_chunk=True)
+    with pytest.raises(ValueError, match="require a request_id"):
+        async_model.forward(input_ids=torch.arange(4, dtype=torch.long))
+
+    stateless_model = _make_model(async_chunk=False)
+    stateless_model.forward(input_ids=torch.arange(4, dtype=torch.long))
+    assert stateless_model.decoder.batched_decode_calls[-1]["caches"] is None
+
+
 def test_forward_allows_followup_delta_without_reference_prefix():
     model = _make_model(async_chunk=True)
     first_codes = torch.tensor([9, 8, 1, 2, 9, 8, 3, 4], dtype=torch.long)
@@ -556,7 +568,7 @@ def test_forward_passes_variable_length_padded_batch_to_decoder():
     torch.testing.assert_close(audios[1], torch.arange(1008, 1016, dtype=torch.float32))
 
 
-def test_decode_chunking_override_is_passed_to_cudagraph():
+def test_decode_chunking_override_is_resolved_before_target_construction():
     model = _make_model(
         async_chunk=True,
         device=torch.device("cuda"),
@@ -564,75 +576,74 @@ def test_decode_chunking_override_is_passed_to_cudagraph():
             "extra": {
                 "codec_chunk_frames": 25,
                 "codec_left_context_frames": 72,
+            }
+        },
+    )
+    model.vllm_config.model_config.vocoder_cudagraph_config = {
+        "targets": {
+            "qwen3_tts.stateless": {
                 "decode_chunk_frames": 400,
                 "decode_left_context_frames": 17,
             }
-        },
-    )
+        }
+    }
 
     _load_weights_noop(model)
 
-    assert model.decoder.cudagraph_calls[-1] == {
-        "capture_batch_sizes": None,
-        "stateless_capture_sizes": None,
-        "device": torch.device("cuda"),
-        "codec_chunk_frames": 25,
-        "codec_left_context_frames": 72,
-        "initial_codec_chunk_frames": 1,
-        "codec_chunk_ramp": None,
-        "async_chunk": True,
-        "decode_chunk_size": 400,
-        "decode_left_context": 17,
-    }
+    assert model._decode_chunk_frames == 400
+    assert model._decode_left_context_frames == 17
+    target = model.get_vocoder_cudagraph_targets()[0]
+    assert target.descriptors == ()
+    assert target.routine.runnable == model.decoder.forward
 
 
-def test_cudagraph_batch_config_is_preserved():
+def test_async_cudagraph_batch_config_does_not_start_model_local_capture():
     model = _make_model(
         async_chunk=True,
         device=torch.device("cuda"),
-        stage_connector_config={
-            "extra": {
-                "decode_cudagraph_batch_sizes": [1, 2, 4, 8],
-            }
-        },
+        stage_connector_config={"extra": {}},
     )
+    model.vllm_config.model_config.vocoder_cudagraph_config = {"capture_batch_sizes": [1, 2, 4, 8]}
 
     _load_weights_noop(model)
 
-    call = model.decoder.cudagraph_calls[-1]
-    assert call["capture_batch_sizes"] == [1, 2, 4, 8]
+    target = model.get_vocoder_cudagraph_targets()[0]
+    assert target.descriptors == ()
+    assert target.routine.runnable == model.decoder.forward
 
 
-def test_stateless_cudagraph_capture_sizes_are_passed_from_config():
+def test_stateless_cudagraph_capture_sizes_are_resolved_into_target_descriptors():
     model = _make_model(
         async_chunk=False,
         device=torch.device("cuda"),
-        stage_connector_config={
-            "extra": {
-                "decode_cudagraph_capture_sizes": [97, 400],
-            }
-        },
+        stage_connector_config={"extra": {}},
     )
+    model.vllm_config.model_config.vocoder_cudagraph_config = {
+        "targets": {"qwen3_tts.stateless": {"capture_bucket_sizes": [97, 400]}}
+    }
 
     _load_weights_noop(model)
 
-    assert model.decoder.cudagraph_calls[-1]["stateless_capture_sizes"] == [97, 400]
+    target = model.get_vocoder_cudagraph_targets()[0]
+    assert {descriptor.variant.frames for descriptor in target.descriptors} == {97, 150, 325, 400}
+    assert target.routine.runnable == model.decoder.forward
 
 
-def test_async_cudagraph_ignores_stateless_capture_sizes():
+def test_async_cudagraph_keeps_stateless_target_inactive():
     model = _make_model(
         async_chunk=True,
         device=torch.device("cuda"),
-        stage_connector_config={
-            "extra": {
-                "decode_cudagraph_capture_sizes": [97, 400],
-            }
-        },
+        stage_connector_config={"extra": {}},
     )
+    model.vllm_config.model_config.vocoder_cudagraph_config = {
+        "targets": {"qwen3_tts.stateless": {"capture_bucket_sizes": [97, 400]}}
+    }
 
     _load_weights_noop(model)
 
-    assert model.decoder.cudagraph_calls[-1]["stateless_capture_sizes"] is None
+    target = model.get_vocoder_cudagraph_targets()[0]
+    assert target.descriptors == ()
+    assert target.routine.runnable == model.decoder.forward
 
 
 def test_decode_tf32_can_be_configured():
@@ -646,12 +657,9 @@ def test_decode_tf32_can_be_configured():
         model = _make_model(
             async_chunk=True,
             device=torch.device("cuda"),
-            stage_connector_config={
-                "extra": {
-                    "decode_enable_tf32": "true",
-                }
-            },
+            stage_connector_config={"extra": {}},
         )
+        model.vllm_config.model_config.vocoder_cudagraph_config = {"decode_enable_tf32": "true"}
 
         _load_weights_noop(model)
 
@@ -667,12 +675,9 @@ def test_decode_tf32_can_be_configured():
 def test_decode_batch_max_size_can_be_configured():
     model = _make_model(
         async_chunk=True,
-        stage_connector_config={
-            "extra": {
-                "decode_batch_max_size": 10,
-            }
-        },
+        stage_connector_config={"extra": {}},
     )
+    model.vllm_config.model_config.vocoder_cudagraph_config = {"decode_batch_max_size": 10}
 
     _load_weights_noop(model)
 
@@ -682,12 +687,9 @@ def test_decode_batch_max_size_can_be_configured():
 def test_invalid_decode_batch_max_size_is_rejected():
     model = _make_model(
         async_chunk=True,
-        stage_connector_config={
-            "extra": {
-                "decode_batch_max_size": -1,
-            }
-        },
+        stage_connector_config={"extra": {}},
     )
+    model.vllm_config.model_config.vocoder_cudagraph_config = {"decode_batch_max_size": -1}
 
     with pytest.raises(ValueError, match="decode_batch_max_size"):
         _load_weights_noop(model)
@@ -696,12 +698,11 @@ def test_invalid_decode_batch_max_size_is_rejected():
 def test_invalid_decode_chunking_is_rejected():
     model = _make_model(
         async_chunk=True,
-        stage_connector_config={
-            "extra": {
-                "decode_chunk_frames": 0,
-            }
-        },
+        stage_connector_config={"extra": {}},
     )
+    model.vllm_config.model_config.vocoder_cudagraph_config = {
+        "targets": {"qwen3_tts.stateless": {"decode_chunk_frames": 0}}
+    }
 
     with pytest.raises(ValueError, match="decode_chunk_frames=0"):
         _load_weights_noop(model)

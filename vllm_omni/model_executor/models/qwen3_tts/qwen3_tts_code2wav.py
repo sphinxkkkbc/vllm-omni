@@ -1,6 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import os
+import weakref
 from collections import Counter
 from collections.abc import Iterable
 from typing import Any
@@ -13,6 +17,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader import DefaultModelLoader
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
+    VocoderCUDAGraphTarget,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
 
@@ -21,6 +28,11 @@ from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
 )
 from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2Decoder,
+)
+from .vocoder_cudagraph import (
+    SHARED_CONFIG_KEYS,
+    build_qwen3_tts_targets,
+    get_qwen3_tts_target_config,
 )
 
 logger = init_logger(__name__)
@@ -55,6 +67,8 @@ class Qwen3TTSCode2Wav(nn.Module):
     via the SpeechTokenizer decoder directly (bypassing HF wrapper overhead)."""
 
     input_modalities = "audio"
+    supports_vocoder_cudagraph = True
+    vocoder_cudagraph_shared_config_keys = SHARED_CONFIG_KEYS
 
     # Ask the model runner for the scheduler-side request IDs. Stateful
     # decoder caches must use the same IDs delivered by on_requests_finished;
@@ -109,6 +123,12 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._decoder_sliding_window = int(getattr(dec_config, "sliding_window", 0) or 0)
         self._decoder_state_cache: dict[str, dict[str, Any]] = {}
         self._decoder_state_cache_warn_entries = 512
+        self._vocoder_cudagraph_targets: tuple[VocoderCUDAGraphTarget, ...] = ()
+
+    def get_vocoder_cudagraph_targets(self) -> tuple[VocoderCUDAGraphTarget, ...]:
+        """Return the stable Targets constructed from the resolved config."""
+
+        return self._vocoder_cudagraph_targets
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         # This stage ignores token embeddings. Keep a stable dummy embedding for vLLM runner.
@@ -147,58 +167,6 @@ class Qwen3TTSCode2Wav(nn.Module):
                     boundaries.append(boundaries[-1] + s)
                 return [ids[boundaries[i] : boundaries[i + 1]] for i in range(len(boundaries) - 1)]
         return [ids]
-
-    def _maybe_enable_decoder_cudagraph(
-        self,
-        *,
-        device: torch.device,
-        codec_chunk_frames: int,
-        codec_left_context_frames: int,
-        initial_codec_chunk_frames: int,
-        codec_chunk_ramp: list[int] | None,
-        decode_cudagraph_batch_sizes: list[int] | None,
-        decode_cudagraph_capture_sizes: list[int] | None,
-    ) -> None:
-        """Enable inner Code2Wav CUDA graph unless stage is enforce_eager."""
-        if not hasattr(self.decoder, "enable_cudagraph") or device.type != "cuda":
-            return
-
-        model_cfg = getattr(self.vllm_config, "model_config", None)
-        if getattr(model_cfg, "enforce_eager", False):
-            logger.info("Qwen3-TTS Code2Wav CUDA Graph disabled because enforce_eager is set")
-            return
-
-        if (
-            self._async_chunk
-            and codec_chunk_frames > 0
-            and codec_left_context_frames > 0
-            and self._decoder_sliding_window
-            and codec_left_context_frames < self._decoder_sliding_window
-        ):
-            logger.warning(
-                "Qwen3-TTS streaming codec_left_context_frames=%d "
-                "is smaller than decoder sliding_window=%d; "
-                "chunk-boundary distortion may occur. "
-                "Increase codec_left_context_frames to at least "
-                "%d for streaming.",
-                codec_left_context_frames,
-                self._decoder_sliding_window,
-                self._decoder_sliding_window,
-            )
-
-        self.decoder.enable_cudagraph(
-            capture_batch_sizes=decode_cudagraph_batch_sizes,
-            stateless_capture_sizes=decode_cudagraph_capture_sizes,
-            device=device,
-            codec_chunk_frames=codec_chunk_frames,
-            codec_left_context_frames=codec_left_context_frames,
-            initial_codec_chunk_frames=initial_codec_chunk_frames,
-            codec_chunk_ramp=codec_chunk_ramp,
-            async_chunk=self._async_chunk,
-            decode_chunk_size=self._decode_chunk_frames,
-            decode_left_context=self._decode_left_context_frames,
-        )
-        logger.info("Code2Wav decoder CUDA Graph enabled")
 
     def _record_decode_batch_stats(
         self,
@@ -571,14 +539,21 @@ class Qwen3TTSCode2Wav(nn.Module):
         codec_left_context_frames = 0
         model_cfg = getattr(self.vllm_config, "model_config", None)
         connector_cfg = getattr(model_cfg, "stage_connector_config", None)
-        extra_cfg = (
+        connector_extra = (
             connector_cfg.get("extra", connector_cfg)
             if isinstance(connector_cfg, dict)
             else getattr(connector_cfg, "extra", None)
         )
+        connector_extra = connector_extra if isinstance(connector_extra, dict) else {}
+        graph_cfg = getattr(model_cfg, "vocoder_cudagraph_config", None)
+        if graph_cfg is None:
+            graph_cfg = {}
+        if not isinstance(graph_cfg, dict):
+            raise TypeError("vocoder_cudagraph must be a mapping")
+        stateless_graph_cfg = get_qwen3_tts_target_config(self.vllm_config, "qwen3_tts.stateless")
 
-        def _get_int_config(name: str, default: int) -> int:
-            value = extra_cfg.get(name, default)
+        def _get_int_config(config: dict[str, Any], name: str, default: int) -> int:
+            value = config.get(name, default)
             if value is None:
                 return default
             try:
@@ -587,7 +562,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
 
         def _get_bool_config(name: str, default: bool) -> bool:
-            value = extra_cfg.get(name, default)
+            value = graph_cfg.get(name, default)
             if value is None:
                 return default
             if isinstance(value, bool):
@@ -602,99 +577,29 @@ class Qwen3TTSCode2Wav(nn.Module):
                 return bool(value)
             raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}")
 
-        def _get_int_list_config(name: str) -> list[int] | None:
-            value = extra_cfg.get(name)
-            if value is None:
-                return None
-            if isinstance(value, str):
-                raw_values = [item.strip() for item in value.split(",") if item.strip()]
-            elif isinstance(value, int):
-                raw_values = [value]
-            else:
-                try:
-                    raw_values = list(value)
-                except TypeError as exc:
-                    raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
-            values: set[int] = set()
-            for item in raw_values:
-                try:
-                    parsed = int(item)
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
-                if parsed > 0:
-                    values.add(parsed)
-            return sorted(values)
-
-        def _get_int_pair_list_config(name: str) -> list[tuple[int, int]] | None:
-            value = extra_cfg.get(name)
-            if value is None:
-                return None
-            if isinstance(value, str):
-                raw_values = [item.strip() for item in value.split(",") if item.strip()]
-            else:
-                try:
-                    raw_values = list(value)
-                except TypeError as exc:
-                    raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
-
-            pairs: set[tuple[int, int]] = set()
-            for item in raw_values:
-                if isinstance(item, str):
-                    if ":" not in item:
-                        raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}")
-                    left, right = item.split(":", 1)
-                    raw_pair = (left.strip(), right.strip())
-                else:
-                    try:
-                        raw_pair = tuple(item)
-                    except TypeError as exc:
-                        raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
-                    if len(raw_pair) != 2:
-                        raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}")
-                try:
-                    batch_size = int(raw_pair[0])
-                    seq_len = int(raw_pair[1])
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
-                if batch_size > 0 and seq_len > 0:
-                    pairs.add((batch_size, seq_len))
-            return sorted(pairs)
-
-        if isinstance(extra_cfg, dict):
-            codec_chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
-            codec_left_context_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
-            initial_codec_chunk_frames = int(extra_cfg.get("initial_codec_chunk_frames") or 1)
-            codec_chunk_ramp = parse_chunk_ramp(extra_cfg, steady=codec_chunk_frames) if self._async_chunk else None
-            decode_chunk_frames = _get_int_config("decode_chunk_frames", self._decode_chunk_frames)
-            decode_left_context_frames = _get_int_config(
-                "decode_left_context_frames",
-                self._decode_left_context_frames,
+        codec_chunk_frames = int(connector_extra.get("codec_chunk_frames") or 0)
+        codec_left_context_frames = int(connector_extra.get("codec_left_context_frames") or 0)
+        initial_codec_chunk_frames = int(connector_extra.get("initial_codec_chunk_frames") or 1)
+        codec_chunk_ramp = parse_chunk_ramp(connector_extra, steady=codec_chunk_frames) if self._async_chunk else None
+        decode_chunk_frames = _get_int_config(stateless_graph_cfg, "decode_chunk_frames", self._decode_chunk_frames)
+        decode_left_context_frames = _get_int_config(
+            stateless_graph_cfg,
+            "decode_left_context_frames",
+            self._decode_left_context_frames,
+        )
+        if decode_chunk_frames <= 0 or decode_left_context_frames < 0:
+            raise ValueError(
+                "Invalid Qwen3-TTS Code2Wav decode chunk config: "
+                f"decode_chunk_frames={decode_chunk_frames}, "
+                f"decode_left_context_frames={decode_left_context_frames}"
             )
-            if decode_chunk_frames <= 0 or decode_left_context_frames < 0:
-                raise ValueError(
-                    "Invalid Qwen3-TTS Code2Wav decode chunk config: "
-                    f"decode_chunk_frames={decode_chunk_frames}, "
-                    f"decode_left_context_frames={decode_left_context_frames}"
-                )
-            self._decode_chunk_frames = decode_chunk_frames
-            self._decode_left_context_frames = decode_left_context_frames
-            decode_cudagraph_batch_sizes = _get_int_list_config("decode_cudagraph_batch_sizes")
-            decode_cudagraph_capture_sizes = (
-                None if self._async_chunk else _get_int_list_config("decode_cudagraph_capture_sizes")
-            )
-            decode_batch_max_size = _get_int_config("decode_batch_max_size", self._decode_batch_max_size)
-            if decode_batch_max_size < 0:
-                raise ValueError(f"Invalid Qwen3-TTS Code2Wav config decode_batch_max_size={decode_batch_max_size}")
-            self._decode_batch_max_size = decode_batch_max_size
-            decode_enable_tf32 = _get_bool_config("decode_enable_tf32", False)
-        else:
-            codec_chunk_frames = 0
-            codec_left_context_frames = 0
-            initial_codec_chunk_frames = 1
-            codec_chunk_ramp = None
-            decode_cudagraph_batch_sizes = None
-            decode_cudagraph_capture_sizes = None
-            decode_enable_tf32 = False
+        self._decode_chunk_frames = decode_chunk_frames
+        self._decode_left_context_frames = decode_left_context_frames
+        decode_batch_max_size = _get_int_config(graph_cfg, "decode_batch_max_size", self._decode_batch_max_size)
+        if decode_batch_max_size < 0:
+            raise ValueError(f"Invalid Qwen3-TTS Code2Wav config decode_batch_max_size={decode_batch_max_size}")
+        self._decode_batch_max_size = decode_batch_max_size
+        decode_enable_tf32 = _get_bool_config("decode_enable_tf32", False)
 
         if decode_enable_tf32 and device.type == "cuda":
             # PyTorch exposes TF32 controls as process-wide CUDA backend
@@ -711,25 +616,37 @@ class Qwen3TTSCode2Wav(nn.Module):
                 torch.get_float32_matmul_precision(),
             )
 
+        if (
+            self._async_chunk
+            and codec_chunk_frames > 0
+            and codec_left_context_frames > 0
+            and self._decoder_sliding_window
+            and codec_left_context_frames < self._decoder_sliding_window
+        ):
+            logger.warning(
+                "Qwen3-TTS streaming codec_left_context_frames=%d is smaller "
+                "than decoder sliding_window=%d; chunk-boundary distortion "
+                "may occur. Increase codec_left_context_frames to at least %d.",
+                codec_left_context_frames,
+                self._decoder_sliding_window,
+                self._decoder_sliding_window,
+            )
+
         self.decoder._initial_codec_chunk_frames = initial_codec_chunk_frames
         self.decoder._incremental_chunk_frames = codec_chunk_frames or 25
         self.decoder._incremental_chunk_ramp = list(codec_chunk_ramp or ())
 
-        if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
-            try:
-                self._maybe_enable_decoder_cudagraph(
-                    device=device,
-                    codec_chunk_frames=codec_chunk_frames,
-                    codec_left_context_frames=codec_left_context_frames,
-                    initial_codec_chunk_frames=initial_codec_chunk_frames,
-                    codec_chunk_ramp=codec_chunk_ramp,
-                    decode_cudagraph_batch_sizes=decode_cudagraph_batch_sizes,
-                    decode_cudagraph_capture_sizes=decode_cudagraph_capture_sizes,
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to enable CUDA Graph for Code2Wav decoder",
-                    exc_info=True,
-                )
+        # Capture planning is complete only after the decoder configuration has
+        # been resolved. The model retains these exact Target objects for all
+        # subsequent forward calls; Manager only changes their delegate.
+        self._vocoder_cudagraph_targets = build_qwen3_tts_targets(
+            decoder=self.decoder,
+            vllm_config=self.vllm_config,
+            num_quantizers=self._num_quantizers,
+            total_upsample=self._total_upsample,
+        )
+        for target in self._vocoder_cudagraph_targets:
+            suffix = target.target_id.removeprefix("qwen3_tts.")
+            setattr(self.decoder, f"_{suffix}_cudagraph_target_ref", weakref.ref(target))
 
         return loaded

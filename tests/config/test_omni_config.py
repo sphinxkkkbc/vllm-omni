@@ -122,6 +122,52 @@ def test_non_duplex_deploy_keeps_model_session_capacity_at_one(tmp_path: Path) -
     assert [stage.model_config.session_mode for stage in omni_config.stage_configs] == ["turn", "turn"]
 
 
+def test_vocoder_cudagraph_config_is_generation_stage_local(tmp_path: Path) -> None:
+    deploy_path = tmp_path / "qwen3-tts-vocoder-graph.yaml"
+    deploy_path.write_text(
+        """
+async_chunk: false
+stages:
+  - stage_id: 1
+    vocoder_cudagraph:
+      capture_batch_sizes: [1, 2]
+      targets:
+        qwen3_tts.stateless:
+          enabled: true
+          capture_bucket_sizes: [150, 325]
+""",
+        encoding="utf-8",
+    )
+
+    omni_config = _from_pipeline_key("qwen3_tts", deploy_config_path=str(deploy_path))
+
+    assert omni_config.stage_by_id(0).model_config.vocoder_cudagraph is None
+    assert omni_config.stage_by_id(1).model_config.vocoder_cudagraph == {
+        "capture_batch_sizes": [1, 2],
+        "targets": {
+            "qwen3_tts.stateless": {
+                "enabled": True,
+                "capture_bucket_sizes": [150, 325],
+            }
+        },
+    }
+
+
+def test_vocoder_cudagraph_config_rejects_ar_stage(tmp_path: Path) -> None:
+    deploy_path = tmp_path / "qwen3-tts-ar-vocoder-graph.yaml"
+    deploy_path.write_text(
+        """
+stages:
+  - stage_id: 0
+    vocoder_cudagraph: {}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="only for LLM_GENERATION"):
+        _from_pipeline_key("qwen3_tts", deploy_config_path=str(deploy_path))
+
+
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
 def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(model_type: str):
     pipeline = _resolve_pipeline_or_skip(model_type)
@@ -490,6 +536,14 @@ def test_from_pipeline_config_dispatches_async_chunk_processors_without_mutating
     assert async_config.stage_by_id(0).custom_process_next_stage_input_func.endswith("talker2code2wav_async_chunk")
     assert async_config.stage_by_id(1).custom_process_input_func is None
     assert async_config.stage_by_id(1).model_config.requires_full_payload_input is True
+    assert async_config.stage_by_id(1).model_config.vocoder_cudagraph == {
+        "decode_batch_max_size": 4,
+        "targets": {
+            "qwen3_tts.stateless": {
+                "capture_bucket_sizes": [150, 325],
+            }
+        },
+    }
 
     sync_config = _from_pipeline_key("qwen3_tts", cli_overrides={"async_chunk": False})
     assert sync_config.stage_by_id(0).custom_process_next_stage_input_func.endswith("talker2code2wav_full_payload")
@@ -617,6 +671,7 @@ def test_sub_config_fields_match_structured_scopes():
         "model_subdir",
         "tokenizer_subdir",
         "requires_full_payload_input",
+        "vocoder_cudagraph",
     }
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
     assert issubclass(OmniStageLoadConfig, VllmLoadConfig)

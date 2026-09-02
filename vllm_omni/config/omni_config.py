@@ -164,6 +164,7 @@ class _ModelEngineOverrides(TypedDict, total=False):
     enable_multithread_weight_load: bool
     num_weight_load_threads: int
     disable_autocast: bool
+    vocoder_cudagraph: dict[str, Any]
 
 
 class _LoadEngineOverrides(TypedDict, total=False):
@@ -408,6 +409,9 @@ class OmniStageModelConfig:
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
     requires_full_payload_input: bool = False
+    # User-facing per-stage runner-owned vocoder graph configuration. It is
+    # projected to OmniModelConfig.vocoder_cudagraph_config by OmniEngineArgs.
+    vocoder_cudagraph: dict[str, Any] | None = None
 
 
 @_enforce_keyword_only_init
@@ -1585,7 +1589,7 @@ def _build_stage_config(
         builder = _STAGE_CONFIG_BUILDERS[topology.execution_type]
     except KeyError as exc:
         raise ValueError(f"Unsupported stage execution type: {topology.execution_type!r}") from exc
-    return cast(
+    stage_config = cast(
         StageConfigType,
         builder(
             pipeline,
@@ -1596,6 +1600,15 @@ def _build_stage_config(
             model=model,
         ),
     )
+    if (
+        stage_config.model_config.vocoder_cudagraph is not None
+        and topology.execution_type != StageExecutionType.LLM_GENERATION
+    ):
+        raise ValueError(
+            "vocoder_cudagraph is supported only for LLM_GENERATION stages; "
+            f"stage {topology.stage_id} uses {topology.execution_type.value}"
+        )
+    return stage_config
 
 
 def _build_quantization_config(

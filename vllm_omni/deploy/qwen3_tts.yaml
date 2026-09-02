@@ -9,7 +9,7 @@
 #   * Stage 1 (code2wav) sets max_num_batched_tokens=65536 for correctness:
 #     codec prefill length (Q * num_frames) exceeds the 32k default.
 #   * Stage 0 does not set enforce_eager — talker runs cudagraph by default.
-#     Stage 1 defaults to false so Code2Wav can use its inner cudagraph;
+#     Stage 1 defaults to false so Code2Wav uses runner-owned vocoder graphs;
 #     set true to disable that path in eager mode.
 async_chunk: true
 
@@ -44,19 +44,6 @@ connectors:
       # codec_chunk_ramp_divisor: 15
       # min chunk-size growth per emit
       # codec_chunk_ramp_delta_min: 2
-      # Decoder CUDA Graph sizing:
-      #   * async_chunk=true derives all stateful ICL/xvec shapes from
-      #     codec_chunk_ramp when enabled, otherwise from
-      #     initial_codec_chunk_frames, codec_chunk_frames, and sliding_window;
-      #     decode_cudagraph_capture_sizes is ignored in this mode.
-      #   * async_chunk=false captures stateless shapes 150 and
-      #     decode_chunk_frames + decode_left_context_frames (325 by default).
-      #     Extra stateless shapes may be added (union, not intersection) with:
-      #       decode_cudagraph_capture_sizes: [97, 400]
-      # Graph batch size defaults to 1. Add larger buckets only when needed:
-      #   decode_cudagraph_batch_sizes: [1, 2, 4]
-      # Limit eager batches to reduce temporary stateful cache allocations; CUDA Graph batching uses the buckets above.
-      decode_batch_max_size: 4
 
 stages:
   - stage_id: 0
@@ -110,6 +97,20 @@ stages:
     # accumulated flat codec stream.
     max_model_len: 65536
     devices: "0"
+    # Target Descriptors are resolved by qwen3_tts/vocoder_cudagraph.py from
+    # this policy plus the connector chunk contract. This example shows only
+    # the stateless Target; enabled=true, lazy=false, and max_extra_graphs=0
+    # are the framework defaults. Stateful ICL/x-vector/suffix Targets are
+    # derived from async connector transitions and need no YAML entries.
+    vocoder_cudagraph:
+      # Decoder batching is graph/runtime policy, not connector delivery
+      # metadata. This also limits eager stateful fallback batches.
+      decode_batch_max_size: 4
+      targets:
+        qwen3_tts.stateless:
+          # Used when async_chunk=false; async stateful shapes are derived
+          # from codec_chunk_frames/initial_codec_chunk_frames above.
+          capture_bucket_sizes: [150, 325]
     input_connectors:
       from_stage_0: connector_of_shared_memory
     default_sampling_params:

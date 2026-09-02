@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -850,10 +853,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
         self.post_init()
 
-        # CUDA Graph support
-        self._cudagraph_enabled = False
-        self._cudagraph_wrapper = None
-
     def precompute_snake_caches(self):
         """Precompute exp(alpha) and 1/(exp(beta)+eps) for all SnakeBeta modules."""
         count = 0
@@ -864,57 +863,14 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         if count > 0:
             logger.info("Precomputed exp caches for %d SnakeBeta activations", count)
 
-    def enable_cudagraph(
-        self,
-        capture_batch_sizes: list[int] | None = None,
-        stateless_capture_sizes: list[int] | None = None,
-        device: torch.device | None = None,
-        codec_chunk_frames: int = 0,
-        codec_left_context_frames: int = 0,
-        initial_codec_chunk_frames: int = 1,
-        codec_chunk_ramp: list[int] | None = None,
-        async_chunk: bool = True,
-        decode_chunk_size: int = 300,
-        decode_left_context: int = 25,
-    ):
-        # from ..cuda_graph_decoder_wrapper import CUDAGraphDecoderWrapper
-        from ..segmented_graph_wrapper import CUDAGraphDecoderWrapper
-
-        if device is None:
-            device = next(self.parameters()).device
-        if device.type != "cuda":
-            logger.warning("Cannot enable CUDA Graph: decoder is not on a CUDA device (got %s)", device)
-            return
-
-        self._cudagraph_wrapper = CUDAGraphDecoderWrapper(
-            decoder=self,
-            capture_batch_sizes=capture_batch_sizes,
-            stateless_capture_sizes=stateless_capture_sizes,
-            num_quantizers=self.config.num_quantizers,
-            enabled=True,
-            async_chunk=async_chunk,
-            initial_chunk_frames=initial_codec_chunk_frames,
-            codec_chunk_frames=codec_chunk_frames or 25,
-            codec_chunk_ramp=codec_chunk_ramp,
-            decode_chunk_size=decode_chunk_size,
-            decode_left_context=decode_left_context,
-        )
-        self._incremental_chunk_frames = codec_chunk_frames or 25
-        self._incremental_chunk_ramp = list(codec_chunk_ramp or ())
-        self._cudagraph_wrapper.warmup(
-            device,
-            dtype=torch.long,
-        )
-        self._cudagraph_enabled = True
-        logger.info(
-            "CUDA Graph enabled for decoder: batch_sizes=%s seq_lens=%s",
-            self._cudagraph_wrapper.capture_batch_sizes,
-            (
-                self._cudagraph_wrapper.icl_capture_sizes
-                if async_chunk
-                else self._cudagraph_wrapper.stateless_capture_sizes
-            ),
-        )
+    def _get_vocoder_graph_target(self, name: str):
+        target_ref = getattr(self, f"_{name}_cudagraph_target_ref", None)
+        if target_ref is None:
+            raise RuntimeError(f"Qwen3-TTS Target {name!r} is unavailable before load_weights()")
+        target = target_ref()
+        if target is None:
+            raise RuntimeError(f"Qwen3-TTS Target {name!r} disappeared after model setup")
+        return target
 
     def _forward_exact(self, codes):
         hidden = self.quantizer.decode(codes)
@@ -1109,6 +1065,27 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         suffix_cache_length = int(self.config.sliding_window)
         return previous_suffix_frames >= suffix_cache_length and cached_frames == suffix_cache_length
 
+    def _ensure_suffix_state_buffers(self, caches: dict[str, Any]) -> None:
+        """Allocate stable request-local suffix-state storage once."""
+        if "_suffix_quantized_buffer" in caches:
+            return
+
+        suffix_quantized = caches["suffix_quantized"]
+        suffix_conv = caches["suffix_conv"]
+        quantized_capacity = int(self.config.sliding_window)
+        conv_capacity = quantized_capacity - _CONV_CONTEXT_FRAME
+        quantized_buffer = suffix_quantized.new_zeros((*suffix_quantized.shape[:-1], quantized_capacity))
+        conv_buffer = suffix_conv.new_zeros((suffix_conv.shape[0], conv_capacity, suffix_conv.shape[-1]))
+        quantized_valid = min(int(suffix_quantized.shape[-1]), quantized_capacity)
+        conv_valid = min(int(suffix_conv.shape[1]), conv_capacity)
+        quantized_buffer[:, :, :quantized_valid].copy_(suffix_quantized[:, :, -quantized_valid:])
+        conv_buffer[:, :conv_valid, :].copy_(suffix_conv[:, -conv_valid:, :])
+        caches["_suffix_quantized_buffer"] = quantized_buffer
+        caches["_suffix_conv_buffer"] = conv_buffer
+        caches.setdefault("suffix_frames", int(suffix_quantized.shape[-1]))
+        caches["suffix_quantized"] = quantized_buffer[:, :, :quantized_valid]
+        caches["suffix_conv"] = conv_buffer[:, :conv_valid, :]
+
     def decode_suffix(self, new_codes, caches, prefix_frames):
         previous_suffix_frames = int(caches.get("suffix_frames", caches["suffix_quantized"].shape[-1]))
         cached_frames = int(caches["suffix_quantized"].shape[-1])
@@ -1148,7 +1125,10 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         if codes.shape[1] != self.config.num_quantizers:
             raise ValueError(f"Expected {self.config.num_quantizers} layer of codes, got {codes.shape[1]}")
 
-        if caches is None or caches.get("_is_dummy_run", False):
+        if caches is None:
+            return self._get_vocoder_graph_target("stateless")(codes)
+
+        if caches.get("_is_dummy_run", False):
             return self._forward_exact(codes)
 
         prefix_frames = int(caches["prefix_frames"])
@@ -1178,16 +1158,8 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         chunk_size=300,
         left_context_size=25,
     ):
-        # Use CUDA graph if enabled
-        if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
-            return self._cudagraph_wrapper.chunked_decode_with_cudagraph(
-                codes,
-                caches=caches,
-                chunk_size=chunk_size,
-                left_context_size=left_context_size,
-            )
-
-        # Original implementation (eager mode)
+        # The runner-owned Target migration keeps this helper eager. Stateful
+        # graph callbacks are selected by batched_request_decode below.
         wavs = []
         start_index = 0
         while start_index < codes.shape[-1]:
@@ -1379,7 +1351,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             suffix_mask[row, :prefix_pad] = 0
 
         batched_cache: dict[str, Any] = {}
-        output = self._decode_icl_first_chunk(
+        output = self._get_vocoder_graph_target("icl_prefix")(
             batched_codes,
             batched_cache,
             prefix_length,
@@ -1395,6 +1367,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             cache["decoder_prefix_frames"] = prefix_length
             cache["prefix_pad_frames"] = prefix_pad
             cache["suffix_frames"] = initial_chunk_frames
+            self._ensure_suffix_state_buffers(cache)
             outputs.append(output[row : row + 1, :, -initial_chunk_frames * self.total_upsample :].clone())
         return outputs
 
@@ -1409,7 +1382,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             return None
         batched_codes = torch.cat(codes_list, dim=0)
         batched_cache: dict[str, Any] = {}
-        output = self._decode_xvec_first_chunk(batched_codes, batched_cache)
+        output = self._get_vocoder_graph_target("xvec_prefix")(batched_codes, batched_cache)
         outputs: list[torch.Tensor] = []
         for row, cache in enumerate(request_caches):
             for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"):
@@ -1417,6 +1390,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             cache["past_key_values"] = self._slice_dynamic_cache(batched_cache["past_key_values"], row)
             cache["decoder_prefix_frames"] = 0
             cache["suffix_frames"] = initial_chunk_frames
+            self._ensure_suffix_state_buffers(cache)
             outputs.append(output[row : row + 1].clone())
         return outputs
 
@@ -1442,50 +1416,13 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         if any(not 0 < new_frames <= expected_new_frames for new_frames in new_frames_list):
             return None
 
-        batched_codes = codes_list[0].new_zeros((len(codes_list), codes_list[0].shape[1], expected_new_frames))
-        for row, (codes, new_frames) in enumerate(zip(codes_list, new_frames_list, strict=True)):
-            batched_codes[row, :, :new_frames].copy_(codes[0, :, -new_frames:])
-        batched_cache = {
-            key: torch.cat([cache[key] for cache in request_caches], dim=0)
-            for key in ("ref_hidden", "ref_conv", "prefix_hidden")
-        }
-        try:
-            batched_cache["past_key_values"] = self._batch_dynamic_caches(
-                [cache["past_key_values"] for cache in request_caches]
-            )
-        except ValueError:
-            return None
-        attention_mask = torch.ones(
-            len(codes_list),
-            (prefix_length if mode == "icl" else 0) + previous_frames + expected_new_frames,
-            dtype=torch.bool,
-            device=batched_codes.device,
+        return self._get_vocoder_graph_target("suffix")(
+            mode,
+            target_frames,
+            codes_list,
+            request_caches,
+            new_frames_list,
         )
-        if mode == "icl":
-            for row, cache in enumerate(request_caches):
-                attention_mask[row, : int(cache.get("prefix_pad_frames", 0))] = 0
-        old_quantized = torch.cat([cache["suffix_quantized"] for cache in request_caches], dim=0)
-        old_conv = torch.cat([cache["suffix_conv"] for cache in request_caches], dim=0)
-        rolling = self._is_suffix_cache_rolling(previous_frames, int(old_quantized.shape[-1]))
-        output, next_quantized, next_conv = self._decode_suffix(
-            batched_codes,
-            old_quantized,
-            old_conv,
-            batched_cache,
-            prefix_length if mode == "icl" else 0,
-            expected_new_frames,
-            rolling,
-            attention_mask=attention_mask,
-        )
-
-        outputs: list[torch.Tensor] = []
-        for row, (cache, new_frames) in enumerate(zip(request_caches, new_frames_list, strict=True)):
-            outputs.append(output[row : row + 1, :, : new_frames * self.total_upsample].clone())
-            if new_frames == expected_new_frames:
-                cache["suffix_quantized"] = next_quantized[row : row + 1].clone()
-                cache["suffix_conv"] = next_conv[row : row + 1].clone()
-                cache["suffix_frames"] = target_frames
-        return outputs
 
     def batched_chunked_decode(
         self,
@@ -1496,20 +1433,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         left_context_size=25,
         max_batch_size=0,
     ):
-        if (
-            self._cudagraph_enabled
-            and self._cudagraph_wrapper is not None
-            and hasattr(self._cudagraph_wrapper, "batched_chunked_decode_with_cudagraph")
-        ):
-            return self._cudagraph_wrapper.batched_chunked_decode_with_cudagraph(
-                codes,
-                lengths,
-                caches=caches,
-                chunk_size=chunk_size,
-                left_context_size=left_context_size,
-                max_batch_size=max_batch_size,
-            )
-
         if caches is not None:
             prefix_length = int(getattr(self.config, "sliding_window", 0) or 0)
             initial_codec_chunk_frames = int(getattr(self, "_initial_codec_chunk_frames", 1))
