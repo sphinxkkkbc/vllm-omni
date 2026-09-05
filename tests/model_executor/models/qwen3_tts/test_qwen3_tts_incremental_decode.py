@@ -880,18 +880,16 @@ def test_batched_suffix_graph_updates_preallocated_state_buffers(monkeypatch):
     decoder._ensure_suffix_state_buffers(cache)
     first_quantized_buffer = cache["suffix_quantized"]
     first_conv_buffer = cache["suffix_conv"]
-    suffix_routine = decoder._get_vocoder_graph_target("suffix").routine
 
     def suffix_target(mode, target_frames, codes_list, request_caches, new_frames_list):
         del mode
         value = float(target_frames)
-        outputs = []
-        for codes, request_cache, new_frames in zip(codes_list, request_caches, new_frames_list, strict=True):
-            quantized = torch.full((1, codebook_dim, target_frames), value)
-            conv = torch.full((1, target_frames - _CONV_CONTEXT_FRAME, latent_dim), value)
-            suffix_routine._commit_suffix_graph_state(request_cache, quantized, conv, target_frames)
-            outputs.append(torch.full((1, 1, new_frames * decoder.total_upsample), value))
-        return outputs
+        batch_size = len(codes_list)
+        return (
+            torch.full((batch_size, 1, new_frames_list[0] * decoder.total_upsample), value),
+            torch.full((batch_size, codebook_dim, target_frames), value),
+            torch.full((batch_size, target_frames - _CONV_CONTEXT_FRAME, latent_dim), value),
+        )
 
     monkeypatch.setattr(decoder, "_get_vocoder_graph_target", lambda name: suffix_target)
     codes = torch.zeros(1, decoder.config.num_quantizers, 25)
@@ -964,8 +962,7 @@ def test_eager_suffix_fallback_preserves_preallocated_state_buffer(monkeypatch):
     torch.testing.assert_close(cache["suffix_quantized"], eager_quantized)
     torch.testing.assert_close(cache["suffix_conv"], eager_conv)
 
-    suffix_routine = decoder._get_vocoder_graph_target("suffix").routine
-    suffix_routine._commit_suffix_graph_state(
+    decoder._commit_suffix_state(
         cache,
         torch.full((1, codebook_dim, 3), 5.0),
         torch.full((1, 3 - _CONV_CONTEXT_FRAME, latent_dim), 6.0),

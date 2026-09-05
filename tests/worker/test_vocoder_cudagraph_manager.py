@@ -20,10 +20,10 @@ from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
     VocoderCUDAGraphDescriptor,
     VocoderCUDAGraphEntry,
     VocoderCUDAGraphTarget,
+    VocoderGraphHandle,
     VocoderRuntimeKey,
     VocoderRuntimeResolution,
 )
-from vllm_omni.worker.vocoder_cudagraph_handle import VocoderGraphHandle
 from vllm_omni.worker.vocoder_cudagraph_manager import VocoderCUDAGraphManager, clone_tensor_tree
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

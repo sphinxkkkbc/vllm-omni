@@ -267,15 +267,14 @@ def test_icl_prefix_graph_cache_keeps_physical_prefix_length() -> None:
         },
         buffers,
     )
-    output = routine.output_after_replay((runtime_codes, runtime_cache), {}, buffers, entry.captured_output)
+    output, state = routine.output_after_replay((runtime_codes, runtime_cache), {}, buffers, entry.captured_output)
 
     assert buffers.codes.shape == (2, 2, 12)
     torch.testing.assert_close(buffers.codes[0, :, :7], runtime_codes[0])
     torch.testing.assert_close(buffers.codes[0, :, 7:], torch.zeros(2, 5, dtype=torch.long))
-    assert runtime_cache["decoder_prefix_frames"] == 10
-    assert runtime_cache["past_key_values"].get_seq_length() == 0
-    # The Routine returns the captured physical shape. The model's eager
-    # batching layer owns request-specific suffix trimming after this call.
+    assert runtime_cache == {}
+    assert state["decoder_prefix_frames"] == 10
+    assert state["past_key_values"].get_seq_length() == 0
     assert output.shape == (1, 2, 12)
 
 
@@ -355,11 +354,12 @@ def test_xvec_first_chunk_replays_prefix_graph() -> None:
     runtime_codes = torch.ones(1, 2, 2, dtype=torch.long)
     runtime_cache: dict[str, object] = {}
     routine.copy_runtime_inputs((runtime_codes, runtime_cache), {}, buffers)
-    output = routine.output_after_replay((runtime_codes, runtime_cache), {}, buffers, captured_output)
+    output, state = routine.output_after_replay((runtime_codes, runtime_cache), {}, buffers, captured_output)
 
+    assert runtime_cache == {}
+    assert state["decoder_prefix_frames"] == 0
+    assert state["past_key_values"].get_seq_length() == 0
     assert output.shape == (1, 2, 2)
-    assert runtime_cache["decoder_prefix_frames"] == 0
-    assert runtime_cache["past_key_values"].get_seq_length() == 0
 
 
 def test_qwen3_tts_suffix_routine_uses_physical_cache_lengths() -> None:
@@ -449,6 +449,47 @@ def test_suffix_routine_copies_request_state_without_batched_cat(monkeypatch) ->
     torch.testing.assert_close(buffers.quantized[1], caches[1]["suffix_quantized"][0])
 
 
+def test_suffix_output_after_replay_does_not_mutate_request_cache() -> None:
+    decoder = _StatefulDecoder()
+    targets = build_stateful_targets(
+        decoder=decoder,
+        vllm_config=_config(async_chunk=True),
+        num_quantizers=2,
+        prefix_length=10,
+        capture_batch_sizes=[1],
+        initial_frames=2,
+        chunk_frames=3,
+        chunk_ramp=None,
+    )
+    routine = targets[2].routine
+    cache = {
+        "suffix_frames": 2,
+        "suffix_quantized": torch.ones(1, 3, 2),
+        "suffix_conv": torch.ones(1, 2, 2),
+    }
+    quantized_before = cache["suffix_quantized"].clone()
+    conv_before = cache["suffix_conv"].clone()
+    codes = torch.zeros(1, 2, 3)
+    captured_output = (
+        torch.full((1, 1, 12), 1.0),
+        torch.full((1, 3, 5), 2.0),
+        torch.full((1, 3, 2), 3.0),
+    )
+
+    output = routine.output_after_replay(
+        ("xvec", 5, [codes], [cache], [3]),
+        {},
+        object(),
+        captured_output,
+    )
+
+    for actual, expected in zip(output, captured_output, strict=True):
+        torch.testing.assert_close(actual, expected)
+    assert cache["suffix_frames"] == 2
+    torch.testing.assert_close(cache["suffix_quantized"], quantized_before)
+    torch.testing.assert_close(cache["suffix_conv"], conv_before)
+
+
 def test_qwen3_tts_stateful_targets_are_config_derived_and_target_local() -> None:
     decoder = _StatefulDecoder()
     targets = build_stateful_targets(
@@ -503,8 +544,10 @@ def test_segmented_capture_sizes_are_derived_from_decoder_and_chunk_config() -> 
 
 
 def test_target_owns_descriptor_namespace_and_binding_is_reversible() -> None:
-    from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import VocoderCUDAGraphTarget
-    from vllm_omni.worker.vocoder_cudagraph_handle import VocoderGraphHandle
+    from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
+        VocoderCUDAGraphTarget,
+        VocoderGraphHandle,
+    )
 
     routine = Qwen3TTSStatelessRoutine(
         decoder=_Decoder(),
@@ -520,6 +563,8 @@ def test_target_owns_descriptor_namespace_and_binding_is_reversible() -> None:
     handle = VocoderGraphHandle(lambda codes: codes + 1)
     target._bind_handle(handle)
     assert torch.equal(target(torch.zeros(1)), torch.ones(1))
+    with pytest.raises(TypeError, match="VocoderGraphHandle"):
+        target._bind_handle(lambda codes: codes)  # type: ignore[arg-type]
     with pytest.raises(RuntimeError, match="already bound"):
         target._bind_handle(handle)
     target._restore_eager()

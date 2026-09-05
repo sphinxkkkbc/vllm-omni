@@ -1086,6 +1086,80 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         caches["suffix_quantized"] = quantized_buffer[:, :, :quantized_valid]
         caches["suffix_conv"] = conv_buffer[:, :conv_valid, :]
 
+    def _commit_suffix_state(
+        self,
+        caches: dict[str, Any],
+        next_quantized: torch.Tensor,
+        next_conv: torch.Tensor,
+        target_frames: int,
+    ) -> None:
+        """Commit one suffix transition into request-owned decoder state.
+
+        This semantic state transition is shared by eager compute and CUDA
+        Graph replay result finalization.
+        """
+        self._ensure_suffix_state_buffers(caches)
+        quantized_buffer = caches["_suffix_quantized_buffer"]
+        conv_buffer = caches["_suffix_conv_buffer"]
+        quantized_valid = int(next_quantized.shape[-1])
+        conv_valid = int(next_conv.shape[1])
+        quantized_buffer[:, :, :quantized_valid].copy_(next_quantized)
+        conv_buffer[:, :conv_valid, :].copy_(next_conv)
+        caches["suffix_frames"] = target_frames
+        caches["suffix_quantized"] = quantized_buffer[:, :, :quantized_valid]
+        caches["suffix_conv"] = conv_buffer[:, :conv_valid, :]
+
+    def _finalize_prefix_result(
+        self,
+        result: torch.Tensor | tuple[torch.Tensor, dict[str, Any]],
+        eager_state: dict[str, Any],
+        request_caches: list[dict[str, Any]],
+        *,
+        initial_chunk_frames: int,
+        prefix_pads: list[int] | None,
+    ) -> list[torch.Tensor]:
+        if isinstance(result, tuple):
+            wav, state = result
+        else:
+            wav, state = result, eager_state
+
+        outputs: list[torch.Tensor] = []
+        for row, cache in enumerate(request_caches):
+            for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"):
+                cache[key] = state[key][row : row + 1].clone()
+            cache["past_key_values"] = self._slice_dynamic_cache(state["past_key_values"], row)
+            cache["decoder_prefix_frames"] = int(state["decoder_prefix_frames"])
+            if prefix_pads is not None:
+                cache["prefix_pad_frames"] = prefix_pads[row]
+            cache["suffix_frames"] = initial_chunk_frames
+            self._ensure_suffix_state_buffers(cache)
+            wav_slice = wav[row : row + 1]
+            if prefix_pads is not None:
+                wav_slice = wav_slice[..., -initial_chunk_frames * self.total_upsample :]
+            outputs.append(wav_slice.clone())
+        return outputs
+
+    def _finalize_suffix_result(
+        self,
+        result: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        request_caches: list[dict[str, Any]],
+        new_frames_list: list[int],
+        target_frames: int,
+        expected_new_frames: int,
+    ) -> list[torch.Tensor]:
+        wav, next_quantized, next_conv = result
+        outputs: list[torch.Tensor] = []
+        for row, (cache, new_frames) in enumerate(zip(request_caches, new_frames_list, strict=True)):
+            outputs.append(wav[row : row + 1, :, : new_frames * self.total_upsample].clone())
+            if new_frames == expected_new_frames:
+                self._commit_suffix_state(
+                    cache,
+                    next_quantized[row : row + 1],
+                    next_conv[row : row + 1],
+                    target_frames,
+                )
+        return outputs
+
     def decode_suffix(self, new_codes, caches, prefix_frames):
         previous_suffix_frames = int(caches.get("suffix_frames", caches["suffix_quantized"].shape[-1]))
         cached_frames = int(caches["suffix_quantized"].shape[-1])
@@ -1116,9 +1190,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             rolling,
             attention_mask=attention_mask,
         )
-        caches["suffix_quantized"] = next_quantized
-        caches["suffix_conv"] = next_conv
-        caches["suffix_frames"] = retained_frames + new_frames
+        self._commit_suffix_state(caches, next_quantized, next_conv, retained_frames + new_frames)
         return output
 
     def forward(self, codes, caches=None):
@@ -1359,17 +1431,13 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             prefix_attention_mask=prefix_mask,
             suffix_attention_mask=suffix_mask,
         )
-        outputs: list[torch.Tensor] = []
-        for row, (cache, prefix_pad) in enumerate(zip(request_caches, prefix_pads, strict=True)):
-            for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"):
-                cache[key] = batched_cache[key][row : row + 1].clone()
-            cache["past_key_values"] = self._slice_dynamic_cache(batched_cache["past_key_values"], row)
-            cache["decoder_prefix_frames"] = prefix_length
-            cache["prefix_pad_frames"] = prefix_pad
-            cache["suffix_frames"] = initial_chunk_frames
-            self._ensure_suffix_state_buffers(cache)
-            outputs.append(output[row : row + 1, :, -initial_chunk_frames * self.total_upsample :].clone())
-        return outputs
+        return self._finalize_prefix_result(
+            output,
+            batched_cache,
+            request_caches,
+            initial_chunk_frames=initial_chunk_frames,
+            prefix_pads=prefix_pads,
+        )
 
     def _decode_xvec_prefix_eager_batch(
         self,
@@ -1383,16 +1451,13 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         batched_codes = torch.cat(codes_list, dim=0)
         batched_cache: dict[str, Any] = {}
         output = self._get_vocoder_graph_target("xvec_prefix")(batched_codes, batched_cache)
-        outputs: list[torch.Tensor] = []
-        for row, cache in enumerate(request_caches):
-            for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"):
-                cache[key] = batched_cache[key][row : row + 1].clone()
-            cache["past_key_values"] = self._slice_dynamic_cache(batched_cache["past_key_values"], row)
-            cache["decoder_prefix_frames"] = 0
-            cache["suffix_frames"] = initial_chunk_frames
-            self._ensure_suffix_state_buffers(cache)
-            outputs.append(output[row : row + 1].clone())
-        return outputs
+        return self._finalize_prefix_result(
+            output,
+            batched_cache,
+            request_caches,
+            initial_chunk_frames=initial_chunk_frames,
+            prefix_pads=None,
+        )
 
     def _decode_suffix_eager_batch(
         self,
@@ -1416,12 +1481,19 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         if any(not 0 < new_frames <= expected_new_frames for new_frames in new_frames_list):
             return None
 
-        return self._get_vocoder_graph_target("suffix")(
+        result = self._get_vocoder_graph_target("suffix")(
             mode,
             target_frames,
             codes_list,
             request_caches,
             new_frames_list,
+        )
+        return self._finalize_suffix_result(
+            result,
+            request_caches,
+            new_frames_list,
+            target_frames,
+            expected_new_frames,
         )
 
     def batched_chunked_decode(

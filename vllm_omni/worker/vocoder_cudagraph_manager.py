@@ -27,9 +27,9 @@ from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
     VocoderCUDAGraphDescriptor,
     VocoderCUDAGraphEntry,
     VocoderCUDAGraphTarget,
+    VocoderGraphHandle,
     VocoderRuntimeResolution,
 )
-from vllm_omni.worker.vocoder_cudagraph_handle import VocoderGraphHandle
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,6 @@ _FRAMEWORK_CONFIG_KEYS = frozenset(
     {
         "max_memory_bytes",
         "log_stats",
-        "stats_max_runtime_keys",
         "targets",
     }
 )
@@ -115,16 +114,17 @@ class _TargetRecorder:
 
 
 class VocoderGraphStatsSink:
-    """Manager-read, Recorder-write bounded runtime counters."""
+    """Manager-read, Recorder-write runtime counters."""
 
-    def __init__(self, *, enabled: bool, max_runtime_keys: int) -> None:
+    def __init__(self, *, enabled: bool) -> None:
         self.enabled = enabled
-        self.max_runtime_keys = max_runtime_keys
         self._lock = threading.Lock()
         self._calls: Counter[str] = Counter()
         self._outcomes: Counter[tuple[str, str]] = Counter()
+        # Counts graph specializations actually selected for replay.
         self._descriptors: Counter[tuple[str, object]] = Counter()
-        self._runtime_keys: OrderedDict[tuple[str, object], int] = OrderedDict()
+        # Counts runtime keys observed before Descriptor bucket selection.
+        self._runtime_keys: Counter[tuple[str, object]] = Counter()
 
     def recorder_for(self, target_id: str) -> _TargetRecorder | _NoOpRecorder:
         if not self.enabled:
@@ -143,10 +143,7 @@ class VocoderGraphStatsSink:
             if resolution.descriptor is not None:
                 self._descriptors[(target_id, resolution.descriptor.variant)] += 1
             key = (target_id, resolution.runtime_key.variant)
-            self._runtime_keys[key] = self._runtime_keys.get(key, 0) + 1
-            self._runtime_keys.move_to_end(key)
-            while len(self._runtime_keys) > self.max_runtime_keys:
-                self._runtime_keys.popitem(last=False)
+            self._runtime_keys[key] += 1
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
@@ -179,35 +176,9 @@ class VocoderCUDAGraphManager:
         if not isinstance(raw_config, Mapping):
             raise TypeError("vocoder_cudagraph must be a mapping")
         self.config = dict(raw_config)
-        self.max_memory_bytes = self._optional_nonnegative_int(
-            self.config.get("max_memory_bytes"),
-            "vocoder_cudagraph.max_memory_bytes",
-        )
-        log_stats = self._bool_value(self.config.get("log_stats", False), "vocoder_cudagraph.log_stats")
-        stats_max_runtime_keys = self._nonnegative_int(
-            self.config.get("stats_max_runtime_keys", 128),
-            "vocoder_cudagraph.stats_max_runtime_keys",
-        )
-        self.stats_sink = VocoderGraphStatsSink(
-            enabled=log_stats,
-            max_runtime_keys=stats_max_runtime_keys,
-        )
-
-    @staticmethod
-    def _bool_value(value: object, path: str) -> bool:
-        if not isinstance(value, bool):
-            raise TypeError(f"{path} must be a bool")
-        return value
-
-    @staticmethod
-    def _nonnegative_int(value: object, path: str) -> int:
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError(f"{path} must be a non-negative integer")
-        return value
-
-    @classmethod
-    def _optional_nonnegative_int(cls, value: object, path: str) -> int | None:
-        return None if value is None else cls._nonnegative_int(value, path)
+        self.max_memory_bytes = self.config.get("max_memory_bytes")
+        log_stats = self.config.get("log_stats", False)
+        self.stats_sink = VocoderGraphStatsSink(enabled=log_stats)
 
     @staticmethod
     def _model_shared_config_keys(model: object) -> frozenset[str]:
@@ -270,18 +241,9 @@ class VocoderCUDAGraphManager:
             if unknown_keys:
                 names = ", ".join(sorted(unknown_keys))
                 raise ValueError(f"Unknown config key(s) for vocoder Target {target_id}: {names}")
-            enabled = self._bool_value(
-                raw_target.get("enabled", True),
-                f"vocoder_cudagraph.targets.{target_id}.enabled",
-            )
-            lazy = self._bool_value(
-                raw_target.get("enable_lazy_capture", False),
-                f"vocoder_cudagraph.targets.{target_id}.enable_lazy_capture",
-            )
-            max_extra = self._nonnegative_int(
-                raw_target.get("max_extra_graphs", 0),
-                f"vocoder_cudagraph.targets.{target_id}.max_extra_graphs",
-            )
+            enabled = raw_target.get("enabled", True)
+            lazy = raw_target.get("enable_lazy_capture", False)
+            max_extra = raw_target.get("max_extra_graphs", 0)
             self._target_configs[target_id] = VocoderTargetRuntimeConfig(
                 enabled=enabled,
                 enable_lazy_capture=lazy,
@@ -565,6 +527,8 @@ class VocoderCUDAGraphManager:
                     managed,
                     self.stats_sink.recorder_for(target_id),
                 )
+                # Bind one opaque runtime endpoint to the stable model-owned
+                # Target; GraphEntry/Descriptor internals stay manager-owned.
                 target._bind_handle(VocoderGraphHandle(runtime_callable))
             except Exception:
                 target._restore_eager()

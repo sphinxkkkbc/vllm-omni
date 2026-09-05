@@ -55,12 +55,34 @@ class VocoderCUDAGraphEntry:
     replay_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
 
-class VocoderGraphCallable(Protocol):
-    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
+class VocoderGraphHandle:
+    """Opaque runtime endpoint for one bound vocoder CUDA Graph Target.
+
+    The Handle type is shared by the model-facing Target and worker-side
+    Manager, but Handle instances are manager-created and manager-owned. It
+    deliberately hides graph entries, descriptors, replay buffers, and
+    dispatch policy from model code.
+    """
+
+    __slots__ = ("_call",)
+
+    def __init__(self, call: Callable[..., Any]) -> None:
+        self._call = call
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call(*args, **kwargs)
 
 
 class VocoderCUDAGraphRoutine(Protocol):
-    """Model-specific interpreter for one exact eager runnable."""
+    """Model-specific adapter for graph-shape resolution and static-buffer handling.
+
+    A Routine owns graph-shape resolution and static-buffer adaptation. Request/model
+    semantic state transitions are generally kept in the model execution path to
+    preserve ownership boundaries.
+
+    Runtime ``args`` and ``kwargs`` provide context for descriptor selection,
+    replay-input preparation, and logical output materialization.
+    """
 
     target_id: str
 
@@ -91,9 +113,23 @@ class VocoderCUDAGraphRoutine(Protocol):
         self,
         descriptor: VocoderCUDAGraphDescriptor,
         device: torch.device,
-    ) -> object: ...
+    ) -> object:
+        """Allocate descriptor-owned static buffers used by capture and replay.
 
-    def prepare_for_capture(self, buffers: object) -> None: ...
+        The returned object is owned by the graph entry. Request-local semantic
+        state should generally remain model-owned rather than being transferred
+        into the graph-buffer lifecycle.
+        """
+        ...
+
+    def prepare_for_capture(self, buffers: object) -> None:
+        """Prepare graph-owned buffers for warmup/capture.
+
+        This hook is intended for initializing or normalizing static graph state
+        required by the captured callable. Runtime invocation-specific semantics
+        are preferably kept outside the capture lifecycle.
+        """
+        ...
 
     def forward_for_capture(self, buffers: object) -> object: ...
 
@@ -102,7 +138,15 @@ class VocoderCUDAGraphRoutine(Protocol):
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         buffers: object,
-    ) -> None: ...
+    ) -> None:
+        """Adapt one runtime invocation into descriptor-owned replay buffers.
+
+        ``args`` and ``kwargs`` provide the runtime context needed to populate or
+        normalize static graph buffers. Request/model semantic state transitions
+        are preferably kept in the model execution path rather than coupled to
+        replay-buffer preparation.
+        """
+        ...
 
     def output_after_replay(
         self,
@@ -110,13 +154,35 @@ class VocoderCUDAGraphRoutine(Protocol):
         kwargs: dict[str, Any],
         buffers: object,
         captured_output: object,
-    ) -> object: ...
+    ) -> object:
+        """Materialize a runtime-visible result from captured graph output.
 
-    def reset_after_capture(self, buffers: object) -> None: ...
+        ``args`` and ``kwargs`` provide runtime context such as the logical batch
+        size or output extent. Implementations may use them to select, slice, or
+        clone graph-owned outputs. Request/model semantic state commit is generally
+        better kept in the model execution path to preserve ownership boundaries.
+        """
+        ...
+
+    def reset_after_capture(self, buffers: object) -> None:
+        """Restore graph-owned buffers after warmup/capture.
+
+        This hook is intended for capture-local cleanup or normalization of
+        descriptor-owned buffers. Request/model semantic state is generally better
+        restored by the model-side lifecycle that owns that state.
+        """
+        ...
 
 
 class BaseVocoderCUDAGraphRoutine:
-    """Optional no-op defaults that do not interpret model-specific data."""
+    """Model-specific adapter between runtime calls and static CUDA Graph buffers.
+
+    A Routine owns graph-shape resolution and static-buffer adaptation.
+    Request/model semantic state transitions are generally kept in the model
+    execution path to preserve ownership boundaries. Runtime ``args`` and
+    ``kwargs`` provide context for descriptor selection, replay-input
+    preparation, and logical output materialization.
+    """
 
     def validate_runtime_inputs(
         self,
@@ -139,7 +205,12 @@ class BaseVocoderCUDAGraphRoutine:
 
 
 class VocoderCUDAGraphTarget:
-    """Resolved planning declaration and stable model-owned call site."""
+    """Resolved planning declaration and stable model-owned call site.
+
+    Before Manager binding, the delegate is ``Routine.eager_call``. After
+    binding, it is the Manager-created ``VocoderGraphHandle``. Restoring or
+    clearing the Target returns the delegate to ``Routine.eager_call``.
+    """
 
     def __init__(
         self,
@@ -158,12 +229,16 @@ class VocoderCUDAGraphTarget:
         self.clone_output = bool(clone_output)
         self.supported_config_keys = frozenset(supported_config_keys)
         self._delegate: Callable[..., Any] = routine.eager_call
-        self._bound_handle: VocoderGraphCallable | None = None
+        # The Target owns the stable call site, not the runtime Handle
+        # lifecycle. The Manager constructs and binds the Handle after capture.
+        self._bound_handle: VocoderGraphHandle | None = None
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self._delegate(*args, **kwargs)
 
-    def _bind_handle(self, handle: VocoderGraphCallable) -> None:
+    def _bind_handle(self, handle: VocoderGraphHandle) -> None:
+        if not isinstance(handle, VocoderGraphHandle):
+            raise TypeError("VocoderCUDAGraphTarget requires a VocoderGraphHandle")
         if self._bound_handle is not None:
             raise RuntimeError(f"Target already bound: {self.target_id}")
         self._bound_handle = handle

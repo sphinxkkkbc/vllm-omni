@@ -163,6 +163,7 @@ class Qwen3TTSStatelessRoutine(BaseVocoderCUDAGraphRoutine):
         output = captured_output
         if not isinstance(output, torch.Tensor):
             raise TypeError("Qwen3-TTS stateless graph output must be a Tensor")
+        # Runtime args only recover logical extent from descriptor-sized output.
         return output[
             : codes.shape[0],
             ...,
@@ -217,6 +218,11 @@ class _SuffixBuffers:
 
 
 def _slice_dynamic_cache_batch(cache: DynamicCache, batch_size: int) -> DynamicCache:
+    """Clone graph-owned static cache into detached result data.
+
+    The caller/model may later commit this data into request-owned state; this
+    helper itself never receives or mutates a request cache.
+    """
     result = copy.deepcopy(cache)
     for layer in result.layers:
         if layer.keys is not None:
@@ -227,6 +233,11 @@ def _slice_dynamic_cache_batch(cache: DynamicCache, batch_size: int) -> DynamicC
 
 
 def _copy_dynamic_cache_row(source: DynamicCache, target: DynamicCache, row: int) -> None:
+    """Copy request KV contents into one graph-owned static cache row.
+
+    This is replay-input preparation only and must not commit replay output
+    into request-owned decoder state.
+    """
     for source_layer, target_layer in zip(source.layers, target.layers, strict=True):
         if source_layer.keys is None or source_layer.values is None:
             if target_layer.keys is not None and target_layer.keys.numel() != 0:
@@ -248,7 +259,11 @@ def _materialize_cache_bookkeeping(
     head_dim: int | None = None,
     num_layers: int | None = None,
 ) -> None:
-    """Initialize cache metadata on-device without changing logical KV state."""
+    """Materialize graph-owned DynamicCache metadata before capture.
+
+    This prepares dummy/static state required by the captured callable and
+    does not represent or advance request-level decoder state.
+    """
 
     for layer in cache.layers:
         if (
@@ -442,17 +457,19 @@ class Qwen3TTSIclPrefixRoutine(_Qwen3TTSStatefulRoutineBase):
                 source[: value.shape[0], ...].copy_(value)
         del runtime_cache
 
-    def output_after_replay(self, args, kwargs, buffers: object, captured_output: object) -> torch.Tensor:
+    def output_after_replay(
+        self, args, kwargs, buffers: object, captured_output: object
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         del kwargs
-        codes, runtime_cache = args[0], args[1]
+        codes = args[0]
         static_cache = cast(_IclPrefixBuffers, buffers).cache
-        for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"):
-            runtime_cache[key] = static_cache[key][: codes.shape[0]].clone()
-        runtime_cache["past_key_values"] = _slice_dynamic_cache_batch(
-            static_cache["past_key_values"], int(codes.shape[0])
-        )
-        runtime_cache["decoder_prefix_frames"] = self.prefix_length
-        return cast(torch.Tensor, captured_output)[: codes.shape[0]]
+        state = {
+            key: static_cache[key][: codes.shape[0]].clone()
+            for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv")
+        }
+        state["past_key_values"] = _slice_dynamic_cache_batch(static_cache["past_key_values"], int(codes.shape[0]))
+        state["decoder_prefix_frames"] = self.prefix_length
+        return cast(torch.Tensor, captured_output)[: codes.shape[0]], state
 
 
 class Qwen3TTSXvecPrefixRoutine(_Qwen3TTSStatefulRoutineBase):
@@ -531,17 +548,19 @@ class Qwen3TTSXvecPrefixRoutine(_Qwen3TTSStatefulRoutineBase):
         buffers.codes.zero_()
         buffers.codes[: codes.shape[0], :, : codes.shape[-1]].copy_(codes)
 
-    def output_after_replay(self, args, kwargs, buffers: object, captured_output: object) -> torch.Tensor:
+    def output_after_replay(
+        self, args, kwargs, buffers: object, captured_output: object
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         del kwargs
-        codes, runtime_cache = args[0], args[1]
+        codes = args[0]
         static_cache = cast(_XvecPrefixBuffers, buffers).cache
-        for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"):
-            runtime_cache[key] = static_cache[key][: codes.shape[0]].clone()
-        runtime_cache["past_key_values"] = _slice_dynamic_cache_batch(
-            static_cache["past_key_values"], int(codes.shape[0])
-        )
-        runtime_cache["decoder_prefix_frames"] = 0
-        return cast(torch.Tensor, captured_output)[: codes.shape[0]]
+        state = {
+            key: static_cache[key][: codes.shape[0]].clone()
+            for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv")
+        }
+        state["past_key_values"] = _slice_dynamic_cache_batch(static_cache["past_key_values"], int(codes.shape[0]))
+        state["decoder_prefix_frames"] = 0
+        return cast(torch.Tensor, captured_output)[: codes.shape[0]], state
 
 
 class Qwen3TTSSuffixRoutine(_Qwen3TTSStatefulRoutineBase):
@@ -726,39 +745,10 @@ class Qwen3TTSSuffixRoutine(_Qwen3TTSStatefulRoutineBase):
 
     def output_after_replay(self, args, kwargs, buffers: object, captured_output: object):
         del kwargs, buffers
-        mode, target_frames, _codes_list, request_caches, new_frames_list = args
+        _mode, _target_frames, _codes_list, _request_caches, new_frames_list = args
         wav, next_quantized, next_conv = cast(tuple[torch.Tensor, torch.Tensor, torch.Tensor], captured_output)
-        expected_new_frames = int(target_frames) - self.transitions[str(mode)][int(target_frames)]
-        outputs: list[torch.Tensor] = []
-        for row, (cache, new_frames) in enumerate(zip(request_caches, new_frames_list, strict=True)):
-            outputs.append(wav[row : row + 1, :, : new_frames * self.decoder.total_upsample])
-            if new_frames == expected_new_frames:
-                self._commit_suffix_graph_state(
-                    cache,
-                    next_quantized[row : row + 1],
-                    next_conv[row : row + 1],
-                    int(target_frames),
-                )
-        return outputs
-
-    def _commit_suffix_graph_state(
-        self,
-        caches: dict[str, Any],
-        next_quantized: torch.Tensor,
-        next_conv: torch.Tensor,
-        target_frames: int,
-    ) -> None:
-        """Overwrite stable request-local storage with graph-produced state."""
-        self.decoder._ensure_suffix_state_buffers(caches)
-        quantized_buffer = caches["_suffix_quantized_buffer"]
-        conv_buffer = caches["_suffix_conv_buffer"]
-        quantized_valid = int(next_quantized.shape[-1])
-        conv_valid = int(next_conv.shape[1])
-        quantized_buffer[:, :, :quantized_valid].copy_(next_quantized)
-        conv_buffer[:, :conv_valid, :].copy_(next_conv)
-        caches["suffix_frames"] = target_frames
-        caches["suffix_quantized"] = quantized_buffer[:, :, :quantized_valid]
-        caches["suffix_conv"] = conv_buffer[:, :conv_valid, :]
+        actual_batch = len(new_frames_list)
+        return wav[:actual_batch], next_quantized[:actual_batch], next_conv[:actual_batch]
 
     def _eager_request_batch(
         self,
@@ -767,7 +757,7 @@ class Qwen3TTSSuffixRoutine(_Qwen3TTSStatefulRoutineBase):
         codes_list: list[torch.Tensor],
         request_caches: list[dict[str, Any]],
         new_frames_list: list[int],
-    ) -> list[torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         previous_frames = self.transitions[mode][target_frames]
         expected_new_frames = target_frames - previous_frames
         if any(not 0 < frames <= expected_new_frames for frames in new_frames_list):
@@ -776,10 +766,7 @@ class Qwen3TTSSuffixRoutine(_Qwen3TTSStatefulRoutineBase):
             request_caches,
             ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"),
         ):
-            return [
-                self.decoder.decode_suffix(codes, cache, self.prefix_length if mode == "icl" else 0)
-                for codes, cache in zip(codes_list, request_caches, strict=True)
-            ]
+            raise ValueError("Suffix Target eager execution requires batchable request caches")
 
         batched_codes = codes_list[0].new_zeros((len(codes_list), codes_list[0].shape[1], expected_new_frames))
         for row, (codes, new_frames) in enumerate(zip(codes_list, new_frames_list, strict=True)):
@@ -803,15 +790,7 @@ class Qwen3TTSSuffixRoutine(_Qwen3TTSStatefulRoutineBase):
             for row, request_cache in enumerate(request_caches):
                 mask[row, : int(request_cache.get("prefix_pad_frames", 0))] = 0
         captured_output = self._runnable(mode, target_frames, batched_codes, old_quantized, old_conv, cache, mask)
-        return cast(
-            list[torch.Tensor],
-            self.output_after_replay(
-                (mode, target_frames, codes_list, request_caches, new_frames_list),
-                {},
-                object(),
-                captured_output,
-            ),
-        )
+        return captured_output
 
 
 def _positive_ints(value: object, *, path: str) -> tuple[int, ...]:
