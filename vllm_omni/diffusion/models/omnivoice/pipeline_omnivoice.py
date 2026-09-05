@@ -32,6 +32,7 @@ from vllm_omni.diffusion.models.interface import SupportAudioOutput
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.models.omnivoice.duration import RuleDurationEstimator
 from vllm_omni.model_executor.models.omnivoice.omnivoice_decoder import OmniVoiceDecoder
 from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import (
@@ -371,8 +372,7 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         extra = state.sampling.extra_args or {}
         prepared = self._prepare_request_input(prompt, extra)
         if isinstance(prepared, DiffusionOutput):
-            state.error = prepared.error
-            return state
+            raise OmniClientError(prepared.error or "OmniVoice request preparation failed")
 
         prepared_request = prepared
         cond_len = prepared_request.cond_len
