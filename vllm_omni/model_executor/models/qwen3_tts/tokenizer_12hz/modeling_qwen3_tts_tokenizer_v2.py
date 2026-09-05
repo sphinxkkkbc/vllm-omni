@@ -1065,27 +1065,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         suffix_cache_length = int(self.config.sliding_window)
         return previous_suffix_frames >= suffix_cache_length and cached_frames == suffix_cache_length
 
-    def _ensure_suffix_state_buffers(self, caches: dict[str, Any]) -> None:
-        """Allocate stable request-local suffix-state storage once."""
-        if "_suffix_quantized_buffer" in caches:
-            return
-
-        suffix_quantized = caches["suffix_quantized"]
-        suffix_conv = caches["suffix_conv"]
-        quantized_capacity = int(self.config.sliding_window)
-        conv_capacity = quantized_capacity - _CONV_CONTEXT_FRAME
-        quantized_buffer = suffix_quantized.new_zeros((*suffix_quantized.shape[:-1], quantized_capacity))
-        conv_buffer = suffix_conv.new_zeros((suffix_conv.shape[0], conv_capacity, suffix_conv.shape[-1]))
-        quantized_valid = min(int(suffix_quantized.shape[-1]), quantized_capacity)
-        conv_valid = min(int(suffix_conv.shape[1]), conv_capacity)
-        quantized_buffer[:, :, :quantized_valid].copy_(suffix_quantized[:, :, -quantized_valid:])
-        conv_buffer[:, :conv_valid, :].copy_(suffix_conv[:, -conv_valid:, :])
-        caches["_suffix_quantized_buffer"] = quantized_buffer
-        caches["_suffix_conv_buffer"] = conv_buffer
-        caches.setdefault("suffix_frames", int(suffix_quantized.shape[-1]))
-        caches["suffix_quantized"] = quantized_buffer[:, :, :quantized_valid]
-        caches["suffix_conv"] = conv_buffer[:, :conv_valid, :]
-
     def _commit_suffix_state(
         self,
         caches: dict[str, Any],
@@ -1098,16 +1077,9 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         This semantic state transition is shared by eager compute and CUDA
         Graph replay result finalization.
         """
-        self._ensure_suffix_state_buffers(caches)
-        quantized_buffer = caches["_suffix_quantized_buffer"]
-        conv_buffer = caches["_suffix_conv_buffer"]
-        quantized_valid = int(next_quantized.shape[-1])
-        conv_valid = int(next_conv.shape[1])
-        quantized_buffer[:, :, :quantized_valid].copy_(next_quantized)
-        conv_buffer[:, :conv_valid, :].copy_(next_conv)
         caches["suffix_frames"] = target_frames
-        caches["suffix_quantized"] = quantized_buffer[:, :, :quantized_valid]
-        caches["suffix_conv"] = conv_buffer[:, :conv_valid, :]
+        caches["suffix_quantized"] = next_quantized
+        caches["suffix_conv"] = next_conv
 
     def _finalize_prefix_result(
         self,
@@ -1132,7 +1104,6 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             if prefix_pads is not None:
                 cache["prefix_pad_frames"] = prefix_pads[row]
             cache["suffix_frames"] = initial_chunk_frames
-            self._ensure_suffix_state_buffers(cache)
             wav_slice = wav[row : row + 1]
             if prefix_pads is not None:
                 wav_slice = wav_slice[..., -initial_chunk_frames * self.total_upsample :]
@@ -1198,6 +1169,8 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             raise ValueError(f"Expected {self.config.num_quantizers} layer of codes, got {codes.shape[1]}")
 
         if caches is None:
+            if getattr(self, "_stateless_cudagraph_target_ref", None) is None:
+                return self._forward_exact(codes)
             return self._get_vocoder_graph_target("stateless")(codes)
 
         if caches.get("_is_dummy_run", False):

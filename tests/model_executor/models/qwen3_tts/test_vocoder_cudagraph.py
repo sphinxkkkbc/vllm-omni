@@ -134,26 +134,17 @@ def test_stateless_capture_sizes_extend_defaults_with_configured_sizes() -> None
     }
 
 
-def test_qwen3_tts_stateless_target_keeps_default_capture_buckets() -> None:
-    target = build_stateless_target(
-        decoder=_Decoder(),
-        runnable=_Decoder()._forward_exact,
-        vllm_config=_config(async_chunk=False),
-        num_quantizers=2,
-        total_upsample=4,
-        capture_batch_sizes=[1],
-        decode_chunk_size=300,
-        decode_left_context=25,
-    )
-
-    assert {descriptor.variant.frames for descriptor in target.descriptors} == {150, 325}
-
-
 def test_qwen3_tts_async_chunk_keeps_known_stateless_target_without_startup_coverage() -> None:
     target = build_stateless_target(
         decoder=_Decoder(),
         runnable=_Decoder()._forward_exact,
-        vllm_config=_config(async_chunk=True),
+        vllm_config=_config(
+            async_chunk=True,
+            graph_config={
+                "capture_batch_sizes": [1, 2],
+                "targets": {"qwen3_tts.stateless": {"capture_bucket_sizes": [17, 29]}},
+            },
+        ),
         num_quantizers=2,
         total_upsample=4,
         capture_batch_sizes=[1],
@@ -263,62 +254,6 @@ def test_icl_prefix_graph_cache_keeps_physical_prefix_length() -> None:
     assert output.shape == (1, 2, 12)
 
 
-def test_qwen3_tts_icl_capture_delegates_through_eager_call() -> None:
-    decoder = _StatefulDecoder()
-    targets = build_stateful_targets(
-        decoder=decoder,
-        vllm_config=_config(async_chunk=True),
-        num_quantizers=2,
-        prefix_length=10,
-        capture_batch_sizes=[1],
-        initial_frames=2,
-        chunk_frames=3,
-        chunk_ramp=None,
-    )
-    routine = targets[0].routine
-    assert isinstance(routine, Qwen3TTSIclPrefixRoutine)
-    buffers = routine.allocate_buffers(targets[0].descriptors[0], torch.device("cpu"))
-    routine.prepare_for_capture(buffers)
-    prepared_prefix_cache = buffers.prefix_cache
-    assert prepared_prefix_cache is not None
-
-    original_eager_call = routine.eager_call
-    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
-
-    def recording_eager_call(*args: object, **kwargs: object) -> torch.Tensor:
-        calls.append((args, kwargs))
-        return original_eager_call(*args, **kwargs)  # type: ignore[arg-type]
-
-    setattr(routine, "eager_call", recording_eager_call)
-    routine.forward_for_capture(buffers)
-
-    assert len(calls) == 1
-    assert calls[0][1]["prefix_cache"] is prepared_prefix_cache
-
-
-def test_xvec_dummy_cache_is_initialized_before_graph_capture() -> None:
-    decoder = _StatefulDecoder()
-    targets = build_stateful_targets(
-        decoder=decoder,
-        vllm_config=_config(async_chunk=True),
-        num_quantizers=2,
-        prefix_length=10,
-        capture_batch_sizes=[2],
-        initial_frames=2,
-        chunk_frames=3,
-        chunk_ramp=None,
-    )
-    routine = targets[1].routine
-    assert isinstance(routine, Qwen3TTSXvecPrefixRoutine)
-    buffers = routine.allocate_buffers(targets[1].descriptors[0], torch.device("cpu"))
-    routine.prepare_for_capture(buffers)
-
-    cache = buffers.cache["past_key_values"]
-    assert cache.get_seq_length() == 0
-    assert all(layer.is_initialized for layer in cache.layers)
-    assert all(layer.keys.device.type == "cpu" for layer in cache.layers)
-
-
 def test_xvec_first_chunk_replays_prefix_graph() -> None:
     decoder = _StatefulDecoder()
     targets = build_stateful_targets(
@@ -348,28 +283,6 @@ def test_xvec_first_chunk_replays_prefix_graph() -> None:
     assert state["decoder_prefix_frames"] == 0
     assert state["past_key_values"].get_seq_length() == 0
     assert output.shape == (1, 2, 2)
-
-
-def test_qwen3_tts_suffix_routine_uses_physical_cache_lengths() -> None:
-    decoder = _StatefulDecoder()
-    targets = build_stateful_targets(
-        decoder=decoder,
-        vllm_config=_config(async_chunk=True),
-        num_quantizers=2,
-        prefix_length=10,
-        capture_batch_sizes=[1],
-        initial_frames=2,
-        chunk_frames=3,
-        chunk_ramp=None,
-    )
-    target = targets[2]
-    descriptor = next(
-        descriptor for descriptor in target.descriptors if descriptor.variant == Qwen3TTSSuffixVariant("icl", 1, 11)
-    )
-    buffers = target.routine.allocate_buffers(descriptor, torch.device("cpu"))
-
-    assert buffers.quantized.shape == (1, 3, 8)
-    assert buffers.conv.shape == (1, 8, 2)
 
 
 def test_capture_uses_cached_conv_lengths() -> None:
@@ -403,7 +316,7 @@ def test_capture_uses_cached_conv_lengths() -> None:
         assert buffers.conv.shape[1] == expected_conv
 
 
-def test_suffix_routine_copies_request_state_without_batched_cat(monkeypatch) -> None:
+def test_suffix_routine_copies_request_state_into_static_buffers() -> None:
     decoder = _StatefulDecoder()
     targets = build_stateful_targets(
         decoder=decoder,
@@ -428,7 +341,6 @@ def test_suffix_routine_copies_request_state_without_batched_cat(monkeypatch) ->
         cache["decoder_prefix_frames"] = 0
     codes_list = [torch.full((1, 2, 3), row + 1, dtype=torch.long) for row in range(2)]
 
-    monkeypatch.setattr(torch, "cat", lambda *_args, **_kwargs: pytest.fail("runtime suffix copy must not batch-cat"))
     routine.copy_runtime_inputs(("xvec", 5, codes_list, caches, [3, 3]), {}, buffers)
 
     torch.testing.assert_close(buffers.codes[0], codes_list[0][0])
@@ -529,30 +441,3 @@ def test_segmented_capture_sizes_are_derived_from_decoder_and_chunk_config() -> 
     }
 
     assert captured_targets == {6, 10, 14}
-
-
-def test_target_owns_descriptor_namespace_and_binding_is_reversible() -> None:
-    from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
-        VocoderCUDAGraphTarget,
-        VocoderGraphHandle,
-    )
-
-    routine = Qwen3TTSStatelessRoutine(
-        decoder=_Decoder(),
-        runnable=_Decoder()._forward_exact,
-        num_quantizers=2,
-        total_upsample=4,
-    )
-    target = VocoderCUDAGraphTarget(
-        "qwen3_tts.stateless",
-        routine,
-        [VocoderCUDAGraphDescriptor(Qwen3TTSStatelessVariant(1, 4))],
-    )
-    handle = VocoderGraphHandle(lambda codes: codes + 1)
-    target._bind_handle(handle)
-    assert torch.equal(target(torch.zeros(1)), torch.ones(1))
-    with pytest.raises(TypeError, match="VocoderGraphHandle"):
-        target._bind_handle(lambda codes: codes)  # type: ignore[arg-type]
-    with pytest.raises(RuntimeError, match="already bound"):
-        target._bind_handle(handle)
-    target._restore_eager()

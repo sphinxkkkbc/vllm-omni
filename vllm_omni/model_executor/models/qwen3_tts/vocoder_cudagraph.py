@@ -321,9 +321,6 @@ class _Qwen3TTSStatefulRoutineBase(BaseVocoderCUDAGraphRoutine):
     def prepare_for_capture(self, buffers: object) -> None:
         del buffers
 
-    def reset_after_capture(self, buffers: object) -> None:
-        del buffers
-
 
 class Qwen3TTSIclPrefixRoutine(_Qwen3TTSStatefulRoutineBase):
     def __init__(

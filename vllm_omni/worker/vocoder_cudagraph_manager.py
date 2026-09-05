@@ -271,12 +271,9 @@ class VocoderCUDAGraphManager:
                 int(getattr(self.vllm_config.compilation_config, "cudagraph_num_of_warmups", 0)),
             )
             for _ in range(num_warmups):
-                # Stateful routines may need to rebuild their temporary cache
-                # object between warmups. This hook is intentionally repeated
-                # before the final graph capture as well.
+                # Prepare the reusable static buffers before every warmup.
                 routine.prepare_for_capture(buffers)
                 routine.forward_for_capture(buffers)
-                routine.reset_after_capture(buffers)
             routine.prepare_for_capture(buffers)
             torch.cuda.current_stream(self.device).synchronize()
             graph = torch.cuda.CUDAGraph()
@@ -302,16 +299,6 @@ class VocoderCUDAGraphManager:
                 exc_info=True,
             )
             return None
-        finally:
-            if buffers is not None:
-                try:
-                    routine.reset_after_capture(buffers)
-                except Exception:
-                    logger.exception(
-                        "Failed to reset capture state for vocoder Target %s",
-                        target.target_id,
-                    )
-                    raise
 
     def _capture_and_register(
         self,

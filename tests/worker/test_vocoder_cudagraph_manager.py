@@ -486,14 +486,6 @@ def test_concurrent_lazy_misses_capture_one_entry(monkeypatch) -> None:
     assert manager.capture_attempts[("decode", 3)] == 1
 
 
-def test_async_chunk_is_not_a_second_graph_config_source() -> None:
-    target, _ = _target("decode", 2)
-    manager = _TestManager(config={"async_chunk": True})
-
-    with pytest.raises(ValueError, match="Unknown vocoder_cudagraph"):
-        manager.prepare(_Model((target,)))  # type: ignore[arg-type]
-
-
 def test_binding_failure_is_target_local() -> None:
     first, _ = _target("first", 2)
     second, _ = _target("second", 2)

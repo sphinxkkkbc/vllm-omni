@@ -164,15 +164,6 @@ class VocoderCUDAGraphRoutine(Protocol):
         """
         ...
 
-    def reset_after_capture(self, buffers: object) -> None:
-        """Restore graph-owned buffers after warmup/capture.
-
-        This hook is intended for capture-local cleanup or normalization of
-        descriptor-owned buffers. Request/model semantic state is generally better
-        restored by the model-side lifecycle that owns that state.
-        """
-        ...
-
 
 class BaseVocoderCUDAGraphRoutine:
     """Model-specific adapter between runtime calls and static CUDA Graph buffers.
@@ -198,9 +189,6 @@ class BaseVocoderCUDAGraphRoutine:
         return VocoderCUDAGraphDescriptor(runtime_key.variant)
 
     def prepare_for_capture(self, buffers: object) -> None:
-        del buffers
-
-    def reset_after_capture(self, buffers: object) -> None:
         del buffers
 
 

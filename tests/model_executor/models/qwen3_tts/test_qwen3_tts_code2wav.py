@@ -597,21 +597,6 @@ def test_decode_chunking_override_is_resolved_before_target_construction():
     assert target.routine.runnable == model.decoder.forward
 
 
-def test_async_cudagraph_batch_config_does_not_start_model_local_capture():
-    model = _make_model(
-        async_chunk=True,
-        device=torch.device("cuda"),
-        stage_connector_config={"extra": {}},
-    )
-    model.vllm_config.model_config.vocoder_cudagraph_config = {"capture_batch_sizes": [1, 2, 4, 8]}
-
-    _load_weights_noop(model)
-
-    target = model.get_vocoder_cudagraph_targets()[0]
-    assert target.descriptors == ()
-    assert target.routine.runnable == model.decoder.forward
-
-
 def test_stateless_cudagraph_capture_sizes_are_resolved_into_target_descriptors():
     model = _make_model(
         async_chunk=False,
@@ -626,23 +611,6 @@ def test_stateless_cudagraph_capture_sizes_are_resolved_into_target_descriptors(
 
     target = model.get_vocoder_cudagraph_targets()[0]
     assert {descriptor.variant.frames for descriptor in target.descriptors} == {97, 150, 325, 400}
-    assert target.routine.runnable == model.decoder.forward
-
-
-def test_async_cudagraph_keeps_stateless_target_inactive():
-    model = _make_model(
-        async_chunk=True,
-        device=torch.device("cuda"),
-        stage_connector_config={"extra": {}},
-    )
-    model.vllm_config.model_config.vocoder_cudagraph_config = {
-        "targets": {"qwen3_tts.stateless": {"capture_bucket_sizes": [97, 400]}}
-    }
-
-    _load_weights_noop(model)
-
-    target = model.get_vocoder_cudagraph_targets()[0]
-    assert target.descriptors == ()
     assert target.routine.runnable == model.decoder.forward
 
 

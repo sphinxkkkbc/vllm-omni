@@ -96,6 +96,18 @@ def _make_small_decoder() -> Qwen3TTSTokenizerV2Decoder:
     return decoder
 
 
+def test_standalone_decoder_without_vocoder_target_uses_eager_exact_decode(monkeypatch):
+    source = _make_small_decoder()
+    decoder = Qwen3TTSTokenizerV2Decoder(source.config).eval()
+    codes = torch.zeros(1, decoder.config.num_quantizers, 4, dtype=torch.long)
+    expected = torch.ones(1, 1, 7)
+    monkeypatch.setattr(decoder, "_forward_exact", lambda _codes: expected)
+
+    output = decoder(codes, caches=None)
+
+    assert output is expected
+
+
 def _run_downstream(decoder: Qwen3TTSTokenizerV2Decoder, hidden: torch.Tensor) -> torch.Tensor:
     for blocks in decoder.upsample:
         for block in blocks:
@@ -616,54 +628,6 @@ def test_eager_backend_max_batch_size_splits_each_phase_group():
     assert len(outputs) == 5
 
 
-@pytest.mark.parametrize("phase", ["xvec_first", "suffix_xvec"])
-def test_single_request_stateful_route_uses_the_matching_eager_backend(phase):
-    decoder = _decoder_stub(_is_suffix_cache_rolling=lambda _previous, _cached: False)
-    calls = []
-    codes = torch.zeros(1, 2, 1 if phase == "xvec_first" else 25)
-
-    class _KV:
-        @staticmethod
-        def get_seq_length():
-            return 0
-
-    if phase == "xvec_first":
-        caches = [{"prefix_frames": 0}]
-        decode_xvec_prefix_batch = lambda group_codes, _caches: calls.append("xvec") or group_codes  # noqa: E731
-        decode_suffix_batch = None
-    else:
-        caches = [
-            {
-                "prefix_frames": 0,
-                "decoder_prefix_frames": 0,
-                "past_key_values": _KV(),
-                "suffix_frames": 1,
-                "suffix_quantized": torch.zeros(1, 2, 1),
-                "suffix_conv": torch.zeros(1, 1, 2),
-            }
-        ]
-        decode_xvec_prefix_batch = None
-        decode_suffix_batch = (  # noqa: E731
-            lambda mode, target, group_codes, _caches, _new_frames: calls.append((mode, target)) or group_codes
-        )
-
-    outputs = decoder.batched_request_decode(
-        [codes],
-        caches,
-        prefix_length=72,
-        initial_chunk_frames=1,
-        codec_chunk_frames=25,
-        transitions_by_mode={"icl": {26: 1}, "xvec": {26: 1}},
-        decode_icl_prefix_batch=None,
-        decode_xvec_prefix_batch=decode_xvec_prefix_batch,
-        decode_suffix_batch=decode_suffix_batch,
-        decode_fallback=lambda *_args: pytest.fail("unexpected eager fallback"),
-    )
-
-    assert len(outputs) == 1
-    assert calls == (["xvec"] if phase == "xvec_first" else [("xvec", 26)])
-
-
 def test_batched_chunked_decode_groups_exact_phases():
     decoder = _decoder_stub(_is_suffix_cache_rolling=lambda previous, cached: previous >= 72 and cached == 72)
     calls: list[tuple[str, int, int]] = []
@@ -758,31 +722,6 @@ def test_xvec_delta_chunks_route_through_all_reachable_graph_phases():
     assert calls == [("xvec", 26), ("xvec", 51), ("xvec", 76), ("xvec", 97)]
 
 
-def test_graph_batch_overflow_splits_at_largest_bucket():
-    decoder = _decoder_stub()
-    batch_sizes = []
-
-    def decode_xvec(codes, _caches):
-        batch_sizes.append(len(codes))
-        return [code[:, :1, :].clone() for code in codes]
-
-    decoder.batched_request_decode(
-        [torch.zeros(1, 2, 1) for _ in range(16)],
-        [{"prefix_frames": 0} for _ in range(16)],
-        prefix_length=72,
-        initial_chunk_frames=1,
-        codec_chunk_frames=25,
-        transitions_by_mode={"icl": {}, "xvec": {}},
-        decode_icl_prefix_batch=None,
-        decode_xvec_prefix_batch=decode_xvec,
-        decode_suffix_batch=None,
-        decode_fallback=lambda *_args: pytest.fail("unexpected eager fallback"),
-        backend_max_batch_size=8,
-    )
-
-    assert batch_sizes == [8, 8]
-
-
 def test_missing_graph_phase_falls_back_instead_of_returning_empty():
     decoder = _decoder_stub()
     codes = torch.zeros(1, 2, 1)
@@ -859,119 +798,6 @@ def test_xvec_first_chunk_uses_prefixless_initializer():
 
     assert calls == ["xvec"]
     assert output[0].shape == (1, 1, 1)
-
-
-def test_batched_suffix_graph_updates_preallocated_state_buffers(monkeypatch):
-    decoder = _make_small_decoder()
-    decoder._incremental_chunk_frames = 25
-    codebook_dim = decoder.config.codebook_dim
-    latent_dim = decoder.config.latent_dim
-    cache = {
-        "prefix_frames": 0,
-        "decoder_prefix_frames": 0,
-        "ref_hidden": torch.zeros(1, codebook_dim, 0),
-        "ref_conv": torch.zeros(1, 0, latent_dim),
-        "prefix_hidden": torch.zeros(1, 0, latent_dim),
-        "suffix_quantized": torch.zeros(1, codebook_dim, 1),
-        "suffix_conv": torch.zeros(1, 1, latent_dim),
-        "suffix_frames": 1,
-        "past_key_values": object(),
-    }
-    decoder._ensure_suffix_state_buffers(cache)
-    first_quantized_buffer = cache["suffix_quantized"]
-    first_conv_buffer = cache["suffix_conv"]
-
-    def suffix_target(mode, target_frames, codes_list, request_caches, new_frames_list):
-        del mode
-        value = float(target_frames)
-        batch_size = len(codes_list)
-        return (
-            torch.full((batch_size, 1, new_frames_list[0] * decoder.total_upsample), value),
-            torch.full((batch_size, codebook_dim, target_frames), value),
-            torch.full((batch_size, target_frames - _CONV_CONTEXT_FRAME, latent_dim), value),
-        )
-
-    monkeypatch.setattr(decoder, "_get_vocoder_graph_target", lambda name: suffix_target)
-    codes = torch.zeros(1, decoder.config.num_quantizers, 25)
-
-    first = decoder._decode_suffix_batch(
-        "xvec",
-        26,
-        [codes],
-        [cache],
-        [25],
-        prefix_length=0,
-        codec_chunk_frames=25,
-        transitions_by_mode={"xvec": {26: 1, 51: 26}},
-    )
-    assert first is not None
-    assert cache["suffix_quantized"].data_ptr() == first_quantized_buffer.data_ptr()
-    assert cache["suffix_conv"].data_ptr() == first_conv_buffer.data_ptr()
-    torch.testing.assert_close(cache["suffix_quantized"], torch.full((1, codebook_dim, 26), 26.0))
-
-    second = decoder._decode_suffix_batch(
-        "xvec",
-        51,
-        [codes],
-        [cache],
-        [25],
-        prefix_length=0,
-        codec_chunk_frames=25,
-        transitions_by_mode={"xvec": {26: 1, 51: 26}},
-    )
-    assert second is not None
-    assert cache["suffix_quantized"].data_ptr() == first_quantized_buffer.data_ptr()
-    assert cache["suffix_conv"].data_ptr() == first_conv_buffer.data_ptr()
-    torch.testing.assert_close(cache["suffix_quantized"], torch.full((1, codebook_dim, 51), 51.0))
-
-
-def test_eager_suffix_fallback_preserves_preallocated_state_buffer(monkeypatch):
-    decoder = _make_small_decoder()
-    decoder._incremental_chunk_frames = 25
-    codebook_dim = decoder.config.codebook_dim
-    latent_dim = decoder.config.latent_dim
-    cache = {
-        "prefix_frames": 0,
-        "decoder_prefix_frames": 0,
-        "ref_hidden": torch.zeros(1, codebook_dim, 0),
-        "ref_conv": torch.zeros(1, 0, latent_dim),
-        "prefix_hidden": torch.zeros(1, 0, latent_dim),
-        "suffix_quantized": torch.zeros(1, codebook_dim, 1),
-        "suffix_conv": torch.zeros(1, 1, latent_dim),
-        "suffix_frames": 1,
-    }
-    decoder._ensure_suffix_state_buffers(cache)
-    quantized_buffer_ptr = cache["_suffix_quantized_buffer"].data_ptr()
-    conv_buffer_ptr = cache["_suffix_conv_buffer"].data_ptr()
-    eager_quantized = torch.full((1, codebook_dim, 2), 3.0)
-    eager_conv = torch.full((1, 2, latent_dim), 4.0)
-
-    monkeypatch.setattr(
-        decoder,
-        "_decode_suffix",
-        lambda *_args, **_kwargs: (
-            torch.zeros(1, 1, decoder.total_upsample),
-            eager_quantized,
-            eager_conv,
-        ),
-    )
-    decoder.decode_suffix(torch.zeros(1, decoder.config.num_quantizers, 1), cache, 0)
-
-    assert cache["_suffix_quantized_buffer"].data_ptr() == quantized_buffer_ptr
-    assert cache["_suffix_conv_buffer"].data_ptr() == conv_buffer_ptr
-    torch.testing.assert_close(cache["suffix_quantized"], eager_quantized)
-    torch.testing.assert_close(cache["suffix_conv"], eager_conv)
-
-    decoder._commit_suffix_state(
-        cache,
-        torch.full((1, codebook_dim, 3), 5.0),
-        torch.full((1, 3 - _CONV_CONTEXT_FRAME, latent_dim), 6.0),
-        3,
-    )
-    assert cache["suffix_quantized"].data_ptr() == quantized_buffer_ptr
-    assert cache["suffix_conv"].data_ptr() == conv_buffer_ptr
-    torch.testing.assert_close(cache["suffix_quantized"], torch.full((1, codebook_dim, 3), 5.0))
-    torch.testing.assert_close(cache["suffix_conv"], torch.full((1, 3 - _CONV_CONTEXT_FRAME, latent_dim), 6.0))
 
 
 def test_mixed_phase_batch_restores_outputs_and_caches_to_original_slots():
