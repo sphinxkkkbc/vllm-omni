@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Per-request mutable state for step-wise diffusion execution."""
 
 from __future__ import annotations
@@ -122,8 +122,6 @@ class StepRequestState:
 
     # Peak device memory observed while this request is active in step mode.
     peak_memory_mb: float = 0.0
-
-    error: str | None = None
 
     # ── Properties ──
 
