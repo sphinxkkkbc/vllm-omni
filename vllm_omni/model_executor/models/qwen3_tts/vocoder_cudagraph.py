@@ -8,7 +8,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Callable, Mapping, Sequence, Set
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 import torch
 from transformers.cache_utils import DynamicCache
@@ -462,14 +462,16 @@ class Qwen3TTSIclPrefixRoutine(_Qwen3TTSStatefulRoutineBase):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         del kwargs
         codes = args[0]
-        static_cache = cast(_IclPrefixBuffers, buffers).cache
+        static_cache = buffers.cache
         state = {
             key: static_cache[key][: codes.shape[0]].clone()
             for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv")
         }
         state["past_key_values"] = _slice_dynamic_cache_batch(static_cache["past_key_values"], int(codes.shape[0]))
         state["decoder_prefix_frames"] = self.prefix_length
-        return cast(torch.Tensor, captured_output)[: codes.shape[0]], state
+        if not isinstance(captured_output, torch.Tensor):
+            raise TypeError("Qwen3-TTS ICL graph output must be a Tensor")
+        return captured_output[: codes.shape[0]], state
 
 
 class Qwen3TTSXvecPrefixRoutine(_Qwen3TTSStatefulRoutineBase):
@@ -553,14 +555,16 @@ class Qwen3TTSXvecPrefixRoutine(_Qwen3TTSStatefulRoutineBase):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         del kwargs
         codes = args[0]
-        static_cache = cast(_XvecPrefixBuffers, buffers).cache
+        static_cache = buffers.cache
         state = {
             key: static_cache[key][: codes.shape[0]].clone()
             for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv")
         }
         state["past_key_values"] = _slice_dynamic_cache_batch(static_cache["past_key_values"], int(codes.shape[0]))
         state["decoder_prefix_frames"] = 0
-        return cast(torch.Tensor, captured_output)[: codes.shape[0]], state
+        if not isinstance(captured_output, torch.Tensor):
+            raise TypeError("Qwen3-TTS XVec graph output must be a Tensor")
+        return captured_output[: codes.shape[0]], state
 
 
 class Qwen3TTSSuffixRoutine(_Qwen3TTSStatefulRoutineBase):
@@ -608,9 +612,9 @@ class Qwen3TTSSuffixRoutine(_Qwen3TTSStatefulRoutineBase):
         return self._eager_request_batch(
             str(mode),
             int(target_frames),
-            cast(list[torch.Tensor], codes),
-            cast(list[dict[str, Any]], request_caches),
-            cast(list[int], new_frames_list),
+            codes,
+            request_caches,
+            new_frames_list,
         )
 
     def validate_runtime_inputs(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
@@ -746,7 +750,13 @@ class Qwen3TTSSuffixRoutine(_Qwen3TTSStatefulRoutineBase):
     def output_after_replay(self, args, kwargs, buffers: object, captured_output: object):
         del kwargs, buffers
         _mode, _target_frames, _codes_list, _request_caches, new_frames_list = args
-        wav, next_quantized, next_conv = cast(tuple[torch.Tensor, torch.Tensor, torch.Tensor], captured_output)
+        if (
+            not isinstance(captured_output, tuple)
+            or len(captured_output) != 3
+            or not all(isinstance(value, torch.Tensor) for value in captured_output)
+        ):
+            raise TypeError("Qwen3-TTS suffix graph output must be a 3-tensor tuple")
+        wav, next_quantized, next_conv = captured_output
         actual_batch = len(new_frames_list)
         return wav[:actual_batch], next_quantized[:actual_batch], next_conv[:actual_batch]
 

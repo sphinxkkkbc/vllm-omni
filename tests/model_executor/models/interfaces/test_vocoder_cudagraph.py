@@ -3,17 +3,15 @@
 
 from __future__ import annotations
 
-from typing import cast
-
 import pytest
 
 from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
     BaseVocoderCUDAGraphRoutine,
     SupportsVocoderCUDAGraph,
     VocoderCUDAGraphDescriptor,
-    VocoderCUDAGraphRoutine,
     VocoderCUDAGraphTarget,
     VocoderRuntimeKey,
+    VocoderRuntimeResolution,
     supports_vocoder_cudagraph,
 )
 
@@ -30,6 +28,38 @@ class _Routine(BaseVocoderCUDAGraphRoutine):
     def eager_call(self, value):
         return value + 1
 
+    def validate_runtime_inputs(self, args, kwargs):
+        del args, kwargs
+
+    def resolve_runtime(self, args, kwargs, available):
+        del args, kwargs, available
+        return VocoderRuntimeResolution(VocoderRuntimeKey(0), None)
+
+    def make_lazy_descriptor(self, runtime_key):
+        del runtime_key
+        return None
+
+    def allocate_buffers(self, descriptor, device):
+        del descriptor, device
+        return None
+
+    def prepare_for_capture(self, buffers):
+        del buffers
+
+    def forward_for_capture(self, buffers):
+        del buffers
+        return None
+
+    def copy_runtime_inputs(self, args, kwargs, buffers):
+        del args, kwargs, buffers
+
+    def output_after_replay(self, args, kwargs, buffers, captured_output):
+        del args, kwargs, buffers
+        return captured_output
+
+    def reset_after_capture(self, buffers):
+        del buffers
+
 
 def test_descriptor_is_hashable_and_target_namespace_is_local() -> None:
     first = VocoderCUDAGraphDescriptor((1, 25))
@@ -43,7 +73,7 @@ def test_descriptor_is_hashable_and_target_namespace_is_local() -> None:
 def test_target_binds_same_callable_without_exposing_capture_lifecycle() -> None:
     target = VocoderCUDAGraphTarget(
         "test.decode",
-        cast(VocoderCUDAGraphRoutine, _Routine()),
+        _Routine(),
         [VocoderCUDAGraphDescriptor(1)],
     )
 

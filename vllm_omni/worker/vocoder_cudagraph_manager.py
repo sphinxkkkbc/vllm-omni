@@ -20,7 +20,6 @@ from tqdm import tqdm
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import VllmConfig
 from vllm.platforms import current_platform
-from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
 
 from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
     SupportsVocoderCUDAGraph,
@@ -57,7 +56,7 @@ def clone_tensor_tree(value: object) -> object:
     if isinstance(value, tuple):
         cloned = [clone_tensor_tree(item) for item in value]
         if hasattr(value, "_fields"):
-            constructor = cast(Callable[..., object], type(value))
+            constructor = type(value)
             return constructor(*cloned)
         return tuple(cloned)
     if isinstance(value, list):
@@ -366,7 +365,6 @@ class VocoderCUDAGraphManager:
         ready = torch.cuda.Event()
         ready.record(caller)
         self._runtime_capture_stream.wait_event(ready)
-        unlock_workspace()
         set_cudagraph_capturing_enabled(True)
         try:
             with torch.cuda.stream(self._runtime_capture_stream):
@@ -376,7 +374,6 @@ class VocoderCUDAGraphManager:
             caller.wait_event(complete)
         finally:
             set_cudagraph_capturing_enabled(False)
-            lock_workspace()
 
     def _runtime_capture_and_register(
         self,
@@ -399,7 +396,14 @@ class VocoderCUDAGraphManager:
             if managed.max_graphs == 0:
                 return None
             with self._runtime_capture_scope():
-                return self._capture_and_register(managed, descriptor)
+                entry = self._capture_and_register(managed, descriptor)
+            if entry is not None:
+                logger.info(
+                    "Lazy-captured vocoder CUDA Graph Target %s Descriptor %r",
+                    managed.target.target_id,
+                    descriptor,
+                )
+            return entry
 
     def _make_runtime_miss_handler(
         self,

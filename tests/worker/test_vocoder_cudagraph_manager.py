@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from collections import Counter
+import logging
+from collections import Counter, OrderedDict
 from collections.abc import Callable, Set
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 from threading import Event
 from types import SimpleNamespace
 from typing import Any, NamedTuple, cast
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -24,7 +26,11 @@ from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
     VocoderRuntimeKey,
     VocoderRuntimeResolution,
 )
-from vllm_omni.worker.vocoder_cudagraph_manager import VocoderCUDAGraphManager, clone_tensor_tree
+from vllm_omni.worker.vocoder_cudagraph_manager import (
+    ManagedTarget,
+    VocoderCUDAGraphManager,
+    clone_tensor_tree,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -42,7 +48,8 @@ def test_clone_tensor_tree_clones_supported_tensor_containers() -> None:
         "namedtuple": _NestedOutput(tensor, {"label": "audio"}),
     }
 
-    cloned = cast(dict[str, Any], clone_tensor_tree(output))
+    cloned = clone_tensor_tree(output)
+    assert isinstance(cloned, dict)
 
     assert isinstance(cloned["namedtuple"], _NestedOutput)
     assert cloned["namedtuple"].metadata == {"label": "audio"}
@@ -105,18 +112,19 @@ class _Routine(BaseVocoderCUDAGraphRoutine):
         del kwargs
         size = int(args[0].numel())
         descriptor = min(
-            (item for item in available if cast(int, item.variant) >= size),
-            key=lambda item: cast(int, item.variant),
+            (item for item in available if isinstance(item.variant, int) and item.variant >= size),
+            key=lambda item: item.variant if isinstance(item.variant, int) else 0,
             default=None,
         )
         return VocoderRuntimeResolution(VocoderRuntimeKey(size), descriptor)
 
     def allocate_buffers(self, descriptor: VocoderCUDAGraphDescriptor, device: torch.device) -> _Buffers:
-        size = cast(int, descriptor.variant)
+        assert isinstance(descriptor.variant, int)
+        size = descriptor.variant
         return _Buffers(torch.zeros(size, device=device), torch.zeros(size, device=device))
 
     def forward_for_capture(self, buffers: object) -> torch.Tensor:
-        buffers = cast(_Buffers, buffers)
+        assert isinstance(buffers, _Buffers)
         buffers.output.copy_(buffers.input * 2)
         return buffers.output
 
@@ -127,7 +135,7 @@ class _Routine(BaseVocoderCUDAGraphRoutine):
         buffers: object,
     ) -> None:
         del kwargs
-        buffers = cast(_Buffers, buffers)
+        assert isinstance(buffers, _Buffers)
         buffers.input.zero_()
         buffers.input[: args[0].numel()].copy_(args[0])
 
@@ -139,7 +147,8 @@ class _Routine(BaseVocoderCUDAGraphRoutine):
         captured_output: object,
     ) -> torch.Tensor:
         del kwargs, buffers
-        return cast(torch.Tensor, captured_output)[: args[0].numel()]
+        assert isinstance(captured_output, torch.Tensor)
+        return captured_output[: args[0].numel()]
 
 
 class _TestManager(VocoderCUDAGraphManager):
@@ -170,9 +179,10 @@ class _TestManager(VocoderCUDAGraphManager):
         if key in self.fail_capture_for:
             return None
         buffers = target.routine.allocate_buffers(descriptor, self.device)
+        assert isinstance(buffers, _Buffers)
         output = target.routine.forward_for_capture(buffers)
         graph = _Graph(
-            cast(_Buffers, buffers),
+            buffers,
             fail=(target.target_id, descriptor.variant) in self.fail_replay_for,
         )
         return VocoderCUDAGraphEntry(
@@ -212,6 +222,54 @@ def test_handle_exposes_only_runtime_call_semantics() -> None:
     assert not hasattr(handle, "capture")
     assert not hasattr(handle, "replay")
     assert not hasattr(handle, "entries")
+
+
+def test_runtime_lazy_capture_logs_only_new_entries(monkeypatch) -> None:
+    target, _ = _target("decode", 2)
+    manager = _TestManager()
+    descriptor = VocoderCUDAGraphDescriptor(3)
+    fake_buffers = _Buffers(torch.zeros(1), torch.zeros(1))
+    fake_entry = VocoderCUDAGraphEntry(
+        descriptor=descriptor,
+        graph=cast(torch.cuda.CUDAGraph, _Graph(fake_buffers)),
+        buffers=fake_buffers,
+        captured_output=fake_buffers.output,
+    )
+    managed = ManagedTarget(
+        target=target,
+        entries=OrderedDict(),
+        enable_lazy_capture=True,
+        max_graphs=1,
+    )
+    calls: list[VocoderCUDAGraphDescriptor] = []
+
+    def capture(managed_target, requested_descriptor):
+        assert managed_target is managed
+        calls.append(requested_descriptor)
+        return fake_entry
+
+    monkeypatch.setattr(manager, "_capture_and_register", capture)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(manager, "_runtime_capture_scope", nullcontext)
+    with patch.object(logging.Logger, "info") as log_info:
+        result = manager._runtime_capture_and_register(managed, descriptor)
+
+    assert result is fake_entry
+    assert calls == [descriptor]
+    log_info.assert_called_once_with(
+        "Lazy-captured vocoder CUDA Graph Target %s Descriptor %r",
+        "decode",
+        descriptor,
+    )
+
+    managed.entries[descriptor] = fake_entry
+    calls.clear()
+    with patch.object(logging.Logger, "info") as log_info:
+        result = manager._runtime_capture_and_register(managed, descriptor)
+
+    assert result is fake_entry
+    assert calls == []
+    log_info.assert_not_called()
 
 
 def test_capture_binds_only_after_all_targets_are_captured_and_clear_restores_eager() -> None:
@@ -261,7 +319,8 @@ def test_coverage_miss_falls_back_but_validation_and_replay_errors_propagate() -
     with pytest.raises(RuntimeError, match="replay failed"):
         target(torch.tensor([1.0]))
     assert routine.eager_calls == 1
-    outcomes = cast(dict[tuple[str, str], int], manager.stats_sink.snapshot()["outcomes"])
+    outcomes = manager.stats_sink.snapshot()["outcomes"]
+    assert isinstance(outcomes, dict)
     assert outcomes[("decode", "fallback")] == 1
     assert outcomes[("decode", "replay_error")] == 1
 

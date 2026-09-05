@@ -1394,7 +1394,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             for key in keys
         )
 
-    def _decode_icl_prefix_eager_batch(
+    def _decode_icl_prefix_batch(
         self,
         codes_list: list[torch.Tensor],
         request_caches: list[dict[str, Any]],
@@ -1439,7 +1439,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             prefix_pads=prefix_pads,
         )
 
-    def _decode_xvec_prefix_eager_batch(
+    def _decode_xvec_prefix_batch(
         self,
         codes_list: list[torch.Tensor],
         request_caches: list[dict[str, Any]],
@@ -1459,7 +1459,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             prefix_pads=None,
         )
 
-    def _decode_suffix_eager_batch(
+    def _decode_suffix_batch(
         self,
         mode: str,
         target_frames: int,
@@ -1532,19 +1532,19 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
                 initial_chunk_frames=initial_chunk_frames,
                 codec_chunk_frames=codec_chunk_frames,
                 transitions_by_mode={"icl": transitions, "xvec": transitions},
-                decode_icl_prefix_batch=lambda group_codes, group_caches: self._decode_icl_prefix_eager_batch(
+                decode_icl_prefix_batch=lambda group_codes, group_caches: self._decode_icl_prefix_batch(
                     group_codes,
                     group_caches,
                     prefix_length=prefix_length,
                     initial_chunk_frames=initial_chunk_frames,
                 ),
-                decode_xvec_prefix_batch=lambda group_codes, group_caches: self._decode_xvec_prefix_eager_batch(
+                decode_xvec_prefix_batch=lambda group_codes, group_caches: self._decode_xvec_prefix_batch(
                     group_codes,
                     group_caches,
                     initial_chunk_frames=initial_chunk_frames,
                 ),
                 decode_suffix_batch=lambda mode, target, group_codes, group_caches, new_frames: (
-                    self._decode_suffix_eager_batch(
+                    self._decode_suffix_batch(
                         mode,
                         target,
                         group_codes,

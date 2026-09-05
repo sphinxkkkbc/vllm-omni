@@ -894,7 +894,7 @@ def test_batched_suffix_graph_updates_preallocated_state_buffers(monkeypatch):
     monkeypatch.setattr(decoder, "_get_vocoder_graph_target", lambda name: suffix_target)
     codes = torch.zeros(1, decoder.config.num_quantizers, 25)
 
-    first = decoder._decode_suffix_eager_batch(
+    first = decoder._decode_suffix_batch(
         "xvec",
         26,
         [codes],
@@ -909,7 +909,7 @@ def test_batched_suffix_graph_updates_preallocated_state_buffers(monkeypatch):
     assert cache["suffix_conv"].data_ptr() == first_conv_buffer.data_ptr()
     torch.testing.assert_close(cache["suffix_quantized"], torch.full((1, codebook_dim, 26), 26.0))
 
-    second = decoder._decode_suffix_eager_batch(
+    second = decoder._decode_suffix_batch(
         "xvec",
         51,
         [codes],

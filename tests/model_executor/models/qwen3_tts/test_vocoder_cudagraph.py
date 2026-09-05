@@ -2,14 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
-from typing import cast
 
 import pytest
 import torch
 
 from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
     VocoderCUDAGraphDescriptor,
-    VocoderCUDAGraphEntry,
 )
 from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2DecoderConfig,
@@ -214,15 +212,8 @@ def test_stateless_replay_pads_to_bucket_and_trims_output() -> None:
     buffers.codes.fill_(-1)
     codes = torch.tensor([[[1, 2], [3, 4]]])
     captured_output = torch.arange(16, dtype=torch.float32).view(1, 1, 16)
-    entry = VocoderCUDAGraphEntry(
-        descriptor=descriptor,
-        graph=cast(torch.cuda.CUDAGraph, SimpleNamespace()),
-        buffers=buffers,
-        captured_output=captured_output,
-    )
-
     routine.copy_runtime_inputs((codes,), {}, buffers)
-    output = routine.output_after_replay((codes,), {}, buffers, entry.captured_output)
+    output = routine.output_after_replay((codes,), {}, buffers, captured_output)
 
     torch.testing.assert_close(buffers.codes, torch.tensor([[[1, 2, 0, 0], [3, 4, 0, 0]]]))
     torch.testing.assert_close(output, captured_output[..., :8])
@@ -241,18 +232,12 @@ def test_icl_prefix_graph_cache_keeps_physical_prefix_length() -> None:
         chunk_ramp=None,
     )
     target = targets[0]
-    routine = cast(Qwen3TTSIclPrefixRoutine, target.routine)
+    routine = target.routine
+    assert isinstance(routine, Qwen3TTSIclPrefixRoutine)
     descriptor = target.descriptors[0]
     buffers = routine.allocate_buffers(descriptor, torch.device("cpu"))
     routine.prepare_for_capture(buffers)
     captured_output = routine.forward_for_capture(buffers)
-    entry = VocoderCUDAGraphEntry(
-        descriptor=descriptor,
-        graph=cast(torch.cuda.CUDAGraph, SimpleNamespace()),
-        buffers=buffers,
-        captured_output=captured_output,
-    )
-
     runtime_codes = torch.ones(1, 2, 7, dtype=torch.long)
     runtime_cache: dict[str, object] = {}
     hidden_mask = torch.ones(1, 1, 12)
@@ -267,7 +252,7 @@ def test_icl_prefix_graph_cache_keeps_physical_prefix_length() -> None:
         },
         buffers,
     )
-    output, state = routine.output_after_replay((runtime_codes, runtime_cache), {}, buffers, entry.captured_output)
+    output, state = routine.output_after_replay((runtime_codes, runtime_cache), {}, buffers, captured_output)
 
     assert buffers.codes.shape == (2, 2, 12)
     torch.testing.assert_close(buffers.codes[0, :, :7], runtime_codes[0])
@@ -290,7 +275,8 @@ def test_qwen3_tts_icl_capture_delegates_through_eager_call() -> None:
         chunk_frames=3,
         chunk_ramp=None,
     )
-    routine = cast(Qwen3TTSIclPrefixRoutine, targets[0].routine)
+    routine = targets[0].routine
+    assert isinstance(routine, Qwen3TTSIclPrefixRoutine)
     buffers = routine.allocate_buffers(targets[0].descriptors[0], torch.device("cpu"))
     routine.prepare_for_capture(buffers)
     prepared_prefix_cache = buffers.prefix_cache
@@ -322,7 +308,8 @@ def test_xvec_dummy_cache_is_initialized_before_graph_capture() -> None:
         chunk_frames=3,
         chunk_ramp=None,
     )
-    routine = cast(Qwen3TTSXvecPrefixRoutine, targets[1].routine)
+    routine = targets[1].routine
+    assert isinstance(routine, Qwen3TTSXvecPrefixRoutine)
     buffers = routine.allocate_buffers(targets[1].descriptors[0], torch.device("cpu"))
     routine.prepare_for_capture(buffers)
 
@@ -345,7 +332,8 @@ def test_xvec_first_chunk_replays_prefix_graph() -> None:
         chunk_ramp=None,
     )
     target = targets[1]
-    routine = cast(Qwen3TTSXvecPrefixRoutine, target.routine)
+    routine = target.routine
+    assert isinstance(routine, Qwen3TTSXvecPrefixRoutine)
     descriptor = target.descriptors[0]
     buffers = routine.allocate_buffers(descriptor, torch.device("cpu"))
     routine.prepare_for_capture(buffers)
