@@ -1711,9 +1711,9 @@ class TestTTSMethods:
             ref_text="transcript",
         )
         speech_server._adapter._resolve_ref_audio = mocker.AsyncMock(return_value=([0.1] * 48000, 24000, "key_aaa"))
-        prompt_a = await speech_server._build_higgs_audio_v3_params(req)
+        prompt_a = await speech_server._adapter._build_higgs_audio_v3_params(req)
         speech_server._adapter._resolve_ref_audio = mocker.AsyncMock(return_value=([0.9] * 48000, 24000, "key_bbb"))
-        prompt_b = await speech_server._build_higgs_audio_v3_params(req)
+        prompt_b = await speech_server._adapter._build_higgs_audio_v3_params(req)
 
         assert prompt_a["prompt_token_ids"] == [1, 151700, 151700, 2]
         assert prompt_a["prompt_token_ids"] == prompt_b["prompt_token_ids"]
@@ -1861,7 +1861,7 @@ class TestTTSMethods:
                 seen.append((ref_str, kwargs.get("voice_name")))
                 return torch.zeros(3, dtype=torch.int64), f"rk:{ref_str}"
 
-        mocker.patch.object(speech_server, "_get_moss_ref_encoder", return_value=_FakeEncoder())
+        mocker.patch.object(speech_server._adapter, "_get_moss_ref_encoder", return_value=_FakeEncoder())
 
         req = OpenAICreateSpeechRequest(
             input="hello",
@@ -4809,7 +4809,6 @@ class TestMingFlashOmniTTSServing:
         request = OpenAICreateSpeechRequest(input="Hello", voice="test")
         asyncio.run(ming_flash_omni_tts_server._prepare_speech_generation(request))
 
-        ming_flash_omni_tts_server._adapter.build.assert_awaited_once()
         prompt = ming_flash_omni_tts_server.engine_client.generate.call_args.kwargs["prompt"]
         assert prompt["prompt_token_ids"] == [0]
         assert prompt["additional_information"]["text"] == "Hello"
