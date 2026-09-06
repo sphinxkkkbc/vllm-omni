@@ -596,18 +596,12 @@ class Qwen3TTSSuffixRoutine(_Qwen3TTSStatefulRoutineBase):
     def runnable(self) -> Callable[..., Any]:
         return self._runnable
 
-    def eager_call(self, mode, target_frames, codes, *args):
-        # Capture forwards static tensors; runtime eager fallback receives
-        # request lists so it can preserve model-owned request state.
-        if isinstance(codes, torch.Tensor):
-            old_quantized, old_conv, cache, mask = args
-            return self._runnable(mode, target_frames, codes, old_quantized, old_conv, cache, mask)
-
-        request_caches, new_frames_list = args
+    def eager_call(self, mode, target_frames, codes_list, request_caches, new_frames_list):
+        """Handle only the runtime Target signature."""
         return self._eager_request_batch(
             str(mode),
             int(target_frames),
-            codes,
+            codes_list,
             request_caches,
             new_frames_list,
         )
@@ -711,7 +705,7 @@ class Qwen3TTSSuffixRoutine(_Qwen3TTSStatefulRoutineBase):
     def forward_for_capture(self, buffers: object):
         if not isinstance(buffers, _SuffixBuffers):
             raise TypeError("Unexpected suffix capture buffers")
-        return self.eager_call(
+        return self._runnable(
             buffers.mode,
             buffers.target_frames,
             buffers.codes,

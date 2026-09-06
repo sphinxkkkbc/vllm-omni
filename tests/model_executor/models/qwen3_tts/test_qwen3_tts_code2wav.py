@@ -23,12 +23,28 @@ class _FakeDecoder(nn.Module):
     def __init__(self, total_upsample: int = _TOTAL_UPSAMPLE):
         super().__init__()
         self.total_upsample = total_upsample
+        self.config = SimpleNamespace(sliding_window=0)
         self.decode_calls: list[dict[str, int]] = []
         self.batched_decode_calls: list[dict[str, object]] = []
         self.decode_codes: list[torch.Tensor] = []
 
     def to(self, *args, **kwargs):
         return self
+
+    def _forward_exact(self, codes: torch.Tensor) -> torch.Tensor:
+        return self.chunked_decode(codes)
+
+    def _decode_icl_first_chunk(self, codes, cache, prefix_frames, **kwargs):
+        del prefix_frames, kwargs
+        cache["suffix_quantized"] = codes
+        return codes.float()
+
+    def _decode_xvec_first_chunk(self, codes, cache):
+        cache["suffix_quantized"] = codes
+        return codes.float()
+
+    def _decode_suffix(self, codes, *_args, **_kwargs):
+        return codes.float(), codes.float(), codes.float()
 
     def chunked_decode(
         self,
@@ -104,6 +120,7 @@ def _fake_dec_config():
 def _make_model(
     *,
     stage_connector_config=None,
+    vocoder_cudagraph_config=None,
     async_chunk: bool = False,
     device: torch.device | None = None,
 ) -> Qwen3TTSCode2Wav:
@@ -129,6 +146,7 @@ def _make_model(
                     model="unused",
                     revision=None,
                     stage_connector_config=stage_connector_config,
+                    vocoder_cudagraph_config=vocoder_cudagraph_config,
                     async_chunk=async_chunk,
                 ),
                 device_config=SimpleNamespace(device=device or torch.device("cpu")),
@@ -323,15 +341,10 @@ def test_decode_chunking_can_be_overridden_separately():
                 "codec_left_context_frames": 72,
             }
         },
+        vocoder_cudagraph_config={
+            "targets": {"qwen3_tts.stateless": {"decode_chunk_frames": 400, "decode_left_context_frames": 17}}
+        },
     )
-    model.vllm_config.model_config.vocoder_cudagraph_config = {
-        "targets": {
-            "qwen3_tts.stateless": {
-                "decode_chunk_frames": 400,
-                "decode_left_context_frames": 17,
-            }
-        }
-    }
 
     _load_weights_noop(model)
 
@@ -578,15 +591,10 @@ def test_decode_chunking_override_is_resolved_before_target_construction():
                 "codec_left_context_frames": 72,
             }
         },
+        vocoder_cudagraph_config={
+            "targets": {"qwen3_tts.stateless": {"decode_chunk_frames": 400, "decode_left_context_frames": 17}}
+        },
     )
-    model.vllm_config.model_config.vocoder_cudagraph_config = {
-        "targets": {
-            "qwen3_tts.stateless": {
-                "decode_chunk_frames": 400,
-                "decode_left_context_frames": 17,
-            }
-        }
-    }
 
     _load_weights_noop(model)
 
@@ -594,7 +602,7 @@ def test_decode_chunking_override_is_resolved_before_target_construction():
     assert model._decode_left_context_frames == 17
     target = model.get_vocoder_cudagraph_targets()[0]
     assert target.descriptors == ()
-    assert target.routine.runnable == model.decoder.forward
+    assert target.routine.runnable == model.decoder._forward_exact
 
 
 def test_stateless_cudagraph_capture_sizes_are_resolved_into_target_descriptors():
@@ -602,16 +610,14 @@ def test_stateless_cudagraph_capture_sizes_are_resolved_into_target_descriptors(
         async_chunk=False,
         device=torch.device("cuda"),
         stage_connector_config={"extra": {}},
+        vocoder_cudagraph_config={"targets": {"qwen3_tts.stateless": {"capture_bucket_sizes": [97, 400]}}},
     )
-    model.vllm_config.model_config.vocoder_cudagraph_config = {
-        "targets": {"qwen3_tts.stateless": {"capture_bucket_sizes": [97, 400]}}
-    }
 
     _load_weights_noop(model)
 
     target = model.get_vocoder_cudagraph_targets()[0]
     assert {descriptor.variant.frames for descriptor in target.descriptors} == {97, 150, 325, 400}
-    assert target.routine.runnable == model.decoder.forward
+    assert target.routine.runnable == model.decoder._forward_exact
 
 
 def test_decode_tf32_can_be_configured():
@@ -626,8 +632,8 @@ def test_decode_tf32_can_be_configured():
             async_chunk=True,
             device=torch.device("cuda"),
             stage_connector_config={"extra": {}},
+            vocoder_cudagraph_config={"decode_enable_tf32": "true"},
         )
-        model.vllm_config.model_config.vocoder_cudagraph_config = {"decode_enable_tf32": "true"}
 
         _load_weights_noop(model)
 
@@ -644,8 +650,8 @@ def test_decode_batch_max_size_can_be_configured():
     model = _make_model(
         async_chunk=True,
         stage_connector_config={"extra": {}},
+        vocoder_cudagraph_config={"decode_batch_max_size": 10},
     )
-    model.vllm_config.model_config.vocoder_cudagraph_config = {"decode_batch_max_size": 10}
 
     _load_weights_noop(model)
 
@@ -653,24 +659,18 @@ def test_decode_batch_max_size_can_be_configured():
 
 
 def test_invalid_decode_batch_max_size_is_rejected():
-    model = _make_model(
-        async_chunk=True,
-        stage_connector_config={"extra": {}},
-    )
-    model.vllm_config.model_config.vocoder_cudagraph_config = {"decode_batch_max_size": -1}
-
     with pytest.raises(ValueError, match="decode_batch_max_size"):
-        _load_weights_noop(model)
+        _make_model(
+            async_chunk=True,
+            stage_connector_config={"extra": {}},
+            vocoder_cudagraph_config={"decode_batch_max_size": -1},
+        )
 
 
 def test_invalid_decode_chunking_is_rejected():
-    model = _make_model(
-        async_chunk=True,
-        stage_connector_config={"extra": {}},
-    )
-    model.vllm_config.model_config.vocoder_cudagraph_config = {
-        "targets": {"qwen3_tts.stateless": {"decode_chunk_frames": 0}}
-    }
-
     with pytest.raises(ValueError, match="decode_chunk_frames=0"):
-        _load_weights_noop(model)
+        _make_model(
+            async_chunk=True,
+            stage_connector_config={"extra": {}},
+            vocoder_cudagraph_config={"targets": {"qwen3_tts.stateless": {"decode_chunk_frames": 0}}},
+        )

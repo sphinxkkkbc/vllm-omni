@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import copy
-import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +10,7 @@ import torch.nn as nn
 from transformers.cache_utils import DynamicCache
 
 from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import Qwen3TTSCode2Wav
+from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_graph_executor import Qwen3TTSGraphExecutor
 from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2DecoderConfig,
 )
@@ -20,7 +20,6 @@ from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts
     Qwen3TTSTokenizerV2Decoder,
     Qwen3TTSTokenizerV2DecoderTransformerModel,
 )
-from vllm_omni.model_executor.models.qwen3_tts.vocoder_cudagraph import build_qwen3_tts_targets
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -68,31 +67,9 @@ def _make_small_decoder() -> Qwen3TTSTokenizerV2Decoder:
         sliding_window=72,
     )
     decoder = Qwen3TTSTokenizerV2Decoder(config).eval()
-    # Direct decoder tests bypass Qwen3TTSCode2Wav.load_weights(); install the
-    # same stable eager Targets that production load_weights creates so tests
-    # exercise the public call-site contract without a compatibility branch.
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            async_chunk=True,
-            stage_connector_config={
-                "extra": {
-                    "codec_chunk_frames": 25,
-                    "initial_codec_chunk_frames": 1,
-                }
-            },
-            vocoder_cudagraph_config=None,
-        )
-    )
-    targets = build_qwen3_tts_targets(
-        decoder=decoder,
-        vllm_config=vllm_config,
-        num_quantizers=config.num_quantizers,
-        total_upsample=decoder.total_upsample,
-    )
-    decoder._vocoder_cudagraph_targets = targets
-    for target in targets:
-        suffix = target.target_id.removeprefix("qwen3_tts.")
-        setattr(decoder, f"_{suffix}_cudagraph_target_ref", weakref.ref(target))
+    decoder._initial_codec_chunk_frames = 1
+    decoder._incremental_chunk_frames = 25
+    decoder._incremental_chunk_ramp = []
     return decoder
 
 
@@ -645,12 +622,8 @@ def test_eager_backend_max_batch_size_splits_each_phase_group():
     assert len(outputs) == 5
 
 
-def test_stateful_graph_batch_overflow_splits_at_target_buckets():
+def test_graph_executor_stateful_overflow_splits_at_target_buckets():
     decoder = _decoder_stub(dtype=torch.float32)
-    decoder._decode_xvec_prefix_batch = Qwen3TTSTokenizerV2Decoder._decode_xvec_prefix_batch.__get__(decoder)
-    decoder._decode_xvec_prefix_batch_once = Qwen3TTSTokenizerV2Decoder._decode_xvec_prefix_batch_once.__get__(decoder)
-    decoder._stateful_phase_batch_ranges = Qwen3TTSTokenizerV2Decoder._stateful_phase_batch_ranges.__get__(decoder)
-    decoder._run_stateful_phase_batches = Qwen3TTSTokenizerV2Decoder._run_stateful_phase_batches.__get__(decoder)
     calls: list[int] = []
 
     class _Target:
@@ -661,15 +634,25 @@ def test_stateful_graph_batch_overflow_splits_at_target_buckets():
             calls.append(int(codes.shape[0]))
             return codes[:, :1]
 
-    decoder._get_vocoder_graph_target = lambda _name: _Target()
     decoder._finalize_prefix_result = lambda result, _eager, _caches, **_kwargs: [
         result[row : row + 1] for row in range(result.shape[0])
     ]
-
-    outputs = decoder._decode_xvec_prefix_batch(
+    target = _Target()
+    executor = Qwen3TTSGraphExecutor(
+        decoder=decoder,
+        stateless_target=target,
+        icl_prefix_target=target,
+        xvec_prefix_target=target,
+        suffix_target=target,
+        initial_codec_chunk_frames=1,
+        codec_chunk_frames=25,
+        codec_chunk_ramp=[],
+    )
+    outputs = executor._decode_xvec_prefix_target_batch(
         [torch.zeros(1, 2, 1) for _ in range(10)],
         [{} for _ in range(10)],
         initial_chunk_frames=1,
+        eager_max_batch_size=0,
     )
 
     assert calls == [4, 4, 2]
@@ -677,15 +660,11 @@ def test_stateful_graph_batch_overflow_splits_at_target_buckets():
     assert len(outputs) == 10
 
 
-def test_stateful_pure_eager_target_honors_decode_batch_max_size():
+def test_decoder_eager_batch_max_size_is_routed_by_shared_api():
     decoder = _decoder_stub(config=SimpleNamespace(sliding_window=10), dtype=torch.float32)
     for name in (
         "batched_chunked_decode",
         "batched_request_decode",
-        "_decode_xvec_prefix_batch",
-        "_decode_xvec_prefix_batch_once",
-        "_stateful_phase_batch_ranges",
-        "_run_stateful_phase_batches",
     ):
         setattr(decoder, name, getattr(Qwen3TTSTokenizerV2Decoder, name).__get__(decoder))
     decoder._initial_codec_chunk_frames = 1
@@ -693,19 +672,11 @@ def test_stateful_pure_eager_target_honors_decode_batch_max_size():
     decoder._incremental_chunk_ramp = []
     calls: list[int] = []
 
-    class _Target:
-        is_graph_bound = False
-        descriptors = ()
+    def decode_xvec(codes, _caches, **_kwargs):
+        calls.append(len(codes))
+        return [code[:, :1] for code in codes]
 
-        def __call__(self, codes, _cache):
-            calls.append(int(codes.shape[0]))
-            return codes[:, :1]
-
-    target = _Target()
-    decoder._get_vocoder_graph_target = lambda _name: target
-    decoder._finalize_prefix_result = lambda result, _eager, _caches, **_kwargs: [
-        result[row : row + 1] for row in range(result.shape[0])
-    ]
+    decoder._decode_xvec_prefix_eager_batch = decode_xvec
     outputs = decoder.batched_chunked_decode(
         torch.zeros(10, 2, 1),
         [1] * 10,
@@ -788,12 +759,8 @@ def test_runtime_stateful_chunk_contract_matches_target_planning():
     assert captured["backend_max_batch_size"] == 0
 
 
-def test_stateless_variable_lengths_share_target_frame_bucket():
+def test_graph_executor_stateless_variable_lengths_share_target_frame_bucket():
     decoder = _decoder_stub(total_upsample=2)
-    decoder._batched_stateless_chunked_decode = Qwen3TTSTokenizerV2Decoder._batched_stateless_chunked_decode.__get__(
-        decoder
-    )
-    decoder._stateless_frame_bucket = Qwen3TTSTokenizerV2Decoder._stateless_frame_bucket.__get__(decoder)
     calls: list[torch.Tensor] = []
 
     class _Target:
@@ -803,9 +770,19 @@ def test_stateless_variable_lengths_share_target_frame_bucket():
             calls.append(codes.clone())
             return codes[:, :1].repeat_interleave(2, dim=-1).float()
 
-    decoder._get_vocoder_graph_target = lambda _name: _Target()
+    target = _Target()
+    executor = Qwen3TTSGraphExecutor(
+        decoder=decoder,
+        stateless_target=target,
+        icl_prefix_target=target,
+        xvec_prefix_target=target,
+        suffix_target=target,
+        initial_codec_chunk_frames=1,
+        codec_chunk_frames=25,
+        codec_chunk_ramp=[],
+    )
     codes = torch.arange(100).reshape(2, 2, 25)
-    outputs = decoder._batched_stateless_chunked_decode(
+    outputs = executor._batched_stateless_chunked_decode(
         codes,
         [25, 12],
         chunk_size=25,
@@ -818,12 +795,8 @@ def test_stateless_variable_lengths_share_target_frame_bucket():
     torch.testing.assert_close(outputs[1], codes[1, :1, :12].repeat_interleave(2, dim=-1).float())
 
 
-def test_stateless_mixed_zero_and_nonzero_lengths_keep_empty_output():
+def test_graph_executor_stateless_mixed_zero_and_nonzero_lengths_keep_empty_output():
     decoder = _decoder_stub(total_upsample=2)
-    decoder._batched_stateless_chunked_decode = Qwen3TTSTokenizerV2Decoder._batched_stateless_chunked_decode.__get__(
-        decoder
-    )
-    decoder._stateless_frame_bucket = Qwen3TTSTokenizerV2Decoder._stateless_frame_bucket.__get__(decoder)
 
     class _Target:
         descriptors = (SimpleNamespace(variant=SimpleNamespace(batch_size=2, frames=25)),)
@@ -831,9 +804,19 @@ def test_stateless_mixed_zero_and_nonzero_lengths_keep_empty_output():
         def __call__(self, codes):
             return codes[:, :1].repeat_interleave(2, dim=-1).float()
 
-    decoder._get_vocoder_graph_target = lambda _name: _Target()
+    target = _Target()
+    executor = Qwen3TTSGraphExecutor(
+        decoder=decoder,
+        stateless_target=target,
+        icl_prefix_target=target,
+        xvec_prefix_target=target,
+        suffix_target=target,
+        initial_codec_chunk_frames=1,
+        codec_chunk_frames=25,
+        codec_chunk_ramp=[],
+    )
     codes = torch.arange(100).reshape(2, 2, 25)
-    outputs = decoder._batched_stateless_chunked_decode(
+    outputs = executor._batched_stateless_chunked_decode(
         codes,
         [0, 25],
         chunk_size=25,
@@ -845,7 +828,7 @@ def test_stateless_mixed_zero_and_nonzero_lengths_keep_empty_output():
     torch.testing.assert_close(outputs[1], codes[1, :1].repeat_interleave(2, dim=-1).float())
     assert [
         output.shape[-1]
-        for output in decoder._batched_stateless_chunked_decode(
+        for output in executor._batched_stateless_chunked_decode(
             codes,
             [0, 0],
             chunk_size=25,
