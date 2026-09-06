@@ -24,6 +24,10 @@ from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
 
 from .stateful_chunking import resolve_stateful_chunk_contract
+from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+    _materialize_suffix_batch,
+    _resolve_suffix_batch,
+)
 
 STATELESS_TARGET_ID = "qwen3_tts.stateless"
 SHARED_CONFIG_KEYS = frozenset(
@@ -40,6 +44,23 @@ TARGET_CONFIG_KEYS = frozenset({"capture_bucket_sizes", "decode_chunk_frames", "
 class Qwen3TTSStatelessVariant:
     batch_size: int
     frames: int
+
+
+@dataclass(frozen=True)
+class Qwen3TTSExecutionSettings:
+    """Resolved Qwen decode and capture settings shared by all owners."""
+
+    async_chunk: bool
+    capture_batch_sizes: tuple[int, ...] | None
+    stateless_capture_sizes: tuple[int, ...]
+    decode_chunk_frames: int
+    decode_left_context_frames: int
+    decode_batch_max_size: int
+    decode_enable_tf32: bool
+    codec_chunk_frames: int
+    codec_left_context_frames: int
+    initial_codec_chunk_frames: int
+    codec_chunk_ramp: tuple[int, ...]
 
 
 @dataclass
@@ -60,10 +81,6 @@ class Qwen3TTSStatelessRoutine(BaseVocoderCUDAGraphRoutine):
         self.num_quantizers = num_quantizers
         self.total_upsample = total_upsample
         self._runnable = runnable
-
-    @property
-    def runnable(self) -> Callable[..., Any]:
-        return self._runnable
 
     def eager_call(self, codes: torch.Tensor) -> torch.Tensor:
         return self._runnable(codes)
@@ -231,6 +248,17 @@ def _slice_dynamic_cache_batch(cache: DynamicCache, batch_size: int) -> DynamicC
     return result
 
 
+def _slice_dynamic_cache_view(cache: DynamicCache, row: int) -> DynamicCache:
+    result = copy.copy(cache)
+    result.layers = [copy.copy(layer) for layer in cache.layers]
+    for layer in result.layers:
+        if layer.keys is not None:
+            layer.keys = layer.keys[row : row + 1]
+        if layer.values is not None:
+            layer.values = layer.values[row : row + 1]
+    return result
+
+
 def _copy_dynamic_cache_row(source: DynamicCache, target: DynamicCache, row: int) -> None:
     """Copy request KV contents into one graph-owned static cache row.
 
@@ -328,10 +356,6 @@ class Qwen3TTSIclPrefixRoutine(_Qwen3TTSStatefulRoutineBase):
         self.prefix_length = prefix_length
         self.initial_frames = initial_frames
         self._runnable = decoder._decode_icl_first_chunk
-
-    @property
-    def runnable(self) -> Callable[..., Any]:
-        return self._runnable
 
     def eager_call(
         self,
@@ -459,10 +483,11 @@ class Qwen3TTSIclPrefixRoutine(_Qwen3TTSStatefulRoutineBase):
         codes = args[0]
         static_cache = buffers.cache
         state = {
-            key: static_cache[key][: codes.shape[0]].clone()
+            key: static_cache[key][: codes.shape[0]]
             for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv")
         }
-        state["past_key_values"] = _slice_dynamic_cache_batch(static_cache["past_key_values"], int(codes.shape[0]))
+        detached = _slice_dynamic_cache_batch(static_cache["past_key_values"], int(codes.shape[0]))
+        state["past_key_values"] = [_slice_dynamic_cache_view(detached, row) for row in range(int(codes.shape[0]))]
         state["decoder_prefix_frames"] = self.prefix_length
         if not isinstance(captured_output, torch.Tensor):
             raise TypeError("Qwen3-TTS ICL graph output must be a Tensor")
@@ -474,10 +499,6 @@ class Qwen3TTSXvecPrefixRoutine(_Qwen3TTSStatefulRoutineBase):
         super().__init__(decoder=decoder, num_quantizers=num_quantizers)
         self.initial_frames = initial_frames
         self._runnable = decoder._decode_xvec_first_chunk
-
-    @property
-    def runnable(self) -> Callable[..., Any]:
-        return self._runnable
 
     def eager_call(self, codes: torch.Tensor, cache: dict[str, Any]) -> torch.Tensor:
         return self._runnable(codes, cache)
@@ -552,10 +573,11 @@ class Qwen3TTSXvecPrefixRoutine(_Qwen3TTSStatefulRoutineBase):
         codes = args[0]
         static_cache = buffers.cache
         state = {
-            key: static_cache[key][: codes.shape[0]].clone()
+            key: static_cache[key][: codes.shape[0]]
             for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv")
         }
-        state["past_key_values"] = _slice_dynamic_cache_batch(static_cache["past_key_values"], int(codes.shape[0]))
+        detached = _slice_dynamic_cache_batch(static_cache["past_key_values"], int(codes.shape[0]))
+        state["past_key_values"] = [_slice_dynamic_cache_view(detached, row) for row in range(int(codes.shape[0]))]
         state["decoder_prefix_frames"] = 0
         if not isinstance(captured_output, torch.Tensor):
             raise TypeError("Qwen3-TTS XVec graph output must be a Tensor")
@@ -591,10 +613,6 @@ class Qwen3TTSSuffixRoutine(_Qwen3TTSStatefulRoutineBase):
             )
 
         self._runnable = run
-
-    @property
-    def runnable(self) -> Callable[..., Any]:
-        return self._runnable
 
     def eager_call(self, mode, target_frames, codes_list, request_caches, new_frames_list):
         """Handle only the runtime Target signature."""
@@ -757,45 +775,36 @@ class Qwen3TTSSuffixRoutine(_Qwen3TTSStatefulRoutineBase):
         request_caches: list[dict[str, Any]],
         new_frames_list: list[int],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        previous_frames = self.transitions[mode][target_frames]
-        expected_new_frames = target_frames - previous_frames
-        if any(not 0 < frames <= expected_new_frames for frames in new_frames_list):
-            raise ValueError("Suffix eager fallback received an invalid frame count")
-        if not self.decoder._cache_tensors_are_batchable(
+        metadata = _resolve_suffix_batch(
+            self.decoder,
+            mode,
+            target_frames,
+            codes_list,
             request_caches,
-            ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"),
-        ):
-            raise ValueError("Suffix Target eager execution requires batchable request caches")
-
-        batched_codes = codes_list[0].new_zeros((len(codes_list), codes_list[0].shape[1], expected_new_frames))
-        for row, (codes, new_frames) in enumerate(zip(codes_list, new_frames_list, strict=True)):
-            batched_codes[row, :, :new_frames].copy_(codes[0, :, -new_frames:])
-        cache = {
-            key: torch.cat([request_cache[key] for request_cache in request_caches], dim=0)
-            for key in ("ref_hidden", "ref_conv", "prefix_hidden")
-        }
-        try:
-            cache["past_key_values"] = self.decoder._batch_dynamic_caches(
-                [request_cache["past_key_values"] for request_cache in request_caches]
-            )
-        except ValueError:
-            # This is a pre-replay batching limitation, not a graph replay
-            # failure. Returning None lets shared routing use its safe
-            # per-request eager fallback, as the legacy wrapper did.
-            return None
-        old_quantized = torch.cat([request_cache["suffix_quantized"] for request_cache in request_caches], dim=0)
-        old_conv = torch.cat([request_cache["suffix_conv"] for request_cache in request_caches], dim=0)
-        mask = torch.ones(
-            len(codes_list),
-            (self.prefix_length if mode == "icl" else 0) + previous_frames + expected_new_frames,
-            dtype=torch.bool,
-            device=batched_codes.device,
+            new_frames_list,
+            transitions_by_mode=self.transitions,
         )
-        if mode == "icl":
-            for row, request_cache in enumerate(request_caches):
-                mask[row, : int(request_cache.get("prefix_pad_frames", 0))] = 0
-        captured_output = self._runnable(mode, target_frames, batched_codes, old_quantized, old_conv, cache, mask)
-        return captured_output
+        if metadata is None:
+            return None
+        prepared = _materialize_suffix_batch(
+            self.decoder,
+            mode,
+            codes_list,
+            request_caches,
+            new_frames_list,
+            metadata,
+        )
+        if prepared is None:
+            return None
+        return self._runnable(
+            mode,
+            target_frames,
+            prepared.codes,
+            prepared.old_quantized,
+            prepared.old_conv,
+            prepared.cache,
+            prepared.attention_mask,
+        )
 
 
 def _positive_ints(value: object, *, path: str) -> tuple[int, ...]:
@@ -809,37 +818,6 @@ def _positive_ints(value: object, *, path: str) -> tuple[int, ...]:
     if not result:
         raise ValueError(f"{path} must not be empty")
     return tuple(sorted(result))
-
-
-def _resolved_graph_config(vllm_config: VllmConfig) -> dict[str, Any]:
-    value = getattr(vllm_config.model_config, "vocoder_cudagraph_config", None)
-    if value is None:
-        return {}
-    if not isinstance(value, Mapping):
-        raise TypeError("vocoder_cudagraph must be a mapping")
-    return dict(value)
-
-
-def get_qwen3_tts_target_config(vllm_config: VllmConfig, target_id: str) -> dict[str, Any]:
-    graph_config = _resolved_graph_config(vllm_config)
-    target_configs = graph_config.get("targets", {})
-    if target_configs is None:
-        return {}
-    if not isinstance(target_configs, Mapping):
-        raise TypeError("vocoder_cudagraph.targets must be a mapping")
-    target_config = target_configs.get(target_id, {})
-    if not isinstance(target_config, Mapping):
-        raise TypeError(f"vocoder_cudagraph.targets.{target_id} must be a mapping")
-    return dict(target_config)
-
-
-def _connector_extra(vllm_config: VllmConfig) -> dict[str, Any]:
-    connector = getattr(vllm_config.model_config, "stage_connector_config", None)
-    if isinstance(connector, Mapping):
-        extra = connector.get("extra", connector)
-    else:
-        extra = getattr(connector, "extra", None)
-    return dict(extra) if isinstance(extra, Mapping) else {}
 
 
 def _positive_ints_or_none(value: object) -> tuple[int, ...] | None:
@@ -860,48 +838,117 @@ def _positive_ints_or_none(value: object) -> tuple[int, ...] | None:
     return tuple(sorted(set(result)))
 
 
+def resolve_qwen3_tts_execution_settings(vllm_config: VllmConfig) -> Qwen3TTSExecutionSettings:
+    """Resolve Qwen config once for decoder, Targets, and GraphExecutor."""
+    model_config = vllm_config.model_config
+    async_chunk = bool(getattr(model_config, "async_chunk", False))
+    graph_value = getattr(model_config, "vocoder_cudagraph_config", None)
+    graph_config = {} if graph_value is None else dict(graph_value) if isinstance(graph_value, Mapping) else None
+    if graph_config is None:
+        raise TypeError("vocoder_cudagraph must be a mapping")
+    target_configs = graph_config.get("targets", {})
+    if target_configs is None:
+        target_configs = {}
+    if not isinstance(target_configs, Mapping):
+        raise TypeError("vocoder_cudagraph.targets must be a mapping")
+    stateless_value = target_configs.get(STATELESS_TARGET_ID, {})
+    if not isinstance(stateless_value, Mapping):
+        raise TypeError(f"vocoder_cudagraph.targets.{STATELESS_TARGET_ID} must be a mapping")
+    stateless_config = dict(stateless_value)
+    connector_config = getattr(model_config, "stage_connector_config", None)
+    connector_value = (
+        connector_config.get("extra", connector_config)
+        if isinstance(connector_config, Mapping)
+        else getattr(connector_config, "extra", None)
+    )
+    connector = dict(connector_value) if isinstance(connector_value, Mapping) else {}
+
+    def int_config(config: Mapping[str, Any], name: str, default: int) -> int:
+        value = config.get(name, default)
+        try:
+            return default if value is None else int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
+
+    decode_chunk = int_config(stateless_config, "decode_chunk_frames", 300)
+    decode_left = int_config(stateless_config, "decode_left_context_frames", 25)
+    decode_batch = int_config(graph_config, "decode_batch_max_size", 0)
+    if decode_chunk <= 0 or decode_left < 0:
+        raise ValueError(
+            "Invalid Qwen3-TTS Code2Wav decode chunk config: "
+            f"decode_chunk_frames={decode_chunk}, decode_left_context_frames={decode_left}"
+        )
+    if decode_batch < 0:
+        raise ValueError(f"Invalid Qwen3-TTS Code2Wav config decode_batch_max_size={decode_batch}")
+
+    tf32 = graph_config.get("decode_enable_tf32", False)
+    if isinstance(tf32, str):
+        lowered = tf32.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            tf32 = True
+        elif lowered in ("0", "false", "no", "off"):
+            tf32 = False
+        else:
+            raise ValueError(f"Invalid Qwen3-TTS Code2Wav config decode_enable_tf32={tf32!r}")
+    if not isinstance(tf32, (bool, int)):
+        raise ValueError(f"Invalid Qwen3-TTS Code2Wav config decode_enable_tf32={tf32!r}")
+
+    capture_batch_sizes = _positive_ints_or_none(graph_config.get("capture_batch_sizes"))
+    capture_bucket_value = stateless_config.get("capture_bucket_sizes")
+    if capture_bucket_value is None:
+        stateless_capture_sizes = (150, decode_chunk + decode_left)
+    else:
+        stateless_capture_sizes = tuple(
+            sorted(
+                {
+                    150,
+                    decode_chunk + decode_left,
+                    *_positive_ints(
+                        capture_bucket_value,
+                        path=f"vocoder_cudagraph.targets.{STATELESS_TARGET_ID}.capture_bucket_sizes",
+                    ),
+                }
+            )
+        )
+    codec_chunk = int(connector.get("codec_chunk_frames", 0) or 0)
+    initial_chunk = int(connector.get("initial_codec_chunk_frames", 1) or 1)
+    ramp = parse_chunk_ramp(connector, steady=codec_chunk) if async_chunk else None
+    return Qwen3TTSExecutionSettings(
+        async_chunk=async_chunk,
+        capture_batch_sizes=capture_batch_sizes,
+        stateless_capture_sizes=stateless_capture_sizes,
+        decode_chunk_frames=decode_chunk,
+        decode_left_context_frames=decode_left,
+        decode_batch_max_size=decode_batch,
+        decode_enable_tf32=bool(tf32),
+        codec_chunk_frames=codec_chunk,
+        codec_left_context_frames=int(connector.get("codec_left_context_frames", 0) or 0),
+        initial_codec_chunk_frames=initial_chunk,
+        codec_chunk_ramp=tuple(ramp or ()),
+    )
+
+
 def build_qwen3_tts_targets(
     *,
     decoder: torch.nn.Module,
-    vllm_config: VllmConfig,
+    settings: Qwen3TTSExecutionSettings,
     num_quantizers: int,
     total_upsample: int,
 ) -> tuple[VocoderCUDAGraphTarget, ...]:
     """Build Qwen3-TTS Targets without CUDA allocation or runnable invocation."""
 
-    connector = _connector_extra(vllm_config)
-    graph_config = _resolved_graph_config(vllm_config)
-    stateless_config = get_qwen3_tts_target_config(vllm_config, STATELESS_TARGET_ID)
-    decode_chunk = int(stateless_config.get("decode_chunk_frames", 300) or 300)
-    decode_left = int(stateless_config.get("decode_left_context_frames", 25) or 25)
-    batch_sizes = _positive_ints_or_none(graph_config.get("capture_batch_sizes"))
-    codec_chunk = int(connector.get("codec_chunk_frames", 0) or 0)
-    initial_chunk = int(connector.get("initial_codec_chunk_frames", 1) or 1)
-    ramp = (
-        parse_chunk_ramp(connector, steady=codec_chunk)
-        if bool(getattr(vllm_config.model_config, "async_chunk", False))
-        else None
-    )
-
     stateless = build_stateless_target(
         decoder=decoder,
         runnable=decoder._forward_exact,
-        vllm_config=vllm_config,
+        settings=settings,
         num_quantizers=num_quantizers,
         total_upsample=total_upsample,
-        capture_batch_sizes=batch_sizes,
-        decode_chunk_size=decode_chunk,
-        decode_left_context=decode_left,
     )
     stateful = build_stateful_targets(
         decoder=decoder,
-        vllm_config=vllm_config,
+        settings=settings,
         num_quantizers=num_quantizers,
         prefix_length=int(getattr(getattr(decoder, "config", None), "sliding_window", 0) or 0),
-        capture_batch_sizes=batch_sizes,
-        initial_frames=initial_chunk,
-        chunk_frames=codec_chunk or 25,
-        chunk_ramp=ramp,
     )
     return (stateless, *stateful)
 
@@ -910,56 +957,21 @@ def build_stateless_target(
     *,
     decoder: torch.nn.Module,
     runnable: Callable[[torch.Tensor], torch.Tensor],
-    vllm_config: VllmConfig,
+    settings: Qwen3TTSExecutionSettings,
     num_quantizers: int,
     total_upsample: int,
-    capture_batch_sizes: Sequence[int] | None,
-    decode_chunk_size: int,
-    decode_left_context: int,
 ) -> VocoderCUDAGraphTarget:
     """Resolve config into one immutable stateless Target, CPU-only."""
 
-    config = _resolved_graph_config(vllm_config)
-    target_config = get_qwen3_tts_target_config(vllm_config, STATELESS_TARGET_ID)
-
-    if bool(getattr(vllm_config.model_config, "async_chunk", False)):
+    if settings.async_chunk:
         # Keep the known Target in the stable registry so overrides can be
         # validated, but declare no stateless startup coverage; the stateful
         # ICL/x-vector/suffix Targets are built separately below.
         batch_sizes: tuple[int, ...] = ()
         capture_sizes: tuple[int, ...] = ()
     else:
-        batch_value = config.get("capture_batch_sizes")
-        if batch_value is not None:
-            batch_sizes = _positive_ints(batch_value, path="vocoder_cudagraph.capture_batch_sizes")
-        elif capture_batch_sizes:
-            batch_sizes = tuple(sorted({int(size) for size in capture_batch_sizes if int(size) > 0}))
-        else:
-            batch_sizes = (1,)
-
-        bucket_value = target_config.get("capture_bucket_sizes")
-        if bucket_value is not None:
-            capture_sizes = tuple(
-                sorted(
-                    {
-                        150,
-                        decode_chunk_size + decode_left_context,
-                        *_positive_ints(
-                            bucket_value,
-                            path=f"vocoder_cudagraph.targets.{STATELESS_TARGET_ID}.capture_bucket_sizes",
-                        ),
-                    }
-                )
-            )
-        else:
-            capture_sizes = tuple(
-                sorted(
-                    {
-                        150,
-                        decode_chunk_size + decode_left_context,
-                    }
-                )
-            )
+        batch_sizes = settings.capture_batch_sizes or (1,)
+        capture_sizes = settings.stateless_capture_sizes
 
     descriptors = tuple(
         VocoderCUDAGraphDescriptor(Qwen3TTSStatelessVariant(batch_size, frames))
@@ -984,36 +996,28 @@ def build_stateless_target(
 def build_stateful_targets(
     *,
     decoder: torch.nn.Module,
-    vllm_config: VllmConfig,
+    settings: Qwen3TTSExecutionSettings,
     num_quantizers: int,
     prefix_length: int,
-    capture_batch_sizes: Sequence[int] | None,
-    initial_frames: int,
-    chunk_frames: int,
-    chunk_ramp: Sequence[int] | None,
 ) -> tuple[VocoderCUDAGraphTarget, ...]:
     """Build Qwen3-TTS stateful Targets from connector transitions."""
 
-    config = _resolved_graph_config(vllm_config)
-    batch_value = config.get("capture_batch_sizes")
-    if batch_value is not None:
-        batch_sizes = _positive_ints(batch_value, path="vocoder_cudagraph.capture_batch_sizes")
-    elif capture_batch_sizes:
-        batch_sizes = tuple(sorted({int(size) for size in capture_batch_sizes if int(size) > 0}))
-    else:
-        batch_sizes = (1,)
+    batch_sizes = settings.capture_batch_sizes or (1,)
 
     contract = resolve_stateful_chunk_contract(
         prefix_length=prefix_length,
-        initial_codec_chunk_frames=initial_frames,
-        codec_chunk_frames=chunk_frames,
-        codec_chunk_ramp=chunk_ramp,
+        initial_codec_chunk_frames=settings.initial_codec_chunk_frames,
+        codec_chunk_frames=settings.codec_chunk_frames or 25,
+        codec_chunk_ramp=settings.codec_chunk_ramp,
     )
     resolved_initial_frames = contract.resolved_initial_frames
-    transitions = contract.transitions if prefix_length > 2 and resolved_initial_frames > 0 and chunk_frames > 0 else {}
+    transitions = (
+        contract.transitions
+        if prefix_length > 2 and resolved_initial_frames > 0 and settings.codec_chunk_frames > 0
+        else {}
+    )
 
-    async_chunk = bool(getattr(vllm_config.model_config, "async_chunk", False))
-    if not async_chunk:
+    if not settings.async_chunk:
         batch_sizes = ()
         transitions = {}
 

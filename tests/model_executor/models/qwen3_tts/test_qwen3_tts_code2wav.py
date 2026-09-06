@@ -24,7 +24,7 @@ class _FakeDecoder(nn.Module):
         super().__init__()
         self.total_upsample = total_upsample
         self.config = SimpleNamespace(sliding_window=0)
-        self.decode_calls: list[dict[str, int]] = []
+        self.decode_calls: list[dict[str, object]] = []
         self.batched_decode_calls: list[dict[str, object]] = []
         self.decode_codes: list[torch.Tensor] = []
 
@@ -78,7 +78,7 @@ class _FakeDecoder(nn.Module):
         chunk_size: int = 300,
         left_context_size: int = 25,
         max_batch_size: int = 0,
-    ) -> torch.Tensor:
+    ) -> list[torch.Tensor]:
         self.batched_decode_calls.append(
             {
                 "chunk_size": chunk_size,
@@ -106,8 +106,26 @@ class _FakeDecoder(nn.Module):
         wav_len = frames * self.total_upsample + 6
         wav = torch.arange(wav_len, dtype=torch.float32).view(1, 1, -1)
         offsets = torch.arange(batch, dtype=torch.float32).view(batch, 1, 1) * 1000
-        outputs = wav.expand(batch, 1, wav_len) + offsets
-        return [outputs[row, :, : lengths[row] * self.total_upsample] for row in range(batch)]
+        batched_outputs = wav.expand(batch, 1, wav_len) + offsets
+        return [batched_outputs[row, :, : lengths[row] * self.total_upsample] for row in range(batch)]
+
+    def batched_request_decode(self, codes_list, request_caches, **kwargs):
+        lengths = [int(codes.shape[-1]) for codes in codes_list]
+        max_length = max(lengths, default=0)
+        padded = codes_list[0].new_zeros((len(codes_list), codes_list[0].shape[1], max_length))
+        for row, codes in enumerate(codes_list):
+            padded[row, :, : codes.shape[-1]].copy_(codes[0])
+        return [
+            output.unsqueeze(0)
+            for output in self.batched_chunked_decode(
+                padded,
+                lengths,
+                caches=request_caches,
+                chunk_size=kwargs.get("chunk_size", 300),
+                left_context_size=kwargs.get("left_context_size", 25),
+                max_batch_size=kwargs.get("backend_max_batch_size", 0),
+            )
+        ]
 
 
 def _fake_dec_config():
@@ -125,6 +143,8 @@ def _make_model(
     device: torch.device | None = None,
 ) -> Qwen3TTSCode2Wav:
     dec_config = _fake_dec_config()
+    if vocoder_cudagraph_config is None:
+        vocoder_cudagraph_config = {"capture_batch_sizes": [2]}
     tok_config = SimpleNamespace(
         decoder_config=dec_config,
         output_sample_rate=_OUTPUT_SAMPLE_RATE,
@@ -454,17 +474,6 @@ def test_forward_batches_equal_length_requests_in_one_decoder_call():
         ],
     )
 
-    assert model.decoder.decode_calls == []
-    assert model.decoder.batched_decode_calls == [
-        {
-            "chunk_size": 300,
-            "left_context_size": 25,
-            "max_batch_size": 0,
-            "codes_shape": (2, _NUM_QUANTIZERS, 3),
-            "lengths": (3, 3),
-            "caches": None,
-        }
-    ]
     audios = out.multimodal_outputs["model_outputs"]
     torch.testing.assert_close(audios[0], torch.arange(12, dtype=torch.float32))
     torch.testing.assert_close(audios[1], torch.arange(1004, 1012, dtype=torch.float32))
@@ -512,8 +521,9 @@ def test_decode_modes_enforce_cache_contracts():
         async_model.forward(input_ids=torch.arange(4, dtype=torch.long))
 
     stateless_model = _make_model(async_chunk=False)
-    stateless_model.forward(input_ids=torch.arange(4, dtype=torch.long))
-    assert stateless_model.decoder.batched_decode_calls[-1]["caches"] is None
+    output = stateless_model.forward(input_ids=torch.arange(4, dtype=torch.long))
+    assert stateless_model._decoder_state_cache == {}
+    assert output.multimodal_outputs["model_outputs"][0].numel() > 0
 
 
 def test_forward_allows_followup_delta_without_reference_prefix():
@@ -565,17 +575,6 @@ def test_forward_passes_variable_length_padded_batch_to_decoder():
         ],
     )
 
-    assert model.decoder.decode_calls == []
-    assert model.decoder.batched_decode_calls == [
-        {
-            "chunk_size": 300,
-            "left_context_size": 25,
-            "max_batch_size": 0,
-            "codes_shape": (2, _NUM_QUANTIZERS, 4),
-            "lengths": (2, 4),
-            "caches": None,
-        }
-    ]
     audios = out.multimodal_outputs["model_outputs"]
     torch.testing.assert_close(audios[0], torch.arange(8, dtype=torch.float32))
     torch.testing.assert_close(audios[1], torch.arange(1008, 1016, dtype=torch.float32))
@@ -602,7 +601,6 @@ def test_decode_chunking_override_is_resolved_before_target_construction():
     assert model._decode_left_context_frames == 17
     target = model.get_vocoder_cudagraph_targets()[0]
     assert target.descriptors == ()
-    assert target.routine.runnable == model.decoder._forward_exact
 
 
 def test_stateless_cudagraph_capture_sizes_are_resolved_into_target_descriptors():
@@ -617,7 +615,6 @@ def test_stateless_cudagraph_capture_sizes_are_resolved_into_target_descriptors(
 
     target = model.get_vocoder_cudagraph_targets()[0]
     assert {descriptor.variant.frames for descriptor in target.descriptors} == {97, 150, 325, 400}
-    assert target.routine.runnable == model.decoder._forward_exact
 
 
 def test_decode_tf32_can_be_configured():

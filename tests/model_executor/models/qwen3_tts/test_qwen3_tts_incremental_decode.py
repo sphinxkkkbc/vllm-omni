@@ -3,6 +3,7 @@
 
 import copy
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -19,6 +20,10 @@ from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts
     _DOWNSTREAM_CONTEXT_FRAME,
     Qwen3TTSTokenizerV2Decoder,
     Qwen3TTSTokenizerV2DecoderTransformerModel,
+)
+from vllm_omni.model_executor.models.qwen3_tts.vocoder_cudagraph import (
+    build_qwen3_tts_targets,
+    resolve_qwen3_tts_execution_settings,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -163,6 +168,30 @@ def test_code2wav_full_graph_dummy_forward_uses_exact_batched_decode(monkeypatch
     model._batch_stats_enabled = False
     model._batch_stats_log_every = 0
     model._batch_stats_forwards = 0
+    graph_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            async_chunk=True,
+            stage_connector_config={"extra": {"codec_chunk_frames": 25, "initial_codec_chunk_frames": 1}},
+            vocoder_cudagraph_config=None,
+        )
+    )
+    settings = resolve_qwen3_tts_execution_settings(graph_config)
+    stateless_target, icl_target, xvec_target, suffix_target = build_qwen3_tts_targets(
+        decoder=decoder,
+        settings=settings,
+        num_quantizers=decoder.config.num_quantizers,
+        total_upsample=decoder.total_upsample,
+    )
+    model._graph_executor = Qwen3TTSGraphExecutor(
+        decoder=decoder,
+        stateless_target=stateless_target,
+        icl_prefix_target=icl_target,
+        xvec_prefix_target=xvec_target,
+        suffix_target=suffix_target,
+        initial_codec_chunk_frames=settings.initial_codec_chunk_frames,
+        codec_chunk_frames=settings.codec_chunk_frames,
+        codec_chunk_ramp=list(settings.codec_chunk_ramp),
+    )
 
     runtime_info = model.get_dummy_runtime_additional_information(1)
     output = model.forward(
@@ -356,7 +385,7 @@ def test_incremental_request_audio_matches_full_decode(mode):
         (1, decoder.config.num_quantizers, prefix_frames + suffix_frames),
     )
     suffix_codes = codes[..., prefix_frames:]
-    caches = {"prefix_frames": prefix_frames}
+    caches: dict[str, Any] = {"prefix_frames": prefix_frames}
 
     with torch.no_grad():
         first = decoder(codes[..., : prefix_frames + 1], caches=caches)
@@ -398,7 +427,7 @@ def test_single_frame_xvec_prefix_keeps_all_next_chunk_conv_frames():
     decoder = Qwen3TTSTokenizerV2Decoder(config).eval()
     decoder._incremental_chunk_frames = 25
     codes = torch.randint(0, config.codebook_size, (1, config.num_quantizers, 26))
-    caches = {"prefix_frames": 0}
+    caches: dict[str, Any] = {"prefix_frames": 0}
 
     with torch.no_grad():
         decoder(codes[..., :1], caches=caches)
@@ -436,7 +465,7 @@ def test_xvec_rolling_matches_truncated_suffix_window():
     decoder = Qwen3TTSTokenizerV2Decoder(config).eval()
     decoder._incremental_chunk_frames = 25
     codes = torch.randint(0, config.codebook_size, (1, config.num_quantizers, 101))
-    caches = {"prefix_frames": 0}
+    caches: dict[str, Any] = {"prefix_frames": 0}
 
     with torch.no_grad():
         decoder(codes[..., :1], caches=caches)
@@ -485,7 +514,7 @@ def test_icl_rolling_matches_reference_plus_truncated_suffix_window():
     )
     prefix_codes = codes[..., :prefix_frames]
     suffix_codes = codes[..., prefix_frames:]
-    caches = {"prefix_frames": prefix_frames}
+    caches: dict[str, Any] = {"prefix_frames": prefix_frames}
 
     with torch.no_grad():
         decoder(codes[..., : prefix_frames + 1], caches=caches)
@@ -534,12 +563,51 @@ def test_batched_stateful_first_chunk_matches_per_request(mode):
 
 def test_single_request_stateful_target_path_commits_prefix_and_suffix_state():
     decoder = _make_small_decoder()
-    cache = {"prefix_frames": 0}
+    cache: dict[str, Any] = {"prefix_frames": 0}
     first_codes = torch.randint(0, decoder.config.codebook_size, (1, decoder.config.num_quantizers, 1))
     suffix_codes = torch.randint(0, decoder.config.codebook_size, (1, decoder.config.num_quantizers, 25))
 
-    first = decoder.batched_chunked_decode(first_codes, [1], caches=[cache])
-    suffix = decoder.batched_chunked_decode(suffix_codes, [25], caches=[cache])
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            async_chunk=True,
+            stage_connector_config={"extra": {"codec_chunk_frames": 25, "initial_codec_chunk_frames": 1}},
+            vocoder_cudagraph_config=None,
+        )
+    )
+    settings = resolve_qwen3_tts_execution_settings(vllm_config)
+    stateless_target, icl_target, xvec_target, suffix_target = build_qwen3_tts_targets(
+        decoder=decoder,
+        settings=settings,
+        num_quantizers=decoder.config.num_quantizers,
+        total_upsample=decoder.total_upsample,
+    )
+    graph_executor = Qwen3TTSGraphExecutor(
+        decoder=decoder,
+        stateless_target=stateless_target,
+        icl_prefix_target=icl_target,
+        xvec_prefix_target=xvec_target,
+        suffix_target=suffix_target,
+        initial_codec_chunk_frames=settings.initial_codec_chunk_frames,
+        codec_chunk_frames=settings.codec_chunk_frames,
+        codec_chunk_ramp=list(settings.codec_chunk_ramp),
+    )
+
+    first = graph_executor.batched_chunked_decode(
+        first_codes,
+        [1],
+        caches=[cache],
+        chunk_size=300,
+        left_context_size=25,
+        max_batch_size=0,
+    )
+    suffix = graph_executor.batched_chunked_decode(
+        suffix_codes,
+        [25],
+        caches=[cache],
+        chunk_size=300,
+        left_context_size=25,
+        max_batch_size=0,
+    )
 
     assert first[0].shape[-1] == decoder.total_upsample
     assert suffix[0].shape[-1] == 25 * decoder.total_upsample
@@ -686,6 +754,59 @@ def test_decoder_eager_batch_max_size_is_routed_by_shared_api():
 
     assert calls == [4, 4, 2]
     assert len(outputs) == 10
+
+
+def test_graph_executor_suffix_validates_without_batching_dynamic_cache():
+    decoder = _decoder_stub(
+        dtype=torch.float32,
+        _cache_tensors_are_batchable=lambda *_args: True,
+        _finalize_suffix_result=lambda result, *_args: [result],
+    )
+
+    class _Target:
+        is_graph_bound = True
+        descriptors = (SimpleNamespace(variant=SimpleNamespace(batch_size=1, mode="xvec", target_frames=5)),)
+
+        def __call__(self, mode, target_frames, codes, caches, new_frames):
+            assert mode == "xvec"
+            assert target_frames == 5
+            assert len(codes) == len(caches) == len(new_frames) == 1
+            value = torch.zeros(1, 1, 3)
+            return value, value, value
+
+    def _must_not_batch(_caches):
+        raise AssertionError("GraphExecutor must not batch DynamicCache before Target execution")
+
+    decoder._batch_dynamic_caches = _must_not_batch
+    target = _Target()
+    executor = Qwen3TTSGraphExecutor(
+        decoder=decoder,
+        stateless_target=target,
+        icl_prefix_target=target,
+        xvec_prefix_target=target,
+        suffix_target=target,
+        initial_codec_chunk_frames=1,
+        codec_chunk_frames=3,
+        codec_chunk_ramp=[],
+    )
+    cache = {
+        "ref_hidden": torch.zeros(1, 2, 0),
+        "ref_conv": torch.zeros(1, 0, 2),
+        "prefix_hidden": torch.zeros(1, 0, 2),
+        "suffix_quantized": torch.zeros(1, 2, 2),
+        "suffix_conv": torch.zeros(1, 0, 2),
+    }
+    outputs = executor._decode_suffix_target_batch(
+        "xvec",
+        5,
+        [torch.zeros(1, 2, 3)],
+        [cache],
+        [3],
+        transitions_by_mode={"icl": {5: 2}, "xvec": {5: 2}},
+        eager_max_batch_size=0,
+    )
+
+    assert outputs is not None
 
 
 def test_stateful_batched_eager_decline_uses_per_request_fallback():
@@ -857,7 +978,7 @@ def test_batched_chunked_decode_groups_exact_phases():
 
     prefix_frames = 48
     codes_list = [torch.zeros(1, 2, prefix_frames + 1)]
-    caches = [{"prefix_frames": prefix_frames}]
+    caches: list[dict[str, Any]] = [{"prefix_frames": prefix_frames}]
     for previous, cached_frames in ((1, 1), (26, 26), (51, 51), (76, 72)):
         codes_list.append(torch.zeros(1, 2, 25))
         caches.append(

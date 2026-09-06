@@ -20,7 +20,6 @@ from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
     VocoderCUDAGraphTarget,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
 
 from .qwen3_tts_graph_executor import Qwen3TTSGraphExecutor
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
@@ -32,7 +31,7 @@ from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
 from .vocoder_cudagraph import (
     SHARED_CONFIG_KEYS,
     build_qwen3_tts_targets,
-    get_qwen3_tts_target_config,
+    resolve_qwen3_tts_execution_settings,
 )
 
 logger = init_logger(__name__)
@@ -124,84 +123,44 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._decoder_state_cache: dict[str, dict[str, Any]] = {}
         self._decoder_state_cache_warn_entries = 512
         self._vocoder_cudagraph_targets: tuple[VocoderCUDAGraphTarget, ...] = ()
-        self._graph_executor: Qwen3TTSGraphExecutor | None = None
-        self._resolve_decoder_execution_settings()
+        self._graph_executor: Qwen3TTSGraphExecutor
+        self._execution_settings = resolve_qwen3_tts_execution_settings(self.vllm_config)
+        self._apply_decoder_execution_settings()
         # Targets are immutable model-owned objects. Construct them before
         # weight loading so the runner can retain these exact identities.
         self._vocoder_cudagraph_targets = build_qwen3_tts_targets(
             decoder=self.decoder,
-            vllm_config=self.vllm_config,
+            settings=self._execution_settings,
             num_quantizers=self._num_quantizers,
             total_upsample=self._total_upsample,
         )
-        targets = {target.target_id: target for target in self._vocoder_cudagraph_targets}
-        if hasattr(self.decoder, "batched_request_decode"):
-            self._graph_executor = Qwen3TTSGraphExecutor(
-                decoder=self.decoder,
-                stateless_target=targets["qwen3_tts.stateless"],
-                icl_prefix_target=targets["qwen3_tts.icl_prefix"],
-                xvec_prefix_target=targets["qwen3_tts.xvec_prefix"],
-                suffix_target=targets["qwen3_tts.suffix"],
-                initial_codec_chunk_frames=self._initial_codec_chunk_frames,
-                codec_chunk_frames=self._codec_chunk_frames,
-                codec_chunk_ramp=self._codec_chunk_ramp,
-            )
+        stateless_target, icl_prefix_target, xvec_prefix_target, suffix_target = self._vocoder_cudagraph_targets
+        self._graph_executor = Qwen3TTSGraphExecutor(
+            decoder=self.decoder,
+            stateless_target=stateless_target,
+            icl_prefix_target=icl_prefix_target,
+            xvec_prefix_target=xvec_prefix_target,
+            suffix_target=suffix_target,
+            initial_codec_chunk_frames=self._initial_codec_chunk_frames,
+            codec_chunk_frames=self._codec_chunk_frames,
+            codec_chunk_ramp=self._codec_chunk_ramp,
+        )
 
     def get_vocoder_cudagraph_targets(self) -> tuple[VocoderCUDAGraphTarget, ...]:
         """Return the stable Targets constructed from the resolved config."""
 
         return self._vocoder_cudagraph_targets
 
-    def _resolve_decoder_execution_settings(self) -> None:
-        """Resolve the small config subset shared by eager and Target paths."""
-        model_cfg = self.vllm_config.model_config
-        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
-        connector_extra = (
-            connector_cfg.get("extra", connector_cfg)
-            if isinstance(connector_cfg, dict)
-            else getattr(connector_cfg, "extra", None)
-        )
-        connector_extra = connector_extra if isinstance(connector_extra, dict) else {}
-        graph_cfg = getattr(model_cfg, "vocoder_cudagraph_config", None) or {}
-        if not isinstance(graph_cfg, dict):
-            raise TypeError("vocoder_cudagraph must be a mapping")
-        stateless_cfg = get_qwen3_tts_target_config(self.vllm_config, "qwen3_tts.stateless")
-
-        def int_value(config: dict[str, Any], name: str, default: int) -> int:
-            value = config.get(name, default)
-            try:
-                return default if value is None else int(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
-
-        self._codec_chunk_frames = int(connector_extra.get("codec_chunk_frames") or 0)
-        self._codec_left_context_frames = int(connector_extra.get("codec_left_context_frames") or 0)
-        self._initial_codec_chunk_frames = int(connector_extra.get("initial_codec_chunk_frames") or 1)
-        self._codec_chunk_ramp = list(
-            (parse_chunk_ramp(connector_extra, steady=self._codec_chunk_frames) or ()) if self._async_chunk else ()
-        )
-        self._decode_chunk_frames = int_value(stateless_cfg, "decode_chunk_frames", self._decode_chunk_frames)
-        self._decode_left_context_frames = int_value(
-            stateless_cfg, "decode_left_context_frames", self._decode_left_context_frames
-        )
-        self._decode_batch_max_size = int_value(graph_cfg, "decode_batch_max_size", self._decode_batch_max_size)
-        if self._decode_chunk_frames <= 0 or self._decode_left_context_frames < 0:
-            raise ValueError(
-                "Invalid Qwen3-TTS Code2Wav decode chunk config: "
-                f"decode_chunk_frames={self._decode_chunk_frames}, "
-                f"decode_left_context_frames={self._decode_left_context_frames}"
-            )
-        if self._decode_batch_max_size < 0:
-            raise ValueError(f"Invalid Qwen3-TTS Code2Wav config decode_batch_max_size={self._decode_batch_max_size}")
-        tf32_value = graph_cfg.get("decode_enable_tf32", False)
-        if isinstance(tf32_value, str):
-            if tf32_value.strip().lower() in ("1", "true", "yes", "on"):
-                tf32_value = True
-            elif tf32_value.strip().lower() in ("0", "false", "no", "off"):
-                tf32_value = False
-            else:
-                raise ValueError(f"Invalid Qwen3-TTS Code2Wav config decode_enable_tf32={tf32_value!r}")
-        self._decode_enable_tf32 = bool(tf32_value)
+    def _apply_decoder_execution_settings(self) -> None:
+        settings = self._execution_settings
+        self._codec_chunk_frames = settings.codec_chunk_frames
+        self._codec_left_context_frames = settings.codec_left_context_frames
+        self._initial_codec_chunk_frames = settings.initial_codec_chunk_frames
+        self._codec_chunk_ramp = list(settings.codec_chunk_ramp)
+        self._decode_chunk_frames = settings.decode_chunk_frames
+        self._decode_left_context_frames = settings.decode_left_context_frames
+        self._decode_batch_max_size = settings.decode_batch_max_size
+        self._decode_enable_tf32 = settings.decode_enable_tf32
         self.decoder._initial_codec_chunk_frames = self._initial_codec_chunk_frames
         self.decoder._incremental_chunk_frames = self._codec_chunk_frames or 25
         self.decoder._incremental_chunk_ramp = self._codec_chunk_ramp
@@ -307,7 +266,6 @@ class Qwen3TTSCode2Wav(nn.Module):
         sentinel logic.
         """
         self._batch_stats_forwards += 1
-        decoder = self.decoder
         q = int(self._num_quantizers)
         sr_val = int(self._output_sample_rate)
         sr_tensor = torch.tensor(sr_val, dtype=torch.int32)
@@ -510,11 +468,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             left_context_size=self._decode_left_context_frames,
             max_batch_size=self._decode_batch_max_size,
         )
-        request_wavs = (
-            self._graph_executor.batched_chunked_decode(request_codes, request_lengths, **decode_kwargs)
-            if getattr(self, "_graph_executor", None) is not None
-            else decoder.batched_chunked_decode(request_codes, request_lengths, **decode_kwargs)
-        )
+        request_wavs = self._graph_executor.batched_chunked_decode(request_codes, request_lengths, **decode_kwargs)
         if len(request_wavs) != len(valid_codes_qf):
             raise ValueError(
                 f"Qwen3-TTS batched decoder returned {len(request_wavs)} outputs for {len(valid_codes_qf)} requests"

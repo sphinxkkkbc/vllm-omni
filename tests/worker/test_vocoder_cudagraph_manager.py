@@ -482,7 +482,7 @@ def test_concurrent_lazy_misses_capture_one_entry(monkeypatch) -> None:
     assert manager.capture_attempts[("decode", 3)] == 1
 
 
-def test_binding_failure_is_target_local() -> None:
+def test_binding_failure_propagates() -> None:
     first, _ = _target("first", 2)
     second, _ = _target("second", 2)
     manager = _TestManager()
@@ -492,11 +492,8 @@ def test_binding_failure_is_target_local() -> None:
         raise RuntimeError("bind failed")
 
     first._bind_handle = fail_bind  # type: ignore[assignment]
-    manager.capture_and_bind()
-
-    assert first._bound_handle is None
-    assert second._bound_handle is not None
-    assert set(manager.managed_targets) == {"second"}
+    with pytest.raises(RuntimeError, match="bind failed"):
+        manager.capture_and_bind()
 
 
 def test_prepare_and_capture_are_single_use_lifecycle_operations() -> None:

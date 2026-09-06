@@ -808,6 +808,131 @@ _CONV_CONTEXT_FRAME = 2
 _DOWNSTREAM_CONTEXT_FRAME = 12
 
 
+@dataclass(frozen=True)
+class _PreparedIclPrefixBatch:
+    codes: torch.Tensor
+    hidden_mask: torch.Tensor
+    prefix_mask: torch.Tensor
+    suffix_mask: torch.Tensor
+    prefix_pads: list[int]
+
+
+@dataclass(frozen=True)
+class _SuffixBatchMetadata:
+    previous_frames: int
+    expected_new_frames: int
+
+
+@dataclass(frozen=True)
+class _MaterializedSuffixBatch:
+    codes: torch.Tensor
+    old_quantized: torch.Tensor
+    old_conv: torch.Tensor
+    cache: dict[str, Any]
+    attention_mask: torch.Tensor
+    previous_frames: int
+    expected_new_frames: int
+
+
+def _prepare_icl_prefix_batch(
+    codes_list: list[torch.Tensor],
+    request_caches: list[dict[str, Any]],
+    *,
+    prefix_length: int,
+    initial_chunk_frames: int,
+    dtype: torch.dtype,
+) -> _PreparedIclPrefixBatch | None:
+    batch_size = len(codes_list)
+    total_frames = prefix_length + initial_chunk_frames
+    batched_codes = codes_list[0].new_zeros((batch_size, codes_list[0].shape[1], total_frames))
+    hidden_mask = torch.ones((batch_size, 1, total_frames), dtype=dtype, device=batched_codes.device)
+    prefix_mask = torch.ones((batch_size, prefix_length), dtype=torch.bool, device=batched_codes.device)
+    suffix_mask = torch.ones((batch_size, total_frames), dtype=torch.bool, device=batched_codes.device)
+    prefix_pads: list[int] = []
+    for row, (codes, cache) in enumerate(zip(codes_list, request_caches, strict=True)):
+        prefix_frames = int(cache["prefix_frames"])
+        suffix_frames = int(codes.shape[-1]) - prefix_frames
+        if not 0 < prefix_frames <= prefix_length or suffix_frames != initial_chunk_frames:
+            return None
+        prefix_pad = prefix_length - prefix_frames
+        prefix_pads.append(prefix_pad)
+        batched_codes[row, :, prefix_pad:prefix_length].copy_(codes[0, :, :prefix_frames])
+        batched_codes[row, :, prefix_length:].copy_(codes[0, :, prefix_frames:])
+        hidden_mask[row, :, :prefix_pad] = 0
+        prefix_mask[row, :prefix_pad] = 0
+        suffix_mask[row, :prefix_pad] = 0
+    return _PreparedIclPrefixBatch(batched_codes, hidden_mask, prefix_mask, suffix_mask, prefix_pads)
+
+
+def _resolve_suffix_batch(
+    decoder: Any,
+    mode: str,
+    target_frames: int,
+    codes_list: list[torch.Tensor],
+    request_caches: list[dict[str, Any]],
+    new_frames_list: list[int],
+    *,
+    transitions_by_mode: dict[str, dict[int, int]],
+) -> _SuffixBatchMetadata | None:
+    previous_frames = transitions_by_mode[mode].get(target_frames)
+    if previous_frames is None:
+        return None
+    expected_new_frames = target_frames - previous_frames
+    if any(not 0 < frames <= expected_new_frames for frames in new_frames_list):
+        return None
+    if not decoder._cache_tensors_are_batchable(
+        request_caches,
+        ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"),
+    ):
+        return None
+    return _SuffixBatchMetadata(previous_frames, expected_new_frames)
+
+
+def _materialize_suffix_batch(
+    decoder: Any,
+    mode: str,
+    codes_list: list[torch.Tensor],
+    request_caches: list[dict[str, Any]],
+    new_frames_list: list[int],
+    metadata: _SuffixBatchMetadata,
+) -> _MaterializedSuffixBatch | None:
+    expected_new_frames = metadata.expected_new_frames
+    batched_codes = codes_list[0].new_zeros((len(codes_list), codes_list[0].shape[1], expected_new_frames))
+    for row, (codes, new_frames) in enumerate(zip(codes_list, new_frames_list, strict=True)):
+        batched_codes[row, :, :new_frames].copy_(codes[0, :, -new_frames:])
+    cache = {
+        key: torch.cat([request_cache[key] for request_cache in request_caches], dim=0)
+        for key in ("ref_hidden", "ref_conv", "prefix_hidden")
+    }
+    try:
+        cache["past_key_values"] = decoder._batch_dynamic_caches(
+            [request_cache["past_key_values"] for request_cache in request_caches]
+        )
+    except ValueError:
+        return None
+    old_quantized = torch.cat([request_cache["suffix_quantized"] for request_cache in request_caches], dim=0)
+    old_conv = torch.cat([request_cache["suffix_conv"] for request_cache in request_caches], dim=0)
+    prefix_frames = int(getattr(decoder.config, "sliding_window", 0) or 0) if mode == "icl" else 0
+    attention_mask = torch.ones(
+        len(codes_list),
+        prefix_frames + metadata.previous_frames + expected_new_frames,
+        dtype=torch.bool,
+        device=batched_codes.device,
+    )
+    if mode == "icl":
+        for row, request_cache in enumerate(request_caches):
+            attention_mask[row, : int(request_cache.get("prefix_pad_frames", 0))] = 0
+    return _MaterializedSuffixBatch(
+        batched_codes,
+        old_quantized,
+        old_conv,
+        cache,
+        attention_mask,
+        metadata.previous_frames,
+        expected_new_frames,
+    )
+
+
 class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
     def __init__(self, config: Qwen3TTSTokenizerV2DecoderConfig):
         super().__init__(config)
@@ -1089,8 +1214,8 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         outputs: list[torch.Tensor] = []
         for row, cache in enumerate(request_caches):
             for key in ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"):
-                cache[key] = state[key][row : row + 1].clone()
-            cache["past_key_values"] = self._slice_dynamic_cache(state["past_key_values"], row)
+                cache[key] = state[key][row : row + 1]
+            cache["past_key_values"] = state["past_key_values"][row]
             cache["decoder_prefix_frames"] = int(state["decoder_prefix_frames"])
             if prefix_pads is not None:
                 cache["prefix_pad_frames"] = prefix_pads[row]
@@ -1098,7 +1223,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             wav_slice = wav[row : row + 1]
             if prefix_pads is not None:
                 wav_slice = wav_slice[..., -initial_chunk_frames * self.total_upsample :]
-            outputs.append(wav_slice.clone())
+            outputs.append(wav_slice)
         return outputs
 
     def _finalize_suffix_result(
@@ -1112,7 +1237,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         wav, next_quantized, next_conv = result
         outputs: list[torch.Tensor] = []
         for row, (cache, new_frames) in enumerate(zip(request_caches, new_frames_list, strict=True)):
-            outputs.append(wav[row : row + 1, :, : new_frames * self.total_upsample].clone())
+            outputs.append(wav[row : row + 1, :, : new_frames * self.total_upsample])
             if new_frames == expected_new_frames:
                 self._commit_suffix_state(
                     cache,
@@ -1342,6 +1467,21 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
                 layer.values = layer.values[row : row + 1].clone()
         return request_cache
 
+    def _split_eager_prefix_cache(self, cache: DynamicCache, batch_size: int) -> list[DynamicCache]:
+        return [self._slice_dynamic_cache(cache, row) for row in range(batch_size)]
+
+    @staticmethod
+    def _slice_dynamic_cache_view(cache: DynamicCache, row: int) -> DynamicCache:
+        """Make a request-local cache view after graph-boundary detachment."""
+        request_cache = copy.copy(cache)
+        request_cache.layers = [copy.copy(layer) for layer in cache.layers]
+        for layer in request_cache.layers:
+            if layer.keys is not None:
+                layer.keys = layer.keys[row : row + 1]
+            if layer.values is not None:
+                layer.values = layer.values[row : row + 1]
+        return request_cache
+
     @staticmethod
     def _cache_tensors_are_batchable(request_caches: list[dict[str, Any]], keys: tuple[str, ...]) -> bool:
         return all(
@@ -1361,41 +1501,34 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         prefix_length: int,
         initial_chunk_frames: int,
     ) -> list[torch.Tensor] | None:
-        batch_size = len(codes_list)
-        total_frames = prefix_length + initial_chunk_frames
-        batched_codes = codes_list[0].new_zeros((batch_size, codes_list[0].shape[1], total_frames))
-        hidden_mask = torch.ones((batch_size, 1, total_frames), dtype=self.dtype, device=batched_codes.device)
-        prefix_mask = torch.ones((batch_size, prefix_length), dtype=torch.bool, device=batched_codes.device)
-        suffix_mask = torch.ones((batch_size, total_frames), dtype=torch.bool, device=batched_codes.device)
-        prefix_pads: list[int] = []
-        for row, (codes, cache) in enumerate(zip(codes_list, request_caches, strict=True)):
-            prefix_frames = int(cache["prefix_frames"])
-            suffix_frames = int(codes.shape[-1]) - prefix_frames
-            if not 0 < prefix_frames <= prefix_length or suffix_frames != initial_chunk_frames:
-                return None
-            prefix_pad = prefix_length - prefix_frames
-            prefix_pads.append(prefix_pad)
-            batched_codes[row, :, prefix_pad:prefix_length].copy_(codes[0, :, :prefix_frames])
-            batched_codes[row, :, prefix_length:].copy_(codes[0, :, prefix_frames:])
-            hidden_mask[row, :, :prefix_pad] = 0
-            prefix_mask[row, :prefix_pad] = 0
-            suffix_mask[row, :prefix_pad] = 0
+        prepared = _prepare_icl_prefix_batch(
+            codes_list,
+            request_caches,
+            prefix_length=prefix_length,
+            initial_chunk_frames=initial_chunk_frames,
+            dtype=self.dtype,
+        )
+        if prepared is None:
+            return None
 
         batched_cache: dict[str, Any] = {}
         output = self._decode_icl_first_chunk(
-            batched_codes,
+            prepared.codes,
             batched_cache,
             prefix_length,
-            prefix_hidden_mask=hidden_mask,
-            prefix_attention_mask=prefix_mask,
-            suffix_attention_mask=suffix_mask,
+            prefix_hidden_mask=prepared.hidden_mask,
+            prefix_attention_mask=prepared.prefix_mask,
+            suffix_attention_mask=prepared.suffix_mask,
+        )
+        batched_cache["past_key_values"] = self._split_eager_prefix_cache(
+            batched_cache["past_key_values"], len(request_caches)
         )
         return self._finalize_prefix_result(
             output,
             batched_cache,
             request_caches,
             initial_chunk_frames=initial_chunk_frames,
-            prefix_pads=prefix_pads,
+            prefix_pads=prepared.prefix_pads,
         )
 
     def _decode_xvec_prefix_eager_batch(
@@ -1410,6 +1543,9 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         batched_codes = torch.cat(codes_list, dim=0)
         batched_cache: dict[str, Any] = {}
         output = self._decode_xvec_first_chunk(batched_codes, batched_cache)
+        batched_cache["past_key_values"] = self._split_eager_prefix_cache(
+            batched_cache["past_key_values"], len(request_caches)
+        )
         return self._finalize_prefix_result(
             output,
             batched_cache,
@@ -1428,58 +1564,43 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         *,
         transitions_by_mode: dict[str, dict[int, int]],
     ) -> list[torch.Tensor] | None:
-        tensor_keys = ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv")
-        if not self._cache_tensors_are_batchable(request_caches, tensor_keys):
-            return None
-        previous_frames = transitions_by_mode[mode].get(target_frames)
-        if previous_frames is None:
-            return None
-        expected_new_frames = target_frames - previous_frames
-        if any(not 0 < new_frames <= expected_new_frames for new_frames in new_frames_list):
-            return None
-
-        batched_codes = codes_list[0].new_zeros((len(codes_list), codes_list[0].shape[1], expected_new_frames))
-        for row, (codes, new_frames) in enumerate(zip(codes_list, new_frames_list, strict=True)):
-            batched_codes[row, :, :new_frames].copy_(codes[0, :, -new_frames:])
-        eager_cache = {
-            key: torch.cat([request_cache[key] for request_cache in request_caches], dim=0)
-            for key in ("ref_hidden", "ref_conv", "prefix_hidden")
-        }
-        try:
-            eager_cache["past_key_values"] = self._batch_dynamic_caches(
-                [request_cache["past_key_values"] for request_cache in request_caches]
-            )
-        except ValueError:
-            return None
-        old_quantized = torch.cat([request_cache["suffix_quantized"] for request_cache in request_caches], dim=0)
-        old_conv = torch.cat([request_cache["suffix_conv"] for request_cache in request_caches], dim=0)
-        attention_mask = torch.ones(
-            len(codes_list),
-            (int(getattr(self.config, "sliding_window", 0) or 0) if mode == "icl" else 0)
-            + previous_frames
-            + expected_new_frames,
-            dtype=torch.bool,
-            device=batched_codes.device,
+        metadata = _resolve_suffix_batch(
+            self,
+            mode,
+            target_frames,
+            codes_list,
+            request_caches,
+            new_frames_list,
+            transitions_by_mode=transitions_by_mode,
         )
-        if mode == "icl":
-            for row, request_cache in enumerate(request_caches):
-                attention_mask[row, : int(request_cache.get("prefix_pad_frames", 0))] = 0
+        if metadata is None:
+            return None
+        prepared = _materialize_suffix_batch(
+            self,
+            mode,
+            codes_list,
+            request_caches,
+            new_frames_list,
+            metadata,
+        )
+        if prepared is None:
+            return None
         result = self._decode_suffix(
-            batched_codes,
-            old_quantized,
-            old_conv,
-            eager_cache,
+            prepared.codes,
+            prepared.old_quantized,
+            prepared.old_conv,
+            prepared.cache,
             int(getattr(self.config, "sliding_window", 0) or 0) if mode == "icl" else 0,
-            expected_new_frames,
-            self._is_suffix_cache_rolling(previous_frames, int(old_quantized.shape[-1])),
-            attention_mask=attention_mask,
+            prepared.expected_new_frames,
+            self._is_suffix_cache_rolling(prepared.previous_frames, int(prepared.old_quantized.shape[-1])),
+            attention_mask=prepared.attention_mask,
         )
         return self._finalize_suffix_result(
             result,
             request_caches,
             new_frames_list,
             target_frames,
-            expected_new_frames,
+            prepared.expected_new_frames,
         )
 
     def batched_chunked_decode(

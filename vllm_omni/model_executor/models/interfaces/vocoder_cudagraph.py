@@ -69,9 +69,6 @@ class VocoderCUDAGraphRoutine(Protocol):
     replay-input preparation, and logical output materialization.
     """
 
-    @property
-    def runnable(self) -> Callable[..., Any]: ...
-
     def eager_call(self, *args: Any, **kwargs: Any) -> Any: ...
 
     def validate_runtime_inputs(

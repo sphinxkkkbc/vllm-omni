@@ -88,7 +88,7 @@ stages:
     max_model_len: 65536
     devices: "1"
     vocoder_cudagraph:
-      decode_cudagraph_batch_sizes: [1]
+      capture_batch_sizes: [1]
       decode_batch_max_size: 1
       decode_enable_tf32: false
     input_connectors:

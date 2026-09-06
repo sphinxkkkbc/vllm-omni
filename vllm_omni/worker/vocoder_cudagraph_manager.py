@@ -68,7 +68,7 @@ def clone_tensor_tree(value: object) -> object:
         cloned = [clone_tensor_tree(item) for item in value]
         if hasattr(value, "_fields"):
             constructor = type(value)
-            return constructor(*cloned)
+            return constructor(*cast(tuple[Any, ...], tuple(cloned)))
         return tuple(cloned)
     if isinstance(value, list):
         return [clone_tensor_tree(item) for item in value]
@@ -517,26 +517,18 @@ class VocoderCUDAGraphManager:
                 continue
             prepared[target.target_id] = managed
 
-        # Phase 2: assembly/binding failure is isolated to one Target.
+        # Phase 2: runtime assembly/binding failures are programming or
+        # lifecycle errors and must propagate after capture has completed.
         active: dict[str, ManagedTarget] = {}
         for target_id, managed in prepared.items():
             target = managed.target
-            try:
-                runtime_callable = self._build_runtime_callable(
-                    managed,
-                    self.stats_sink.recorder_for(target_id),
-                )
-                # Bind one opaque runtime endpoint to the stable model-owned
-                # Target; GraphEntry/Descriptor internals stay manager-owned.
-                target._bind_handle(VocoderGraphHandle(runtime_callable))
-            except Exception:
-                target._restore_eager()
-                managed.entries.clear()
-                logger.exception(
-                    "Failed to assemble/bind vocoder CUDA Graph Target %s; leaving it eager",
-                    target_id,
-                )
-                continue
+            runtime_callable = self._build_runtime_callable(
+                managed,
+                self.stats_sink.recorder_for(target_id),
+            )
+            # Bind one opaque runtime endpoint to the stable model-owned
+            # Target; GraphEntry/Descriptor internals stay manager-owned.
+            target._bind_handle(VocoderGraphHandle(runtime_callable))
             active[target_id] = managed
 
         self.managed_targets = active

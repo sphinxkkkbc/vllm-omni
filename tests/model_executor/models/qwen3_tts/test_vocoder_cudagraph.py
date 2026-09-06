@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -21,8 +22,13 @@ from vllm_omni.model_executor.models.qwen3_tts.vocoder_cudagraph import (
     Qwen3TTSSuffixVariant,
     Qwen3TTSXvecPrefixRoutine,
     Qwen3TTSXvecPrefixVariant,
-    build_stateful_targets,
-    build_stateless_target,
+    resolve_qwen3_tts_execution_settings,
+)
+from vllm_omni.model_executor.models.qwen3_tts.vocoder_cudagraph import (
+    build_stateful_targets as _build_stateful_targets,
+)
+from vllm_omni.model_executor.models.qwen3_tts.vocoder_cudagraph import (
+    build_stateless_target as _build_stateless_target,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -99,6 +105,32 @@ def _config(*, async_chunk: bool, graph_config=None):
             vocoder_cudagraph_config=graph_config,
         )
     )
+
+
+def build_stateless_target(**kwargs):
+    config = kwargs.pop("vllm_config")
+    settings = resolve_qwen3_tts_execution_settings(config)
+    capture_batch_sizes = kwargs.pop("capture_batch_sizes", None)
+    if settings.capture_batch_sizes is None and capture_batch_sizes is not None:
+        settings = replace(settings, capture_batch_sizes=tuple(capture_batch_sizes))
+    kwargs.pop("decode_chunk_size", None)
+    kwargs.pop("decode_left_context", None)
+    return _build_stateless_target(settings=settings, **kwargs)
+
+
+def build_stateful_targets(**kwargs):
+    config = kwargs.pop("vllm_config")
+    settings = resolve_qwen3_tts_execution_settings(config)
+    capture_batch_sizes = kwargs.pop("capture_batch_sizes", None)
+    if settings.capture_batch_sizes is None and capture_batch_sizes is not None:
+        settings = replace(settings, capture_batch_sizes=tuple(capture_batch_sizes))
+    settings = replace(
+        settings,
+        initial_codec_chunk_frames=kwargs.pop("initial_frames"),
+        codec_chunk_frames=kwargs.pop("chunk_frames"),
+        codec_chunk_ramp=tuple(kwargs.pop("chunk_ramp") or ()),
+    )
+    return _build_stateful_targets(settings=settings, **kwargs)
 
 
 def test_stateless_capture_sizes_extend_defaults_with_configured_sizes() -> None:
@@ -251,7 +283,8 @@ def test_icl_prefix_graph_cache_keeps_physical_prefix_length() -> None:
     torch.testing.assert_close(buffers.codes[0, :, 7:], torch.zeros(2, 5, dtype=torch.long))
     assert runtime_cache == {}
     assert state["decoder_prefix_frames"] == 10
-    assert state["past_key_values"].get_seq_length() == 0
+    assert len(state["past_key_values"]) == 1
+    assert state["past_key_values"][0].get_seq_length() == 0
     assert output.shape == (1, 2, 12)
 
 
@@ -286,7 +319,8 @@ def test_xvec_first_chunk_replays_prefix_graph() -> None:
 
     assert runtime_cache == {}
     assert state["decoder_prefix_frames"] == 0
-    assert state["past_key_values"].get_seq_length() == 0
+    assert len(state["past_key_values"]) == 1
+    assert state["past_key_values"][0].get_seq_length() == 0
     assert output.shape == (1, 2, 2)
 
 

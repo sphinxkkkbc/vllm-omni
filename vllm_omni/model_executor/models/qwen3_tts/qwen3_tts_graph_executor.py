@@ -14,12 +14,17 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+from transformers.cache_utils import DynamicCache
 
 from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
     VocoderCUDAGraphTarget,
 )
 from vllm_omni.model_executor.models.qwen3_tts.stateful_chunking import (
     resolve_stateful_chunk_contract,
+)
+from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+    _prepare_icl_prefix_batch,
+    _resolve_suffix_batch,
 )
 
 
@@ -61,9 +66,8 @@ class Qwen3TTSGraphExecutor:
                 {
                     int(descriptor.variant.batch_size)
                     for descriptor in target.descriptors
-                    if hasattr(descriptor.variant, "batch_size")
-                    and (mode is None or getattr(descriptor.variant, "mode", None) == mode)
-                    and (target_frames is None or getattr(descriptor.variant, "target_frames", None) == target_frames)
+                    if (mode is None or descriptor.variant.mode == mode)
+                    and (target_frames is None or descriptor.variant.target_frames == target_frames)
                 }
             )
             batch_limit = max(batches, default=0)
@@ -108,42 +112,34 @@ class Qwen3TTSGraphExecutor:
     ) -> list[torch.Tensor] | None:
         def once(start: int, end: int) -> list[torch.Tensor] | None:
             group_codes, group_caches = codes_list[start:end], request_caches[start:end]
-            batch_size = len(group_codes)
-            total_frames = prefix_length + initial_chunk_frames
-            batched_codes = group_codes[0].new_zeros((batch_size, group_codes[0].shape[1], total_frames))
-            hidden_mask = torch.ones(
-                (batch_size, 1, total_frames), dtype=self.decoder.dtype, device=batched_codes.device
+            prepared = _prepare_icl_prefix_batch(
+                group_codes,
+                group_caches,
+                prefix_length=prefix_length,
+                initial_chunk_frames=initial_chunk_frames,
+                dtype=self.decoder.dtype,
             )
-            prefix_mask = torch.ones((batch_size, prefix_length), dtype=torch.bool, device=batched_codes.device)
-            suffix_mask = torch.ones((batch_size, total_frames), dtype=torch.bool, device=batched_codes.device)
-            prefix_pads: list[int] = []
-            for row, (codes, cache) in enumerate(zip(group_codes, group_caches, strict=True)):
-                prefix_frames = int(cache["prefix_frames"])
-                suffix_frames = int(codes.shape[-1]) - prefix_frames
-                if not 0 < prefix_frames <= prefix_length or suffix_frames != initial_chunk_frames:
-                    return None
-                prefix_pad = prefix_length - prefix_frames
-                prefix_pads.append(prefix_pad)
-                batched_codes[row, :, prefix_pad:prefix_length].copy_(codes[0, :, :prefix_frames])
-                batched_codes[row, :, prefix_length:].copy_(codes[0, :, prefix_frames:])
-                hidden_mask[row, :, :prefix_pad] = 0
-                prefix_mask[row, :prefix_pad] = 0
-                suffix_mask[row, :prefix_pad] = 0
+            if prepared is None:
+                return None
             eager_state: dict[str, Any] = {}
             output = self.icl_prefix_target(
-                batched_codes,
+                prepared.codes,
                 eager_state,
                 prefix_length,
-                prefix_hidden_mask=hidden_mask,
-                prefix_attention_mask=prefix_mask,
-                suffix_attention_mask=suffix_mask,
+                prefix_hidden_mask=prepared.hidden_mask,
+                prefix_attention_mask=prepared.prefix_mask,
+                suffix_attention_mask=prepared.suffix_mask,
             )
+            if isinstance(eager_state.get("past_key_values"), DynamicCache):
+                eager_state["past_key_values"] = self.decoder._split_eager_prefix_cache(
+                    eager_state["past_key_values"], len(group_caches)
+                )
             return self.decoder._finalize_prefix_result(
                 output,
                 eager_state,
                 group_caches,
                 initial_chunk_frames=initial_chunk_frames,
-                prefix_pads=prefix_pads,
+                prefix_pads=prepared.prefix_pads,
             )
 
         return self._run_target_batches(
@@ -167,6 +163,10 @@ class Qwen3TTSGraphExecutor:
                 return None
             eager_state: dict[str, Any] = {}
             output = self.xvec_prefix_target(torch.cat(group_codes, dim=0), eager_state)
+            if isinstance(eager_state.get("past_key_values"), DynamicCache):
+                eager_state["past_key_values"] = self.decoder._split_eager_prefix_cache(
+                    eager_state["past_key_values"], len(group_caches)
+                )
             return self.decoder._finalize_prefix_result(
                 output,
                 eager_state,
@@ -196,16 +196,21 @@ class Qwen3TTSGraphExecutor:
         previous_frames = transitions_by_mode[mode].get(target_frames)
         if previous_frames is None:
             return None
-        expected_new_frames = target_frames - previous_frames
 
         def once(start: int, end: int) -> list[torch.Tensor] | None:
             group_codes = codes_list[start:end]
             group_caches = request_caches[start:end]
             group_frames = new_frames_list[start:end]
-            if not self.decoder._cache_tensors_are_batchable(
+            metadata = _resolve_suffix_batch(
+                self.decoder,
+                mode,
+                target_frames,
+                group_codes,
                 group_caches,
-                ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv"),
-            ) or any(not 0 < frames <= expected_new_frames for frames in group_frames):
+                group_frames,
+                transitions_by_mode=transitions_by_mode,
+            )
+            if metadata is None:
                 return None
             result = self.suffix_target(mode, target_frames, group_codes, group_caches, group_frames)
             if result is None:
@@ -215,7 +220,7 @@ class Qwen3TTSGraphExecutor:
                 group_caches,
                 group_frames,
                 target_frames,
-                expected_new_frames,
+                metadata.expected_new_frames,
             )
 
         return self._run_target_batches(
@@ -298,7 +303,7 @@ class Qwen3TTSGraphExecutor:
         candidates = [
             int(descriptor.variant.frames)
             for descriptor in self.stateless_target.descriptors
-            if hasattr(descriptor.variant, "frames") and int(descriptor.variant.frames) >= frames
+            if int(descriptor.variant.frames) >= frames
         ]
         return min(candidates, default=frames)
 
@@ -333,7 +338,7 @@ class Qwen3TTSGraphExecutor:
                         {
                             int(descriptor.variant.batch_size)
                             for descriptor in self.stateless_target.descriptors
-                            if hasattr(descriptor.variant, "frames") and int(descriptor.variant.frames) == bucket
+                            if int(descriptor.variant.frames) == bucket
                         }
                     )
                 )
