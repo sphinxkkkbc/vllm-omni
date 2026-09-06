@@ -1092,6 +1092,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
         return None
 
+
     @staticmethod
     def _local_ref_audio_stat_path(ref_audio_str: str) -> str | None:
         """Filesystem path to stat for a local locator, else ``None``.
