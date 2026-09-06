@@ -1375,22 +1375,28 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         *,
         prefix_length: int,
         initial_chunk_frames: int,
+        eager_max_batch_size: int = 0,
     ) -> list[torch.Tensor] | None:
-        buckets = self._target_batch_buckets("icl_prefix")
-        if buckets and len(codes_list) > max(buckets):
-            outputs: list[torch.Tensor] = []
-            for start, end in self._split_for_graph_buckets(len(codes_list), buckets):
-                split_outputs = self._decode_icl_prefix_batch(
-                    codes_list[start:end],
-                    request_caches[start:end],
-                    prefix_length=prefix_length,
-                    initial_chunk_frames=initial_chunk_frames,
-                )
-                if split_outputs is None:
-                    return None
-                outputs.extend(split_outputs)
-            return outputs
+        return self._run_stateful_phase_batches(
+            "icl_prefix",
+            len(codes_list),
+            lambda start, end: self._decode_icl_prefix_batch_once(
+                codes_list[start:end],
+                request_caches[start:end],
+                prefix_length=prefix_length,
+                initial_chunk_frames=initial_chunk_frames,
+            ),
+            eager_max_batch_size=eager_max_batch_size,
+        )
 
+    def _decode_icl_prefix_batch_once(
+        self,
+        codes_list: list[torch.Tensor],
+        request_caches: list[dict[str, Any]],
+        *,
+        prefix_length: int,
+        initial_chunk_frames: int,
+    ) -> list[torch.Tensor] | None:
         batch_size = len(codes_list)
         total_frames = prefix_length + initial_chunk_frames
         batched_codes = codes_list[0].new_zeros((batch_size, codes_list[0].shape[1], total_frames))
@@ -1434,21 +1440,26 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         request_caches: list[dict[str, Any]],
         *,
         initial_chunk_frames: int,
+        eager_max_batch_size: int = 0,
     ) -> list[torch.Tensor] | None:
-        buckets = self._target_batch_buckets("xvec_prefix")
-        if buckets and len(codes_list) > max(buckets):
-            outputs: list[torch.Tensor] = []
-            for start, end in self._split_for_graph_buckets(len(codes_list), buckets):
-                split_outputs = self._decode_xvec_prefix_batch(
-                    codes_list[start:end],
-                    request_caches[start:end],
-                    initial_chunk_frames=initial_chunk_frames,
-                )
-                if split_outputs is None:
-                    return None
-                outputs.extend(split_outputs)
-            return outputs
+        return self._run_stateful_phase_batches(
+            "xvec_prefix",
+            len(codes_list),
+            lambda start, end: self._decode_xvec_prefix_batch_once(
+                codes_list[start:end],
+                request_caches[start:end],
+                initial_chunk_frames=initial_chunk_frames,
+            ),
+            eager_max_batch_size=eager_max_batch_size,
+        )
 
+    def _decode_xvec_prefix_batch_once(
+        self,
+        codes_list: list[torch.Tensor],
+        request_caches: list[dict[str, Any]],
+        *,
+        initial_chunk_frames: int,
+    ) -> list[torch.Tensor] | None:
         if any(int(codes.shape[-1]) != initial_chunk_frames for codes in codes_list):
             return None
         batched_codes = torch.cat(codes_list, dim=0)
@@ -1473,26 +1484,38 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         prefix_length: int,
         codec_chunk_frames: int,
         transitions_by_mode: dict[str, dict[int, int]],
+        eager_max_batch_size: int = 0,
     ) -> list[torch.Tensor] | None:
-        buckets = self._target_batch_buckets("suffix", mode=mode, target_frames=target_frames)
-        if buckets and len(codes_list) > max(buckets):
-            outputs: list[torch.Tensor] = []
-            for start, end in self._split_for_graph_buckets(len(codes_list), buckets):
-                split_outputs = self._decode_suffix_batch(
-                    mode,
-                    target_frames,
-                    codes_list[start:end],
-                    request_caches[start:end],
-                    new_frames_list[start:end],
-                    prefix_length=prefix_length,
-                    codec_chunk_frames=codec_chunk_frames,
-                    transitions_by_mode=transitions_by_mode,
-                )
-                if split_outputs is None:
-                    return None
-                outputs.extend(split_outputs)
-            return outputs
+        return self._run_stateful_phase_batches(
+            "suffix",
+            len(codes_list),
+            lambda start, end: self._decode_suffix_batch_once(
+                mode,
+                target_frames,
+                codes_list[start:end],
+                request_caches[start:end],
+                new_frames_list[start:end],
+                prefix_length=prefix_length,
+                codec_chunk_frames=codec_chunk_frames,
+                transitions_by_mode=transitions_by_mode,
+            ),
+            mode=mode,
+            target_frames=target_frames,
+            eager_max_batch_size=eager_max_batch_size,
+        )
 
+    def _decode_suffix_batch_once(
+        self,
+        mode: str,
+        target_frames: int,
+        codes_list: list[torch.Tensor],
+        request_caches: list[dict[str, Any]],
+        new_frames_list: list[int],
+        *,
+        prefix_length: int,
+        codec_chunk_frames: int,
+        transitions_by_mode: dict[str, dict[int, int]],
+    ) -> list[torch.Tensor] | None:
         tensor_keys = ("ref_hidden", "ref_conv", "prefix_hidden", "suffix_quantized", "suffix_conv")
         if not self._cache_tensors_are_batchable(request_caches, tensor_keys):
             return None
@@ -1520,40 +1543,58 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             expected_new_frames,
         )
 
-    def _target_batch_buckets(
+    def _stateful_phase_batch_ranges(
         self,
         name: str,
+        request_count: int,
         *,
         mode: str | None = None,
         target_frames: int | None = None,
-    ) -> tuple[int, ...]:
-        """Return the declared graph batch buckets for one Qwen Target shape."""
+        eager_max_batch_size: int,
+    ) -> list[tuple[int, int]]:
+        """Partition one phase by declared graph buckets or the eager batch cap."""
 
         target = self._get_vocoder_graph_target(name)
-        buckets: set[int] = set()
-        for descriptor in target.descriptors:
-            variant = descriptor.variant
-            if not hasattr(variant, "batch_size"):
-                continue
-            if mode is not None and getattr(variant, "mode", None) != mode:
-                continue
-            if target_frames is not None and getattr(variant, "target_frames", None) != target_frames:
-                continue
-            buckets.add(int(variant.batch_size))
-        return tuple(sorted(buckets))
+        if target.is_graph_bound:
+            buckets = sorted(
+                {
+                    int(descriptor.variant.batch_size)
+                    for descriptor in target.descriptors
+                    if hasattr(descriptor.variant, "batch_size")
+                    and (mode is None or getattr(descriptor.variant, "mode", None) == mode)
+                    and (target_frames is None or getattr(descriptor.variant, "target_frames", None) == target_frames)
+                }
+            )
+            batch_limit = max(buckets, default=0)
+        else:
+            batch_limit = eager_max_batch_size
+        if request_count <= 0 or batch_limit <= 0 or request_count <= batch_limit:
+            return [(0, request_count)]
+        return [(start, min(start + batch_limit, request_count)) for start in range(0, request_count, batch_limit)]
 
-    @staticmethod
-    def _split_for_graph_buckets(request_count: int, buckets: tuple[int, ...]) -> list[tuple[int, int]]:
-        if request_count <= 0 or not buckets:
-            return []
-        largest = max(buckets)
-        ranges: list[tuple[int, int]] = []
-        start = 0
-        while request_count - start > largest:
-            ranges.append((start, start + largest))
-            start += largest
-        ranges.append((start, request_count))
-        return ranges
+    def _run_stateful_phase_batches(
+        self,
+        name: str,
+        request_count: int,
+        execute: Callable[[int, int], list[torch.Tensor] | None],
+        *,
+        mode: str | None = None,
+        target_frames: int | None = None,
+        eager_max_batch_size: int,
+    ) -> list[torch.Tensor] | None:
+        outputs: list[torch.Tensor] = []
+        for start, end in self._stateful_phase_batch_ranges(
+            name,
+            request_count,
+            mode=mode,
+            target_frames=target_frames,
+            eager_max_batch_size=eager_max_batch_size,
+        ):
+            batch_outputs = execute(start, end)
+            if batch_outputs is None:
+                return None
+            outputs.extend(batch_outputs)
+        return outputs
 
     def _stateless_frame_bucket(self, frames: int) -> int:
         target = self._get_vocoder_graph_target("stateless")
@@ -1596,7 +1637,9 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
 
         target = self._get_vocoder_graph_target("stateless")
         total_upsample = self.total_upsample
-        outputs: list[torch.Tensor | None] = [None] * batch_size
+        outputs: list[torch.Tensor | None] = [
+            codes.new_empty((1, 0), dtype=torch.float32) if length == 0 else None for length in lengths
+        ]
         for start in range(0, max(lengths), chunk_size):
             groups: dict[int, list[tuple[int, int, int, int, int]]] = {}
             for request_index, request_length in enumerate(lengths):
@@ -1614,8 +1657,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
                         {
                             int(descriptor.variant.batch_size)
                             for descriptor in target.descriptors
-                            if hasattr(descriptor.variant, "frames")
-                            and int(descriptor.variant.frames) == bucket
+                            if hasattr(descriptor.variant, "frames") and int(descriptor.variant.frames) == bucket
                         }
                     )
                 )
@@ -1689,11 +1731,13 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
                     group_caches,
                     prefix_length=prefix_length,
                     initial_chunk_frames=initial_chunk_frames,
+                    eager_max_batch_size=max_batch_size,
                 ),
                 decode_xvec_prefix_batch=lambda group_codes, group_caches: self._decode_xvec_prefix_batch(
                     group_codes,
                     group_caches,
                     initial_chunk_frames=initial_chunk_frames,
+                    eager_max_batch_size=max_batch_size,
                 ),
                 decode_suffix_batch=lambda mode, target, group_codes, group_caches, new_frames: (
                     self._decode_suffix_batch(
@@ -1705,6 +1749,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
                         prefix_length=prefix_length,
                         codec_chunk_frames=codec_chunk_frames,
                         transitions_by_mode={"icl": transitions, "xvec": transitions},
+                        eager_max_batch_size=max_batch_size,
                     )
                 ),
                 decode_fallback=lambda request_codes, cache: self.chunked_decode(
@@ -1713,7 +1758,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
                     chunk_size=chunk_size,
                     left_context_size=left_context_size,
                 ),
-                # Stateful graph splitting follows captured Target buckets;
+                # Stateful graph splitting follows declared Target buckets;
                 # decode_batch_max_size is not a graph-bucket policy.
                 backend_max_batch_size=0,
             )

@@ -9,9 +9,8 @@ packages depend on these declarations; the worker-side manager consumes them.
 
 from __future__ import annotations
 
-import threading
 from collections.abc import Callable, Hashable, Sequence, Set
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, ClassVar, Generic, Literal, Protocol, TypeVar, runtime_checkable
 
 import torch
@@ -39,20 +38,6 @@ class VocoderRuntimeResolution:
 
     runtime_key: VocoderRuntimeKey
     descriptor: VocoderCUDAGraphDescriptor | None
-
-
-@dataclass
-class VocoderCUDAGraphEntry:
-    """Manager-owned graph resources for one Target-local Descriptor."""
-
-    descriptor: VocoderCUDAGraphDescriptor
-    graph: torch.cuda.CUDAGraph
-    buffers: object
-    captured_output: object
-    # Manager-internal guard for this entry's mutable static replay buffers.
-    # It is deliberately not part of equality/identity and is not exposed to
-    # model code through VocoderGraphHandle.
-    replay_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
 
 class VocoderGraphHandle:
@@ -83,8 +68,6 @@ class VocoderCUDAGraphRoutine(Protocol):
     Runtime ``args`` and ``kwargs`` provide context for descriptor selection,
     replay-input preparation, and logical output materialization.
     """
-
-    target_id: str
 
     @property
     def runnable(self) -> Callable[..., Any]: ...
@@ -209,8 +192,6 @@ class VocoderCUDAGraphTarget:
         *,
         supported_config_keys: Set[str] = frozenset(),
     ) -> None:
-        if routine.target_id != target_id:
-            raise ValueError("Target and Routine target_id must match")
         self.target_id = target_id
         self.routine = routine
         self.descriptors = tuple(descriptors)
@@ -223,6 +204,12 @@ class VocoderCUDAGraphTarget:
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self._delegate(*args, **kwargs)
+
+    @property
+    def is_graph_bound(self) -> bool:
+        """Whether Manager has replaced the eager delegate with a Handle."""
+
+        return self._bound_handle is not None
 
     def _bind_handle(self, handle: VocoderGraphHandle) -> None:
         if not isinstance(handle, VocoderGraphHandle):

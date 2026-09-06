@@ -24,13 +24,24 @@ from vllm.platforms import current_platform
 from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
     SupportsVocoderCUDAGraph,
     VocoderCUDAGraphDescriptor,
-    VocoderCUDAGraphEntry,
     VocoderCUDAGraphTarget,
     VocoderGraphHandle,
     VocoderRuntimeResolution,
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class VocoderCUDAGraphEntry:
+    """Worker-owned resources for one captured Target Descriptor."""
+
+    descriptor: VocoderCUDAGraphDescriptor
+    graph: torch.cuda.CUDAGraph
+    buffers: object
+    captured_output: object
+    replay_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
 
 _FRAMEWORK_CONFIG_KEYS = frozenset(
     {
@@ -204,8 +215,6 @@ class VocoderCUDAGraphManager:
                 raise ValueError("Vocoder CUDA Graph target_id must not be empty")
             if target.target_id in target_by_id:
                 raise ValueError(f"Duplicate vocoder CUDA Graph target_id: {target.target_id}")
-            if target.routine.target_id != target.target_id:
-                raise ValueError(f"Target/Routine target_id mismatch for {target.target_id}")
             try:
                 if len(set(target.descriptors)) != len(target.descriptors):
                     raise ValueError(f"Duplicate Descriptor in Target {target.target_id}")

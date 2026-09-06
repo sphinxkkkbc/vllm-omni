@@ -30,12 +30,10 @@ SHARED_CONFIG_KEYS = frozenset(
     {
         "capture_batch_sizes",
         "decode_batch_max_size",
-        "decode_cudagraph_batch_sizes",
         "decode_enable_tf32",
     }
 )
 TARGET_CONFIG_KEYS = frozenset({"capture_bucket_sizes", "decode_chunk_frames", "decode_left_context_frames"})
-STATEFUL_TARGET_IDS = frozenset({"qwen3_tts.icl_prefix", "qwen3_tts.xvec_prefix", "qwen3_tts.suffix"})
 
 
 @dataclass(frozen=True)
@@ -58,7 +56,6 @@ class Qwen3TTSStatelessRoutine(BaseVocoderCUDAGraphRoutine):
         num_quantizers: int,
         total_upsample: int,
     ) -> None:
-        self.target_id = STATELESS_TARGET_ID
         self.decoder = decoder
         self.num_quantizers = num_quantizers
         self.total_upsample = total_upsample
@@ -303,14 +300,13 @@ def _materialize_cache_bookkeeping(
 
 
 class _Qwen3TTSStatefulRoutineBase(BaseVocoderCUDAGraphRoutine):
-    def __init__(self, *, decoder: torch.nn.Module, target_id: str, num_quantizers: int) -> None:
+    def __init__(self, *, decoder: torch.nn.Module, num_quantizers: int) -> None:
         self.decoder = decoder
-        self.target_id = target_id
         self.num_quantizers = num_quantizers
 
     def validate_runtime_inputs(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
         if not args or not isinstance(args[0], torch.Tensor) or args[0].ndim != 3:
-            raise ValueError(f"{self.target_id} expects batched codes with shape [B,Q,F]")
+            raise ValueError(f"{type(self).__name__} expects batched codes with shape [B,Q,F]")
         if int(args[0].shape[1]) != self.num_quantizers:
             raise ValueError(f"Expected {self.num_quantizers} codebooks, got {args[0].shape[1]}")
 
@@ -328,7 +324,7 @@ class Qwen3TTSIclPrefixRoutine(_Qwen3TTSStatefulRoutineBase):
     def __init__(
         self, *, decoder: torch.nn.Module, num_quantizers: int, prefix_length: int, initial_frames: int
     ) -> None:
-        super().__init__(decoder=decoder, target_id="qwen3_tts.icl_prefix", num_quantizers=num_quantizers)
+        super().__init__(decoder=decoder, num_quantizers=num_quantizers)
         self.prefix_length = prefix_length
         self.initial_frames = initial_frames
         self._runnable = decoder._decode_icl_first_chunk
@@ -475,7 +471,7 @@ class Qwen3TTSIclPrefixRoutine(_Qwen3TTSStatefulRoutineBase):
 
 class Qwen3TTSXvecPrefixRoutine(_Qwen3TTSStatefulRoutineBase):
     def __init__(self, *, decoder: torch.nn.Module, num_quantizers: int, initial_frames: int) -> None:
-        super().__init__(decoder=decoder, target_id="qwen3_tts.xvec_prefix", num_quantizers=num_quantizers)
+        super().__init__(decoder=decoder, num_quantizers=num_quantizers)
         self.initial_frames = initial_frames
         self._runnable = decoder._decode_xvec_first_chunk
 
@@ -575,7 +571,7 @@ class Qwen3TTSSuffixRoutine(_Qwen3TTSStatefulRoutineBase):
         prefix_length: int,
         transitions: dict[str, dict[int, int]],
     ) -> None:
-        super().__init__(decoder=decoder, target_id="qwen3_tts.suffix", num_quantizers=num_quantizers)
+        super().__init__(decoder=decoder, num_quantizers=num_quantizers)
         self.prefix_length = prefix_length
         self.transitions = transitions
 
@@ -885,8 +881,6 @@ def build_qwen3_tts_targets(
     decode_chunk = int(stateless_config.get("decode_chunk_frames", 300) or 300)
     decode_left = int(stateless_config.get("decode_left_context_frames", 25) or 25)
     batch_sizes = _positive_ints_or_none(graph_config.get("capture_batch_sizes"))
-    if batch_sizes is None:
-        batch_sizes = _positive_ints_or_none(graph_config.get("decode_cudagraph_batch_sizes"))
     codec_chunk = int(connector.get("codec_chunk_frames", 0) or 0)
     initial_chunk = int(connector.get("initial_codec_chunk_frames", 1) or 1)
     ramp = (
@@ -897,7 +891,7 @@ def build_qwen3_tts_targets(
 
     stateless = build_stateless_target(
         decoder=decoder,
-        runnable=getattr(decoder, "_forward_exact", decoder.forward),
+        runnable=decoder._forward_exact,
         vllm_config=vllm_config,
         num_quantizers=num_quantizers,
         total_upsample=total_upsample,
@@ -1025,14 +1019,6 @@ def build_stateful_targets(
     transitions = contract.transitions if prefix_length > 2 and resolved_initial_frames > 0 and chunk_frames > 0 else {}
 
     async_chunk = bool(getattr(vllm_config.model_config, "async_chunk", False))
-    if not all(
-        hasattr(decoder, name) for name in ("_decode_icl_first_chunk", "_decode_xvec_first_chunk", "_decode_suffix")
-    ):
-        # Lightweight decoder doubles used by config/unit tests may expose
-        # only stateless decode. A production Qwen3-TTS decoder always has
-        # these stateful runnables; omit unavailable Targets rather than
-        # making target construction itself depend on test-only methods.
-        return ()
     if not async_chunk:
         batch_sizes = ()
         transitions = {}

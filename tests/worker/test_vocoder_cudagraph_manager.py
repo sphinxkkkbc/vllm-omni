@@ -20,7 +20,6 @@ import torch
 from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
     BaseVocoderCUDAGraphRoutine,
     VocoderCUDAGraphDescriptor,
-    VocoderCUDAGraphEntry,
     VocoderCUDAGraphTarget,
     VocoderGraphHandle,
     VocoderRuntimeKey,
@@ -28,6 +27,7 @@ from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
 )
 from vllm_omni.worker.vocoder_cudagraph_manager import (
     ManagedTarget,
+    VocoderCUDAGraphEntry,
     VocoderCUDAGraphManager,
     clone_tensor_tree,
 )
@@ -82,8 +82,7 @@ class _Graph:
 
 
 class _Routine(BaseVocoderCUDAGraphRoutine):
-    def __init__(self, target_id: str) -> None:
-        self.target_id = target_id
+    def __init__(self) -> None:
         self.eager_calls = 0
         self.validate_calls = 0
         self._runnable: Callable[[torch.Tensor], torch.Tensor] = lambda value: value * 2
@@ -205,7 +204,7 @@ class _Model:
 
 
 def _target(target_id: str, *sizes: int) -> tuple[VocoderCUDAGraphTarget, _Routine]:
-    routine = _Routine(target_id)
+    routine = _Routine()
     target = VocoderCUDAGraphTarget(
         target_id,
         routine,
@@ -370,7 +369,7 @@ def test_config_validation_catches_unknown_shared_target_and_extension_keys() ->
 
 
 def test_target_registry_rejects_duplicate_ids_and_descriptors() -> None:
-    first, first_routine = _target("decode", 2)
+    first, _ = _target("decode", 2)
     duplicate_id, _ = _target("decode", 3)
     manager = _TestManager()
     with pytest.raises(ValueError, match="Duplicate vocoder CUDA Graph target_id"):
@@ -378,15 +377,12 @@ def test_target_registry_rejects_duplicate_ids_and_descriptors() -> None:
 
     duplicate_descriptor = VocoderCUDAGraphTarget(
         "duplicate",
-        _Routine("duplicate"),
+        _Routine(),
         [VocoderCUDAGraphDescriptor(2), VocoderCUDAGraphDescriptor(2)],
     )
     manager = _TestManager()
     with pytest.raises(ValueError, match="Duplicate Descriptor"):
         manager.prepare(_Model((duplicate_descriptor,)))  # type: ignore[arg-type]
-
-    with pytest.raises(ValueError, match="Target and Routine target_id must match"):
-        VocoderCUDAGraphTarget("mismatch", first_routine, [])
 
 
 def test_disabled_target_remains_on_original_eager_callable() -> None:
