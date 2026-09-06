@@ -23,6 +23,8 @@ from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
 )
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
 
+from .stateful_chunking import resolve_stateful_chunk_contract
+
 STATELESS_TARGET_ID = "qwen3_tts.stateless"
 SHARED_CONFIG_KEYS = frozenset(
     {
@@ -764,7 +766,7 @@ class Qwen3TTSSuffixRoutine(_Qwen3TTSStatefulRoutineBase):
         codes_list: list[torch.Tensor],
         request_caches: list[dict[str, Any]],
         new_frames_list: list[int],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         previous_frames = self.transitions[mode][target_frames]
         expected_new_frames = target_frames - previous_frames
         if any(not 0 < frames <= expected_new_frames for frames in new_frames_list):
@@ -782,9 +784,15 @@ class Qwen3TTSSuffixRoutine(_Qwen3TTSStatefulRoutineBase):
             key: torch.cat([request_cache[key] for request_cache in request_caches], dim=0)
             for key in ("ref_hidden", "ref_conv", "prefix_hidden")
         }
-        cache["past_key_values"] = self.decoder._batch_dynamic_caches(
-            [request_cache["past_key_values"] for request_cache in request_caches]
-        )
+        try:
+            cache["past_key_values"] = self.decoder._batch_dynamic_caches(
+                [request_cache["past_key_values"] for request_cache in request_caches]
+            )
+        except ValueError:
+            # This is a pre-replay batching limitation, not a graph replay
+            # failure. Returning None lets shared routing use its safe
+            # per-request eager fallback, as the legacy wrapper did.
+            return None
         old_quantized = torch.cat([request_cache["suffix_quantized"] for request_cache in request_caches], dim=0)
         old_conv = torch.cat([request_cache["suffix_conv"] for request_cache in request_caches], dim=0)
         mask = torch.ones(
@@ -1007,22 +1015,14 @@ def build_stateful_targets(
     else:
         batch_sizes = (1,)
 
-    transitions: dict[int, int] = {}
-    previous = int(chunk_ramp[0]) if chunk_ramp else int(initial_frames)
-    if prefix_length <= 2 or previous <= 0 or chunk_frames <= 0:
-        transitions = {}
-    else:
-        for new_frames in list(chunk_ramp or ())[1:]:
-            if previous >= prefix_length:
-                break
-            target = previous + int(new_frames)
-            transitions[target] = previous
-            previous = target
-        while previous < prefix_length:
-            target = previous + chunk_frames
-            transitions[target] = previous
-            previous = target
-        transitions[prefix_length + chunk_frames] = prefix_length
+    contract = resolve_stateful_chunk_contract(
+        prefix_length=prefix_length,
+        initial_codec_chunk_frames=initial_frames,
+        codec_chunk_frames=chunk_frames,
+        codec_chunk_ramp=chunk_ramp,
+    )
+    resolved_initial_frames = contract.resolved_initial_frames
+    transitions = contract.transitions if prefix_length > 2 and resolved_initial_frames > 0 and chunk_frames > 0 else {}
 
     async_chunk = bool(getattr(vllm_config.model_config, "async_chunk", False))
     if not all(
@@ -1041,12 +1041,12 @@ def build_stateful_targets(
         decoder=decoder,
         num_quantizers=num_quantizers,
         prefix_length=prefix_length,
-        initial_frames=initial_frames,
+        initial_frames=resolved_initial_frames,
     )
     xvec_routine = Qwen3TTSXvecPrefixRoutine(
         decoder=decoder,
         num_quantizers=num_quantizers,
-        initial_frames=initial_frames,
+        initial_frames=resolved_initial_frames,
     )
     suffix_routine = Qwen3TTSSuffixRoutine(
         decoder=decoder,
@@ -1055,11 +1055,11 @@ def build_stateful_targets(
         transitions={"icl": transitions, "xvec": transitions},
     )
     icl_descriptors = tuple(
-        VocoderCUDAGraphDescriptor(Qwen3TTSIclPrefixVariant(batch, prefix_length + initial_frames))
+        VocoderCUDAGraphDescriptor(Qwen3TTSIclPrefixVariant(batch, prefix_length + resolved_initial_frames))
         for batch in batch_sizes
     )
     xvec_descriptors = tuple(
-        VocoderCUDAGraphDescriptor(Qwen3TTSXvecPrefixVariant(batch, initial_frames)) for batch in batch_sizes
+        VocoderCUDAGraphDescriptor(Qwen3TTSXvecPrefixVariant(batch, resolved_initial_frames)) for batch in batch_sizes
     )
     suffix_descriptors = tuple(
         VocoderCUDAGraphDescriptor(Qwen3TTSSuffixVariant(mode, batch, target))

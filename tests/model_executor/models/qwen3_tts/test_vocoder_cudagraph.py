@@ -17,6 +17,7 @@ from vllm_omni.model_executor.models.qwen3_tts.vocoder_cudagraph import (
     Qwen3TTSIclPrefixVariant,
     Qwen3TTSStatelessRoutine,
     Qwen3TTSStatelessVariant,
+    Qwen3TTSSuffixRoutine,
     Qwen3TTSSuffixVariant,
     Qwen3TTSXvecPrefixRoutine,
     Qwen3TTSXvecPrefixVariant,
@@ -272,6 +273,10 @@ def test_xvec_first_chunk_replays_prefix_graph() -> None:
     descriptor = target.descriptors[0]
     buffers = routine.allocate_buffers(descriptor, torch.device("cpu"))
     routine.prepare_for_capture(buffers)
+    prefix_cache = buffers.cache["past_key_values"]
+    assert prefix_cache.get_seq_length() == 0
+    assert all(layer.is_initialized for layer in prefix_cache.layers)
+    assert all(layer.keys.device == torch.device("cpu") for layer in prefix_cache.layers)
     captured_output = routine.forward_for_capture(buffers)
 
     runtime_codes = torch.ones(1, 2, 2, dtype=torch.long)
@@ -390,6 +395,39 @@ def test_suffix_output_after_replay_does_not_mutate_request_cache() -> None:
     torch.testing.assert_close(cache["suffix_conv"], conv_before)
 
 
+def test_suffix_eager_batch_declines_unbatchable_dynamic_caches(monkeypatch) -> None:
+    decoder = _StatefulDecoder()
+    targets = build_stateful_targets(
+        decoder=decoder,
+        vllm_config=_config(async_chunk=True),
+        num_quantizers=2,
+        prefix_length=10,
+        capture_batch_sizes=[1],
+        initial_frames=2,
+        chunk_frames=3,
+        chunk_ramp=None,
+    )
+    routine = targets[2].routine
+    assert isinstance(routine, Qwen3TTSSuffixRoutine)
+    dtype = next(decoder.parameters()).dtype
+    cache = routine._make_dummy_cache("xvec", 1, torch.device("cpu"), dtype)
+    cache.update(
+        {
+            "suffix_quantized": torch.zeros(1, decoder.config.codebook_dim, 2),
+            "suffix_conv": torch.zeros(1, 2, decoder.config.latent_dim),
+            "suffix_frames": 2,
+        }
+    )
+    monkeypatch.setattr(decoder, "_cache_tensors_are_batchable", lambda *_args: True, raising=False)
+
+    def _cannot_batch(_caches):
+        raise ValueError("incompatible DynamicCache")
+
+    monkeypatch.setattr(decoder, "_batch_dynamic_caches", _cannot_batch, raising=False)
+
+    assert routine.eager_call("xvec", 5, [torch.zeros(1, 2, 3)], [cache], [3]) is None
+
+
 def test_qwen3_tts_stateful_targets_are_config_derived_and_target_local() -> None:
     decoder = _StatefulDecoder()
     targets = build_stateful_targets(
@@ -419,6 +457,60 @@ def test_qwen3_tts_stateful_targets_are_config_derived_and_target_local() -> Non
     suffix_variants = {descriptor.variant for descriptor in targets[2].descriptors}
     assert Qwen3TTSSuffixVariant("icl", 1, 5) in suffix_variants
     assert Qwen3TTSSuffixVariant("xvec", 2, 13) in suffix_variants
+
+
+def test_stateful_targets_use_first_chunk_ramp_entry_consistently() -> None:
+    decoder = _StatefulDecoder()
+    targets = build_stateful_targets(
+        decoder=decoder,
+        vllm_config=_config(async_chunk=True),
+        num_quantizers=2,
+        prefix_length=10,
+        capture_batch_sizes=[1],
+        initial_frames=1,
+        chunk_frames=3,
+        chunk_ramp=[2, 4, 3],
+    )
+    icl_target, xvec_target, suffix_target = targets
+
+    icl_routine = icl_target.routine
+    xvec_routine = xvec_target.routine
+    suffix_routine = suffix_target.routine
+    assert isinstance(icl_routine, Qwen3TTSIclPrefixRoutine)
+    assert isinstance(xvec_routine, Qwen3TTSXvecPrefixRoutine)
+    assert icl_routine.initial_frames == 2
+    assert xvec_routine.initial_frames == 2
+
+    icl_descriptor = VocoderCUDAGraphDescriptor(Qwen3TTSIclPrefixVariant(1, 12))
+    xvec_descriptor = VocoderCUDAGraphDescriptor(Qwen3TTSXvecPrefixVariant(1, 2))
+    assert set(icl_target.descriptors) == {icl_descriptor}
+    assert set(xvec_target.descriptors) == {xvec_descriptor}
+
+    assert suffix_routine.transitions == {
+        "icl": {6: 2, 9: 6, 12: 9, 13: 10},
+        "xvec": {6: 2, 9: 6, 12: 9, 13: 10},
+    }
+    suffix_descriptor = VocoderCUDAGraphDescriptor(Qwen3TTSSuffixVariant("xvec", 1, 6))
+    assert suffix_descriptor in suffix_target.descriptors
+
+    icl_resolution = icl_routine.resolve_runtime(
+        (torch.zeros(1, 2, 12, dtype=torch.long), {}),
+        {},
+        set(icl_target.descriptors),
+    )
+    xvec_resolution = xvec_routine.resolve_runtime(
+        (torch.zeros(1, 2, 2, dtype=torch.long), {}),
+        {},
+        set(xvec_target.descriptors),
+    )
+    suffix_resolution = suffix_routine.resolve_runtime(
+        ("xvec", 6, [torch.zeros(1, 2, 4, dtype=torch.long)]),
+        {},
+        set(suffix_target.descriptors),
+    )
+    assert icl_resolution.descriptor == icl_descriptor
+    assert xvec_resolution.descriptor == xvec_descriptor
+    assert suffix_resolution.descriptor == suffix_descriptor
 
 
 def test_segmented_capture_sizes_are_derived_from_decoder_and_chunk_config() -> None:

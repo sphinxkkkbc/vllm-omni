@@ -265,7 +265,6 @@ class VocoderCUDAGraphManager:
         buffers: object | None = None
         try:
             buffers = routine.allocate_buffers(descriptor, self.device)
-            routine.prepare_for_capture(buffers)
             num_warmups = max(
                 1,
                 int(getattr(self.vllm_config.compilation_config, "cudagraph_num_of_warmups", 0)),
