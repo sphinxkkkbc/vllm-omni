@@ -129,6 +129,8 @@ class OmniModelConfig(ModelConfig):
     hf_text_config: PretrainedConfig = field(init=False)
     async_chunk: bool = False
     session_mode: str = "turn"
+    # Resolved per-stage runner-owned vocoder CUDA Graph configuration.
+    vocoder_cudagraph_config: dict[str, Any] | None = None
     retains_state_across_chunks: bool = False
     supports_running_prefix_cache_reset: bool = True
     use_v2_model_runner: bool = False

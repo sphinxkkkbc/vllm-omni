@@ -197,6 +197,9 @@ class OmniEngineArgs(EngineArgs):
     silence_ban_frames: int = 0
     async_chunk: bool = False
     session_mode: str = "turn"
+    # Public deploy YAML uses ``vocoder_cudagraph``; the resolved model config
+    # stores it as ``vocoder_cudagraph_config`` to make its role explicit.
+    vocoder_cudagraph: dict[str, Any] | None = None
     retains_state_across_chunks: bool = False
     supports_running_prefix_cache_reset: bool = True
     use_v2_model_runner: bool = False
@@ -319,6 +322,11 @@ class OmniEngineArgs(EngineArgs):
         Returns:
             OmniModelConfig instance with all configuration fields set
         """
+        if self.vocoder_cudagraph is not None and self.worker_type != "generation":
+            raise ValueError(
+                f"vocoder_cudagraph is supported only for LLM_GENERATION stages; got worker_type={self.worker_type!r}"
+            )
+
         # register omni models to avoid model not found error
         self._ensure_omni_models_registered()
 
@@ -434,6 +442,7 @@ class OmniEngineArgs(EngineArgs):
             stage_id=self.stage_id,
             async_chunk=self.async_chunk,
             session_mode=self.session_mode,
+            vocoder_cudagraph=self.vocoder_cudagraph,
             retains_state_across_chunks=self.retains_state_across_chunks,
             supports_running_prefix_cache_reset=self.supports_running_prefix_cache_reset,
             use_v2_model_runner=self.use_v2_model_runner,
