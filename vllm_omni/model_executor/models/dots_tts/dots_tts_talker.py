@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """dots.tts talker — vLLM-native AR base LM + audio side path.
 
 Mirrors upstream rednote-hilab/dots.tts (pinned @ a393d2e):
@@ -1013,6 +1013,22 @@ class DotsTTSForConditionalGeneration(nn.Module):
             dtype=dtype if use_amp else torch.float32,
             enabled=use_amp,
         ):
+            cfg_batch_size = g_cond_batched.size(0)
+
+            attn_bias = torch.zeros(
+                cfg_batch_size,
+                self._head.blocks[0].attn.num_heads,
+                total_len,
+                total_len,
+                dtype=dtype,
+                device=device,
+            )
+
+            attn_bias.masked_fill_(
+                attn_mask.logical_not(),
+                float("-inf"),
+            )
+
             for step in range(num_steps):
                 t = times[step].reshape(1)
                 z_proj = self._coordinate_proj(z)
@@ -1025,7 +1041,7 @@ class DotsTTSForConditionalGeneration(nn.Module):
                 vt = self._head(
                     x=z_batched,
                     timesteps=t_batched,
-                    attn_mask=attn_mask,
+                    attn_mask=attn_bias,
                     pos_ids=pos_ids,
                     g_cond=g_cond_batched,
                 )
@@ -1280,12 +1296,18 @@ class DotsTTSForConditionalGeneration(nn.Module):
             ("xvec_proj.", "_xvec_proj", self._xvec_proj),
             ("eos_proj.", "_eos_proj", self._eos_proj),
         ]
+        stacked_params_mapping = [
+            (".qkv_proj.weight", ".q_proj.weight", "q"),
+            (".qkv_proj.weight", ".k_proj.weight", "k"),
+            (".qkv_proj.weight", ".v_proj.weight", "v"),
+        ]
         projector_state_keys = {prefix: set(mod.state_dict().keys()) for prefix, _, mod in projector_specs}
         projector_matched: dict[str, list[tuple[str, torch.Tensor]]] = {prefix: [] for prefix, _, _ in projector_specs}
-
         matched_vae: list[tuple[str, torch.Tensor]] = []
         matched_dit: list[tuple[str, torch.Tensor]] = []
+        matched_dit_stacked: list[tuple[str, torch.Tensor]] = []
         matched_patch: list[tuple[str, torch.Tensor]] = []
+        matched_patch_stacked: list[tuple[str, torch.Tensor]] = []
         matched_llm: list[tuple[str, torch.Tensor]] = []
         matched_speaker: list[tuple[str, torch.Tensor]] = []
         skipped_lm_head = 0
@@ -1297,11 +1319,17 @@ class DotsTTSForConditionalGeneration(nn.Module):
         for name, tensor in weights:
             if name.startswith(DIT_PREFIX):
                 candidate = name[len(DIT_PREFIX) :]
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    if candidate.endswith(weight_name):
+                        matched_dit_stacked.append((candidate, tensor))
                 if candidate in dit_state_keys:
                     matched_dit.append((candidate, tensor))
                 continue
             if name.startswith(PATCH_PREFIX):
                 candidate = name[len(PATCH_PREFIX) :]
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    if candidate.endswith(weight_name):
+                        matched_patch_stacked.append((candidate, tensor))
                 if candidate in patch_state_keys:
                     matched_patch.append((candidate, tensor))
                 continue
@@ -1360,6 +1388,21 @@ class DotsTTSForConditionalGeneration(nn.Module):
                 len(dit_state_keys),
             )
 
+        if matched_dit_stacked:
+            params_dict = dict(self._head.named_parameters())
+            for name, loaded_weight in matched_dit_stacked:
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    if name.endswith(weight_name):
+                        stacked_name = name.replace(weight_name, param_name)
+                        if stacked_name not in params_dict:
+                            logger.warning(f"Stacked param {stacked_name} not found in model parameters.")
+                            continue
+                        param = params_dict[stacked_name]
+                        weight_loader = getattr(param, "weight_loader", None)
+                        if weight_loader is not None:
+                            weight_loader(param, loaded_weight, shard_id)
+                        loaded.add(f"_head.{stacked_name}")
+
         if matched_patch:
             patch_loader = AutoWeightsLoader(self._patch_encoder)
             loaded_patch = patch_loader.load_weights(iter(matched_patch))
@@ -1369,6 +1412,21 @@ class DotsTTSForConditionalGeneration(nn.Module):
                 len(loaded_patch),
                 len(patch_state_keys),
             )
+
+        if matched_patch_stacked:
+            params_dict = dict(self._patch_encoder.named_parameters())
+            for name, loaded_weight in matched_patch_stacked:
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    if name.endswith(weight_name):
+                        stacked_name = name.replace(weight_name, param_name)
+                        if stacked_name not in params_dict:
+                            logger.warning(f"Stacked param {stacked_name} not found in patch_encoder parameters.")
+                            continue
+                        param = params_dict[stacked_name]
+                        weight_loader = getattr(param, "weight_loader", None)
+                        if weight_loader is not None:
+                            weight_loader(param, loaded_weight, shard_id)
+                        loaded.add(f"_patch_encoder.{stacked_name}")
 
         any_projector_matched = False
         for prefix, attr_name, mod in projector_specs:

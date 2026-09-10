@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """dots.tts serving adapter."""
 
 from typing import TYPE_CHECKING
@@ -80,3 +81,10 @@ class DotsTTSAdapter(ARTTSAdapter):
         request_id: str | None = None,
     ) -> list:
         return apply_max_new_tokens(sampling_params_list, request)
+
+    def warmup(self, request: "OpenAICreateSpeechRequest") -> None:
+        if self.tokenizer is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.ctx.engine_client.model_config.model,
+                trust_remote_code=True,
+            )

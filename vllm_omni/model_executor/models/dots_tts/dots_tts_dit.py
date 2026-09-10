@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2026 The vLLM-Omni team.
 # Copyright (c) rednote-hilab. All rights reserved.
 # Adapted from:
@@ -26,6 +27,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import QKVParallelLinear
+
+from vllm_omni.model_executor.models.omnivoice.fused_qkv_rope import fused_qkv_norm_rope
 
 # ============================================================================
 # Building blocks (adapted from modules/backbone/layers.py)
@@ -141,13 +146,23 @@ class MultiHeadAttention(nn.Module):
         self.scale = self.head_dim**-0.5
         self.rotary_bias = rotary_bias
 
-        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
-        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=num_heads,
+            total_num_kv_heads=num_heads,
+            bias=qkv_bias,
+            disable_tp=True,
+            prefix="qkv_proj",
+        )
 
         norm_layer = getattr(nn, norm_layer)
-        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        if norm_layer is torch.nn.modules.normalization.RMSNorm:
+            self.q_norm = RMSNorm(self.head_dim, eps=torch.finfo(torch.float32).eps) if qk_norm else nn.Identity()
+            self.k_norm = RMSNorm(self.head_dim, eps=torch.finfo(torch.float32).eps) if qk_norm else nn.Identity()
+        else:
+            self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+            self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
 
         self.attn_drop = Dropout(attn_drop)
         self.o_proj = nn.Linear(hidden_size, hidden_size)
@@ -156,7 +171,7 @@ class MultiHeadAttention(nn.Module):
         if self.rotary_bias:
             self.rotary = RotaryEmbedding(self.head_dim, theta=rotary_theta)
 
-    def forward(self, q, k=None, v=None, mask=None, pos_ids=None, **_kwargs):
+    def forward(self, q, k=None, v=None, mask=None, rotary_emb=None, **_kwargs):
         k = k or q
         v = v or q
         B, L, _ = q.shape
@@ -170,95 +185,96 @@ class MultiHeadAttention(nn.Module):
                 assert mask.size(1) == L and mask.size(2) == S
                 mask = mask.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
 
-        q, k, v = self.q_proj(q), self.k_proj(k), self.v_proj(v)
-        q = rearrange(q, "b n (h d) -> b h n d", h=self.num_heads)
-        k = rearrange(k, "b n (h d) -> b h n d", h=self.num_heads)
-        v = rearrange(v, "b n (h d) -> b h n d", h=self.num_heads)
-        q, k = self.q_norm(q), self.k_norm(k)
+        qkv, _ = self.qkv_proj(q)
 
         # Apply rotary
         if self.rotary_bias:
             if L == S:
-                if pos_ids is None:
-                    rotary_emb = self.rotary(torch.arange(L, device=q.device))
-                else:
-                    rotary_emb = self.rotary(pos_ids)
-                q, k = (apply_rotary_pos_emb(rotary_emb, tensor) for tensor in (q, k))
+                if rotary_emb.dim() == 3:
+                    rotary_emb = rotary_emb.squeeze(0)
+                qkv = qkv.reshape(B, L, 3 * self.num_heads, self.head_dim)
+                q, k, v = fused_qkv_norm_rope(
+                    qkv,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    rope_table=rotary_emb,
+                    eps=torch.finfo(torch.float32).eps,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_heads,
+                )
             else:
+                q, k, v = qkv.chunk(3, dim=-1)
+                q = q.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+                k = k.reshape(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+                v = v.reshape(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+                q = self.q_norm(q)
+                k = self.k_norm(k)
                 q_rotary_emb = self.rotary(torch.arange(L, device=q.device))
                 k_rotary_emb = self.rotary(torch.arange(S, device=k.device))
                 q = apply_rotary_pos_emb(q_rotary_emb, q)
                 k = apply_rotary_pos_emb(k_rotary_emb, k)
-
-        attn_bias = torch.zeros(B, self.num_heads, L, S, dtype=q.dtype, device=q.device)
-
-        if mask is not None:
-            attn_bias.masked_fill_(mask.logical_not(), float("-inf"))
+        else:
+            q, k, v = qkv.chunk(3, dim=-1)
+            q = q.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+            k = k.reshape(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+            v = v.reshape(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         out = F.scaled_dot_product_attention(
             q,
             k,
             v,
-            attn_mask=attn_bias,
-            dropout_p=self.attn_drop.p if self.training else 0.0,
+            attn_mask=mask,
         )
 
         out = rearrange(out, "b h n d -> b n (h d)")
         return self.o_dropout(self.o_proj(out))
 
-    def decode_step(self, x, *, cache, positions: torch.Tensor):
+    def decode_step(
+        self,
+        x,
+        *,
+        cache,
+        positions: torch.Tensor,
+        rope_table: torch.Tensor | None = None,
+        attn_bias: torch.Tensor | None = None,
+        **_kwargs,
+    ):
         if x.size(1) <= 0:
             raise ValueError("MultiHeadAttention.decode_step expects a non-empty input.")
         if positions.ndim != 1 or positions.size(0) != x.size(1):
             raise ValueError("MultiHeadAttention.decode_step positions must match the decode block length.")
 
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-
-        q = rearrange(q, "b n (h d) -> b h n d", h=self.num_heads)
-        k = rearrange(k, "b n (h d) -> b h n d", h=self.num_heads)
-        v = rearrange(v, "b n (h d) -> b h n d", h=self.num_heads)
-        q, k = self.q_norm(q), self.k_norm(k)
-        block_len = q.size(2)
+        qkv, _ = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
 
         if self.rotary_bias:
-            rotary_emb = self.rotary(positions)
-            q = apply_rotary_pos_emb(rotary_emb, q)
-            k = apply_rotary_pos_emb(rotary_emb, k)
+            q, k, v = fused_qkv_norm_rope(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                rope_table=rope_table,
+                eps=torch.finfo(torch.float32).eps,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_heads,
+            )
+        else:
+            q, k, v = qkv.chunk(3, dim=-1)
+            q = q.reshape(x.size(0), x.size(1), self.num_heads, self.head_dim).transpose(1, 2)
+            k = k.reshape(x.size(0), x.size(1), self.num_heads, self.head_dim).transpose(1, 2)
+            v = v.reshape(x.size(0), x.size(1), self.num_heads, self.head_dim).transpose(1, 2)
+            q, k = self.q_norm(q), self.k_norm(k)
 
         cached_k, cached_v = cache
         cached_k.index_copy_(2, positions, k)
         cached_v.index_copy_(2, positions, v)
-
-        cache_capacity = cached_k.size(2)
-        key_positions = torch.arange(
-            cache_capacity,
-            device=x.device,
-            dtype=torch.long,
-        ).unsqueeze(0)
-        query_positions = positions.unsqueeze(1)
-        causal_mask = key_positions <= query_positions
-        valid_mask = key_positions <= positions[-1]
-        attn_bias = torch.zeros(
-            q.size(0),
-            self.num_heads,
-            block_len,
-            cache_capacity,
-            dtype=q.dtype,
-            device=q.device,
-        )
-        attn_bias.masked_fill_(
-            (causal_mask & valid_mask).unsqueeze(0).unsqueeze(0).logical_not(),
-            float("-inf"),
-        )
 
         out = F.scaled_dot_product_attention(
             q,
             cached_k,
             cached_v,
             attn_mask=attn_bias,
-            dropout_p=self.attn_drop.p if self.training else 0.0,
         )
         out = rearrange(out, "b h n d -> b n (h d)")
         return self.o_dropout(self.o_proj(out)), cache
@@ -345,7 +361,7 @@ class DiTBlock(nn.Module):
                 nn.Linear(hidden_size, 6 * hidden_size, bias=True),
             )
 
-    def forward(self, x, condition=None, mask=None, **kwargs):
+    def forward(self, x, condition=None, mask=None, rotary_emb=None, **kwargs):
         if condition is None:
             assert not self.modulation, "Without global condition, must set modulation to False"
         else:
@@ -367,10 +383,11 @@ class DiTBlock(nn.Module):
             x = x + gate_attn * self.attn(
                 modulate(self.norm1(x), shift_attn, scale_attn, **kwargs),
                 mask=mask,
+                rotary_emb=rotary_emb,
                 **kwargs,
             )
         else:
-            x = x + self.attn(self.norm1(x), mask=mask, **kwargs)
+            x = x + self.attn(self.norm1(x), mask=mask, rotary_emb=rotary_emb, **kwargs)
 
         if condition is not None:
             x = x + gate_ffn * self.ffn(modulate(self.norm2(x), shift_ffn, scale_ffn, **kwargs))
@@ -452,6 +469,22 @@ class DiT(nn.Module):
             c = c + g_cond
 
         x = self.input_layer(x)
+        _, L, _ = x.shape
+        pos_ids = kwargs.get("pos_ids")
+        if pos_ids is None:
+            pos_ids = torch.arange(L, device=x.device)
+        angles = self.blocks[0].attn.rotary(pos_ids)
+        if angles.dim() == 3:
+            angles = angles.squeeze(0)
+
+        half = angles.shape[-1] // 2
+        freqs = angles[..., :half]
+
+        rope_table = torch.cat(
+            [freqs.cos(), freqs.sin()],
+            dim=-1,
+        )
+
         for block in self.blocks:
-            x = block(x, c, mask=attn_mask, **kwargs)
+            x = block(x, c, mask=attn_mask, rotary_emb=rope_table, **kwargs)
         return self.output_layer(x, c, **kwargs)
