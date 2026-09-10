@@ -40,6 +40,7 @@ from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_TTS_PIPELINE,
 )
 from vllm_omni.model_executor.models.audio8_tts.pipeline import AUDIO8_TTS_PIPELINE
+from vllm_omni.model_executor.models.auk.pipeline import AUK_PIPELINE
 from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_PIPELINE
 from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_PIPELINE,
@@ -125,6 +126,7 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
+    "auk": AUK_PIPELINE,
     "aura_omni": AURA_OMNI_PIPELINE,
     "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,

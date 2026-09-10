@@ -41,6 +41,8 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "NemotronVoiceChatTalkerForConditionalGeneration": "nemotron_voicechat",
     "NemotronVoiceChatCode2Wav": "nemotron_voicechat",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
+    "AukConditionModel": "auk",
+    "AukFlowModel": "auk",
 }
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
@@ -54,6 +56,7 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
+        from vllm_omni.model_executor.models.auk.configuration_auk import AukConfig
         from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
             IndexTTS2Config,
             IndexTTS25Config,
@@ -92,6 +95,7 @@ def _register_omni_hf_configs() -> None:
         _CONFIG_REGISTRY = None
 
     for model_type, config_cls in [
+        ("auk", AukConfig),
         ("dense", MingDenseConfig),
         ("bailingmm", MingMoeConfig),
         ("indextts2", IndexTTS2Config),

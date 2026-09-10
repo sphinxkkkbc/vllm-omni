@@ -407,6 +407,8 @@ _OMNI_MODELS = {
         "indextts2_talker",
         "IndexTTS2TalkerForConditionalGeneration",
     ),
+    "AukConditionModel": ("auk", "modeling_auk", "AukConditionModel"),
+    "AukFlowModel": ("auk", "auk_flow", "AukFlowModel"),
     "IndexTTS2S2MelDecoder": (
         "indextts2",
         "indextts2_s2mel_decoder",
