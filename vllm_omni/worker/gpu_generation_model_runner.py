@@ -99,12 +99,16 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
     @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
-        if self.vocoder_cudagraph_manager is not None:
-            # Model-local graph memory is materialized by capture_model(). A
-            # temporary profile capture would bind the same stable Targets and
-            # violate the one-manager lifecycle. Reservation for lazy capture
-            # remains an explicit design open question.
-            return 0
+        manager = self.vocoder_cudagraph_manager
+        if manager is not None:
+            set_cudagraph_capturing_enabled(True)
+            try:
+                with self._freeze_gc(), graph_capture(device=self.device):
+                    torch.accelerator.synchronize()
+                    torch.accelerator.empty_cache()
+                    return manager.profile_memory()
+            finally:
+                set_cudagraph_capturing_enabled(False)
         return super().profile_cudagraph_memory()
 
     @torch.inference_mode()
@@ -297,7 +301,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
-                # The raw model's declared Targets own graph replay for this
+                # The raw model's declared Components own graph replay for this
                 # stage. Keep the upstream root wrapper on its eager runnable.
                 force_eager=self.vocoder_cudagraph_manager is not None,
             )
@@ -681,7 +685,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         """
         if self.vocoder_cudagraph_manager is not None:
             # Warmup/profile calls must not accidentally trigger the upstream
-            # root CUDAGraphWrapper once vocoder Targets own graph capture.
+            # root CUDAGraphWrapper once vocoder Components own graph capture.
             cudagraph_runtime_mode = CUDAGraphMode.NONE
 
         mm_config = self.vllm_config.model_config.multimodal_config

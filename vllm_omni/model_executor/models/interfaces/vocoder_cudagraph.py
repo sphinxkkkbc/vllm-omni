@@ -20,7 +20,7 @@ VariantT = TypeVar("VariantT", bound=Hashable)
 
 @dataclass(frozen=True)
 class VocoderCUDAGraphDescriptor(Generic[VariantT]):
-    """One immutable, Target-scoped capture specialization."""
+    """One immutable, Component-scoped capture specialization."""
 
     variant: VariantT
 
@@ -41,21 +41,33 @@ class VocoderRuntimeResolution:
 
 
 class VocoderGraphHandle:
-    """Opaque runtime endpoint for one bound vocoder CUDA Graph Target.
+    """Opaque runtime endpoint for one bound vocoder CUDA Graph Component.
 
-    The Handle type is shared by the model-facing Target and worker-side
+    The Handle type is shared by the model-facing Component and worker-side
     Manager, but Handle instances are manager-created and manager-owned. It
-    deliberately hides graph entries, descriptors, replay buffers, and
-    dispatch policy from model code.
+    deliberately hides graph entries, replay buffers, and dispatch policy
+    from model code. It exposes only the descriptors currently backed by
+    active graphs so model routing can align grouping with graph coverage.
     """
 
-    __slots__ = ("_call",)
+    __slots__ = ("_call", "_get_available_descriptors")
 
-    def __init__(self, call: Callable[..., Any]) -> None:
+    def __init__(
+        self,
+        call: Callable[..., Any],
+        get_available_descriptors: Callable[[], frozenset[VocoderCUDAGraphDescriptor]] = frozenset,
+    ) -> None:
         self._call = call
+        self._get_available_descriptors = get_available_descriptors
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self._call(*args, **kwargs)
+
+    @property
+    def available_descriptors(self) -> frozenset[VocoderCUDAGraphDescriptor]:
+        """A read-only snapshot of descriptors currently backed by graphs."""
+
+        return self._get_available_descriptors()
 
 
 class VocoderCUDAGraphRoutine(Protocol):
@@ -179,30 +191,30 @@ class BaseVocoderCUDAGraphRoutine:
         del buffers
 
 
-class VocoderCUDAGraphTarget:
+class VocoderCUDAGraphComponent:
     """Resolved planning declaration and stable model-owned call site.
 
     Before Manager binding, the delegate is ``Routine.eager_call``. After
     binding, it is the Manager-created ``VocoderGraphHandle``. Restoring or
-    clearing the Target returns the delegate to ``Routine.eager_call``.
+    clearing the Component returns the delegate to ``Routine.eager_call``.
     """
 
     def __init__(
         self,
-        target_id: str,
+        component_id: str,
         routine: VocoderCUDAGraphRoutine,
         descriptors: Sequence[VocoderCUDAGraphDescriptor],
         clone_output: bool = True,
         *,
         supported_config_keys: Set[str] = frozenset(),
     ) -> None:
-        self.target_id = target_id
+        self.component_id = component_id
         self.routine = routine
         self.descriptors = tuple(descriptors)
         self.clone_output = bool(clone_output)
         self.supported_config_keys = frozenset(supported_config_keys)
         self._delegate: Callable[..., Any] = routine.eager_call
-        # The Target owns the stable call site, not the runtime Handle
+        # The Component owns the stable call site, not the runtime Handle
         # lifecycle. The Manager constructs and binds the Handle after capture.
         self._bound_handle: VocoderGraphHandle | None = None
 
@@ -215,11 +227,19 @@ class VocoderCUDAGraphTarget:
 
         return self._bound_handle is not None
 
+    @property
+    def available_descriptors(self) -> frozenset[VocoderCUDAGraphDescriptor]:
+        """Descriptors currently backed by active non-eager graph entries."""
+
+        if self._bound_handle is None:
+            return frozenset()
+        return self._bound_handle.available_descriptors
+
     def _bind_handle(self, handle: VocoderGraphHandle) -> None:
         if not isinstance(handle, VocoderGraphHandle):
-            raise TypeError("VocoderCUDAGraphTarget requires a VocoderGraphHandle")
+            raise TypeError("VocoderCUDAGraphComponent requires a VocoderGraphHandle")
         if self._bound_handle is not None:
-            raise RuntimeError(f"Target already bound: {self.target_id}")
+            raise RuntimeError(f"Component already bound: {self.component_id}")
         self._bound_handle = handle
         self._delegate = handle
 
@@ -232,10 +252,10 @@ class VocoderCUDAGraphTarget:
 class SupportsVocoderCUDAGraph(Protocol):
     supports_vocoder_cudagraph: ClassVar[Literal[True]]
 
-    def get_vocoder_cudagraph_targets(self) -> Sequence[VocoderCUDAGraphTarget]: ...
+    def get_vocoder_cudagraph_components(self) -> Sequence[VocoderCUDAGraphComponent]: ...
 
 
 def supports_vocoder_cudagraph(model: object) -> bool:
     return bool(getattr(model, "supports_vocoder_cudagraph", False)) and callable(
-        getattr(model, "get_vocoder_cudagraph_targets", None)
+        getattr(model, "get_vocoder_cudagraph_components", None)
     )

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -17,7 +18,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 class _GraphModel:
     supports_vocoder_cudagraph = True
 
-    def get_vocoder_cudagraph_targets(self):
+    def get_vocoder_cudagraph_components(self):
         return ()
 
 
@@ -63,7 +64,7 @@ def test_load_model_prepares_manager_from_unwrapped_model(monkeypatch) -> None:
     assert runner.vocoder_cudagraph_manager is manager
 
 
-def test_enforce_eager_skips_manager_and_shutdown_restores_targets(monkeypatch) -> None:
+def test_enforce_eager_skips_manager_and_shutdown_restores_components(monkeypatch) -> None:
     _FakeManager.instances.clear()
     monkeypatch.setattr(OmniGPUModelRunner, "load_model", lambda self, *args, **kwargs: None)
     monkeypatch.setattr(generation_runner_module, "VocoderCUDAGraphManager", _FakeManager)
@@ -81,3 +82,14 @@ def test_enforce_eager_skips_manager_and_shutdown_restores_targets(monkeypatch) 
     assert manager.cleared
     assert runner.vocoder_cudagraph_manager is None
     assert shutdown_called == [True]
+
+
+def test_profile_uses_measured_estimate(monkeypatch):
+    runner = _runner(enforce_eager=False, mode=CUDAGraphMode.FULL)
+    manager = SimpleNamespace(profile_memory=lambda: 321)
+    runner.vocoder_cudagraph_manager = manager
+    monkeypatch.setattr(runner, "_freeze_gc", nullcontext)
+    monkeypatch.setattr(generation_runner_module, "graph_capture", lambda **kwargs: nullcontext())
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    assert runner.profile_cudagraph_memory() == 321
