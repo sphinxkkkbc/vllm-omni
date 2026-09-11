@@ -17,7 +17,7 @@ def test_capability_discovery_requires_both_declaration_and_provider() -> None:
     class Model(SupportsVocoderCUDAGraph):
         supports_vocoder_cudagraph = True
 
-        def get_vocoder_cudagraph_targets(self):
+        def get_vocoder_cudagraph_components(self):
             return ()
 
     assert supports_vocoder_cudagraph(Model())

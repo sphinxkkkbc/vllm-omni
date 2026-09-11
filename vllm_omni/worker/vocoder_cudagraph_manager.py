@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Runner-owned lifecycle for model-declared vocoder CUDA Graph Targets."""
+"""Runner-owned lifecycle for model-declared vocoder CUDA Graph Components."""
 
 from __future__ import annotations
 
@@ -23,8 +23,8 @@ from vllm.platforms import current_platform
 
 from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
     SupportsVocoderCUDAGraph,
+    VocoderCUDAGraphComponent,
     VocoderCUDAGraphDescriptor,
-    VocoderCUDAGraphTarget,
     VocoderGraphHandle,
     VocoderRuntimeResolution,
 )
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class VocoderCUDAGraphEntry:
-    """Worker-owned resources for one captured Target Descriptor."""
+    """Worker-owned resources for one captured Component Descriptor."""
 
     descriptor: VocoderCUDAGraphDescriptor
     graph: torch.cuda.CUDAGraph
@@ -45,12 +45,11 @@ class VocoderCUDAGraphEntry:
 
 _FRAMEWORK_CONFIG_KEYS = frozenset(
     {
-        "max_memory_bytes",
         "log_stats",
-        "targets",
+        "components",
     }
 )
-_TARGET_POLICY_KEYS = frozenset(
+_COMPONENT_POLICY_KEYS = frozenset(
     {
         "enabled",
         "enable_lazy_capture",
@@ -78,15 +77,15 @@ def clone_tensor_tree(value: object) -> object:
 
 
 @dataclass(frozen=True)
-class VocoderTargetRuntimeConfig:
+class VocoderComponentRuntimeConfig:
     enabled: bool = True
     enable_lazy_capture: bool = False
     max_extra_graphs: int = 0
 
 
 @dataclass
-class ManagedTarget:
-    target: VocoderCUDAGraphTarget
+class ManagedComponent:
+    component: VocoderCUDAGraphComponent
     entries: OrderedDict[VocoderCUDAGraphDescriptor, VocoderCUDAGraphEntry]
     enable_lazy_capture: bool
     failed_descriptors: set[VocoderCUDAGraphDescriptor] = field(default_factory=set)
@@ -106,21 +105,21 @@ class _NoOpRecorder:
         del resolution
 
 
-class _TargetRecorder:
-    __slots__ = ("_sink", "_target_id")
+class _ComponentRecorder:
+    __slots__ = ("_sink", "_component_id")
 
-    def __init__(self, sink: VocoderGraphStatsSink, target_id: str) -> None:
+    def __init__(self, sink: VocoderGraphStatsSink, component_id: str) -> None:
         self._sink = sink
-        self._target_id = target_id
+        self._component_id = component_id
 
     def record_graph_hit(self, resolution: VocoderRuntimeResolution) -> None:
-        self._sink.record("hit", self._target_id, resolution)
+        self._sink.record("hit", self._component_id, resolution)
 
     def record_fallback(self, resolution: VocoderRuntimeResolution) -> None:
-        self._sink.record("fallback", self._target_id, resolution)
+        self._sink.record("fallback", self._component_id, resolution)
 
     def record_replay_error(self, resolution: VocoderRuntimeResolution) -> None:
-        self._sink.record("replay_error", self._target_id, resolution)
+        self._sink.record("replay_error", self._component_id, resolution)
 
 
 class VocoderGraphStatsSink:
@@ -136,23 +135,23 @@ class VocoderGraphStatsSink:
         # Counts runtime keys observed before Descriptor bucket selection.
         self._runtime_keys: Counter[tuple[str, object]] = Counter()
 
-    def recorder_for(self, target_id: str) -> _TargetRecorder | _NoOpRecorder:
+    def recorder_for(self, component_id: str) -> _ComponentRecorder | _NoOpRecorder:
         if not self.enabled:
             return _NoOpRecorder()
-        return _TargetRecorder(self, target_id)
+        return _ComponentRecorder(self, component_id)
 
     def record(
         self,
         outcome: str,
-        target_id: str,
+        component_id: str,
         resolution: VocoderRuntimeResolution,
     ) -> None:
         with self._lock:
-            self._calls[target_id] += 1
-            self._outcomes[(target_id, outcome)] += 1
+            self._calls[component_id] += 1
+            self._outcomes[(component_id, outcome)] += 1
             if resolution.descriptor is not None:
-                self._descriptors[(target_id, resolution.descriptor.variant)] += 1
-            key = (target_id, resolution.runtime_key.variant)
+                self._descriptors[(component_id, resolution.descriptor.variant)] += 1
+            key = (component_id, resolution.runtime_key.variant)
             self._runtime_keys[key] += 1
 
     def snapshot(self) -> dict[str, object]:
@@ -166,19 +165,18 @@ class VocoderGraphStatsSink:
 
 
 class VocoderCUDAGraphManager:
-    """Consumes resolved Targets and owns capture/bind/restore lifecycle."""
+    """Consumes resolved Components and owns capture/bind/restore lifecycle."""
 
     def __init__(self, *, vllm_config: VllmConfig, device: torch.device) -> None:
         self.vllm_config = vllm_config
         self.device = device
-        self.targets: tuple[VocoderCUDAGraphTarget, ...] = ()
-        self.managed_targets: dict[str, ManagedTarget] = {}
-        self._target_configs: dict[str, VocoderTargetRuntimeConfig] = {}
+        self.components: tuple[VocoderCUDAGraphComponent, ...] = ()
+        self.managed_components: dict[str, ManagedComponent] = {}
+        self._component_configs: dict[str, VocoderComponentRuntimeConfig] = {}
         self._capture_lock = threading.RLock()
         self._runtime_capture_stream: torch.cuda.Stream | None = None
         self._prepared = False
         self._capture_finished = False
-        self._captured_memory_bytes = 0
 
         raw_config = getattr(vllm_config.model_config, "vocoder_cudagraph_config", None)
         if raw_config is None:
@@ -186,7 +184,6 @@ class VocoderCUDAGraphManager:
         if not isinstance(raw_config, Mapping):
             raise TypeError("vocoder_cudagraph must be a mapping")
         self.config = dict(raw_config)
-        self.max_memory_bytes = self.config.get("max_memory_bytes")
         log_stats = self.config.get("log_stats", False)
         self.stats_sink = VocoderGraphStatsSink(enabled=log_stats)
 
@@ -197,35 +194,36 @@ class VocoderCUDAGraphManager:
             declaration = declaration()
         return frozenset(cast(Sequence[str], declaration))
 
-    def _memory_allocated(self) -> int:
+    def _synchronized_free_memory(self) -> int:
         if self.device.type == "cpu":
             return 0
-        return int(torch.accelerator.memory_allocated(self.device))
+        torch.accelerator.synchronize()
+        return int(torch.accelerator.get_memory_info()[0])
 
     def prepare(self, model: SupportsVocoderCUDAGraph) -> None:
         if self._prepared:
             raise RuntimeError("VocoderCUDAGraphManager.prepare() called more than once")
 
-        targets = tuple(model.get_vocoder_cudagraph_targets())
-        target_by_id: dict[str, VocoderCUDAGraphTarget] = {}
-        for target in targets:
-            if not isinstance(target, VocoderCUDAGraphTarget):
-                raise TypeError("get_vocoder_cudagraph_targets() must return VocoderCUDAGraphTarget objects")
-            if not target.target_id:
-                raise ValueError("Vocoder CUDA Graph target_id must not be empty")
-            if target.target_id in target_by_id:
-                raise ValueError(f"Duplicate vocoder CUDA Graph target_id: {target.target_id}")
+        components = tuple(model.get_vocoder_cudagraph_components())
+        component_by_id: dict[str, VocoderCUDAGraphComponent] = {}
+        for component in components:
+            if not isinstance(component, VocoderCUDAGraphComponent):
+                raise TypeError("get_vocoder_cudagraph_components() must return VocoderCUDAGraphComponent objects")
+            if not component.component_id:
+                raise ValueError("Vocoder CUDA Graph component_id must not be empty")
+            if component.component_id in component_by_id:
+                raise ValueError(f"Duplicate vocoder CUDA Graph component_id: {component.component_id}")
             try:
-                if len(set(target.descriptors)) != len(target.descriptors):
-                    raise ValueError(f"Duplicate Descriptor in Target {target.target_id}")
+                if len(set(component.descriptors)) != len(component.descriptors):
+                    raise ValueError(f"Duplicate Descriptor in Component {component.component_id}")
             except TypeError as exc:
-                raise TypeError(f"Descriptors for Target {target.target_id} must be hashable") from exc
-            target_by_id[target.target_id] = target
-            if not target.descriptors:
+                raise TypeError(f"Descriptors for Component {component.component_id} must be hashable") from exc
+            component_by_id[component.component_id] = component
+            if not component.descriptors:
                 logger.info(
-                    "Vocoder CUDA Graph Target %s is known but has no startup "
+                    "Vocoder CUDA Graph Component %s is known but has no startup "
                     "Descriptors for the resolved model configuration",
-                    target.target_id,
+                    component.component_id,
                 )
 
         unknown_shared = set(self.config) - _FRAMEWORK_CONFIG_KEYS - self._model_shared_config_keys(model)
@@ -233,45 +231,46 @@ class VocoderCUDAGraphManager:
             names = ", ".join(sorted(unknown_shared))
             raise ValueError(f"Unknown vocoder_cudagraph config key(s): {names}")
 
-        raw_target_configs = self.config.get("targets", {})
-        if not isinstance(raw_target_configs, Mapping):
-            raise TypeError("vocoder_cudagraph.targets must be a mapping")
-        unknown_target_ids = set(raw_target_configs) - set(target_by_id)
-        if unknown_target_ids:
-            names = ", ".join(sorted(str(name) for name in unknown_target_ids))
-            raise ValueError(f"Unknown vocoder CUDA Graph target override(s): {names}")
+        raw_component_configs = self.config.get("components", {})
+        if not isinstance(raw_component_configs, Mapping):
+            raise TypeError("vocoder_cudagraph.components must be a mapping")
+        unknown_component_ids = set(raw_component_configs) - set(component_by_id)
+        if unknown_component_ids:
+            names = ", ".join(sorted(str(name) for name in unknown_component_ids))
+            raise ValueError(f"Unknown vocoder CUDA Graph component override(s): {names}")
 
-        for target_id, target in target_by_id.items():
-            raw_target = raw_target_configs.get(target_id, {})
-            if not isinstance(raw_target, Mapping):
-                raise TypeError(f"vocoder_cudagraph.targets.{target_id} must be a mapping")
-            unknown_keys = set(raw_target) - _TARGET_POLICY_KEYS - set(target.supported_config_keys)
+        for component_id, component in component_by_id.items():
+            raw_component = raw_component_configs.get(component_id, {})
+            if not isinstance(raw_component, Mapping):
+                raise TypeError(f"vocoder_cudagraph.components.{component_id} must be a mapping")
+            unknown_keys = set(raw_component) - _COMPONENT_POLICY_KEYS - set(component.supported_config_keys)
             if unknown_keys:
                 names = ", ".join(sorted(unknown_keys))
-                raise ValueError(f"Unknown config key(s) for vocoder Target {target_id}: {names}")
-            enabled = raw_target.get("enabled", True)
-            lazy = raw_target.get("enable_lazy_capture", False)
-            max_extra = raw_target.get("max_extra_graphs", 0)
-            self._target_configs[target_id] = VocoderTargetRuntimeConfig(
+                raise ValueError(f"Unknown config key(s) for vocoder Component {component_id}: {names}")
+            enabled = raw_component.get("enabled", True)
+            lazy = raw_component.get("enable_lazy_capture", False)
+            max_extra = raw_component.get("max_extra_graphs", 0)
+            self._component_configs[component_id] = VocoderComponentRuntimeConfig(
                 enabled=enabled,
                 enable_lazy_capture=lazy,
                 max_extra_graphs=max_extra,
             )
 
-        self.targets = targets
+        self.components = components
         self._prepared = True
         logger.info(
-            "Prepared runner-owned vocoder CUDA Graph Targets: %s",
-            [target.target_id for target in targets],
+            "Prepared runner-owned vocoder CUDA Graph Components: %s",
+            [component.component_id for component in components],
         )
 
     def capture_entry(
         self,
-        target: VocoderCUDAGraphTarget,
+        component: VocoderCUDAGraphComponent,
         descriptor: VocoderCUDAGraphDescriptor,
     ) -> VocoderCUDAGraphEntry | None:
-        routine = target.routine
+        routine = component.routine
         buffers: object | None = None
+        graph = None
         try:
             buffers = routine.allocate_buffers(descriptor, self.device)
             num_warmups = max(
@@ -306,17 +305,63 @@ class VocoderCUDAGraphManager:
                 captured_output=captured_output,
             )
         except (torch.cuda.OutOfMemoryError, RuntimeError):
+            if graph is not None:
+                graph.reset()
             logger.warning(
-                "Failed to capture vocoder CUDA Graph Target %s Descriptor %r; this Descriptor will remain eager",
-                target.target_id,
+                "Failed to capture vocoder CUDA Graph Component %s Descriptor %r; this Descriptor will remain eager",
+                component.component_id,
                 descriptor,
                 exc_info=True,
             )
             return None
 
+    def profile_memory(self) -> int:
+        """Estimate startup graph memory with throwaway captures."""
+        if not self._prepared:
+            raise RuntimeError("VocoderCUDAGraphManager must be prepared before profiling")
+
+        captured: list[VocoderCUDAGraphEntry] = []
+        estimate = 0
+        try:
+            for component in self.components:
+                component_config = self._component_configs[component.component_id]
+                if not component_config.enabled or not component.descriptors:
+                    continue
+                samples: list[int] = []
+                for descriptor in component.descriptors[:2]:
+                    free_before = self._synchronized_free_memory()
+                    entry = self.capture_entry(component, descriptor)
+                    if entry is None:
+                        continue
+                    free_after = self._synchronized_free_memory()
+                    captured.append(entry)
+                    samples.append(max(0, free_before - free_after))
+                if not samples:
+                    continue
+                first_capture = samples[0]
+                per_graph = max(samples[1] if len(samples) > 1 else 0, 1 << 20)
+                lazy_graphs = component_config.max_extra_graphs if component_config.enable_lazy_capture else 0
+                extra_graphs = len(component.descriptors) - 1 + lazy_graphs
+                estimate += first_capture + per_graph * extra_graphs
+                logger.debug(
+                    "Estimated vocoder Component %s CUDA graph memory: "
+                    "%.2f MiB first-capture + %d x %.2f MiB per-graph",
+                    component.component_id,
+                    first_capture / (1 << 20),
+                    extra_graphs,
+                    per_graph / (1 << 20),
+                )
+        finally:
+            for entry in captured:
+                self._destroy_entry(entry)
+            torch.accelerator.synchronize()
+            torch.accelerator.empty_cache()
+        logger.info("Estimated runner-owned vocoder CUDA graph memory: %.2f MiB", estimate / (1 << 20))
+        return estimate
+
     def _capture_and_register(
         self,
-        managed: ManagedTarget,
+        managed: ManagedComponent,
         descriptor: VocoderCUDAGraphDescriptor,
     ) -> VocoderCUDAGraphEntry | None:
         existing = managed.entries.get(descriptor)
@@ -326,37 +371,43 @@ class VocoderCUDAGraphManager:
         if descriptor in managed.failed_descriptors:
             return None
 
-        allocated_before = self._memory_allocated()
-        entry = self.capture_entry(managed.target, descriptor)
+        entry = self.capture_entry(managed.component, descriptor)
         if entry is None:
             managed.failed_descriptors.add(descriptor)
             return None
-        allocated_after = self._memory_allocated()
-        captured_bytes = max(0, allocated_after - allocated_before)
-        if self.max_memory_bytes is not None and self._captured_memory_bytes + captured_bytes > self.max_memory_bytes:
-            logger.warning(
-                "Vocoder CUDA Graph memory budget rejected Target %s Descriptor %r",
-                managed.target.target_id,
-                descriptor,
-            )
-            return None
 
-        self._captured_memory_bytes += captured_bytes
         managed.entries[descriptor] = entry
         managed.entries.move_to_end(descriptor)
         if managed.max_graphs is not None:
             self._evict_lru_if_needed(managed)
         return entry
 
-    def _evict_lru_if_needed(self, managed: ManagedTarget) -> None:
+    def _evict_lru_if_needed(self, managed: ManagedComponent) -> None:
         assert managed.max_graphs is not None
         while len(managed.entries) > managed.max_graphs:
-            managed.entries.popitem(last=False)
+            self._evict_oldest(managed)
 
-    def _touch_entry(self, managed: ManagedTarget, descriptor: VocoderCUDAGraphDescriptor) -> None:
+    @staticmethod
+    def _destroy_entry(entry: VocoderCUDAGraphEntry) -> None:
+        entry.graph.reset()
+        entry.buffers = None
+        entry.captured_output = None
+
+    def _evict_oldest(self, managed: ManagedComponent) -> None:
+        _, entry = managed.entries.popitem(last=False)
+        self._destroy_entry(entry)
+
+    def _touch_entry(self, managed: ManagedComponent, descriptor: VocoderCUDAGraphDescriptor) -> None:
         with self._capture_lock:
             if descriptor in managed.entries:
                 managed.entries.move_to_end(descriptor)
+
+    def _available_descriptors(
+        self,
+        managed: ManagedComponent,
+    ) -> frozenset[VocoderCUDAGraphDescriptor]:
+        with self._capture_lock:
+            return frozenset(managed.entries.keys())
 
     @contextmanager
     def _runtime_capture_scope(self):
@@ -378,7 +429,7 @@ class VocoderCUDAGraphManager:
 
     def _runtime_capture_and_register(
         self,
-        managed: ManagedTarget,
+        managed: ManagedComponent,
         descriptor: VocoderCUDAGraphDescriptor,
     ) -> VocoderCUDAGraphEntry | None:
         if not managed.enable_lazy_capture:
@@ -400,15 +451,15 @@ class VocoderCUDAGraphManager:
                 entry = self._capture_and_register(managed, descriptor)
             if entry is not None:
                 logger.info(
-                    "Lazy-captured vocoder CUDA Graph Target %s Descriptor %r",
-                    managed.target.target_id,
+                    "Lazy-captured vocoder CUDA Graph Component %s Descriptor %r",
+                    managed.component.component_id,
                     descriptor,
                 )
             return entry
 
     def _make_runtime_miss_handler(
         self,
-        managed: ManagedTarget,
+        managed: ManagedComponent,
     ) -> Callable[[VocoderRuntimeResolution], VocoderCUDAGraphEntry | None]:
         if not managed.enable_lazy_capture:
             return lambda resolution: None
@@ -416,7 +467,7 @@ class VocoderCUDAGraphManager:
         def on_runtime_miss(resolution: VocoderRuntimeResolution) -> VocoderCUDAGraphEntry | None:
             descriptor = resolution.descriptor
             if descriptor is None:
-                descriptor = managed.target.routine.make_lazy_descriptor(resolution.runtime_key)
+                descriptor = managed.component.routine.make_lazy_descriptor(resolution.runtime_key)
             if descriptor is None:
                 return None
             return self._runtime_capture_and_register(managed, descriptor)
@@ -425,18 +476,18 @@ class VocoderCUDAGraphManager:
 
     def _build_runtime_callable(
         self,
-        managed: ManagedTarget,
-        recorder: _TargetRecorder | _NoOpRecorder,
+        managed: ManagedComponent,
+        recorder: _ComponentRecorder | _NoOpRecorder,
     ) -> Callable[..., Any]:
-        target = managed.target
+        component = managed.component
         entries = MappingProxyType(managed.entries)
-        routine = target.routine
+        routine = component.routine
         on_runtime_miss = self._make_runtime_miss_handler(managed)
-        clone_output = target.clone_output
+        clone_output = component.clone_output
 
         def runtime_callable(*args: Any, **kwargs: Any) -> Any:
             routine.validate_runtime_inputs(args, kwargs)
-            resolution = routine.resolve_runtime(args, kwargs, entries.keys())
+            resolution = routine.resolve_runtime(args, kwargs, self._available_descriptors(managed))
             entry = entries.get(resolution.descriptor) if resolution.descriptor is not None else None
             if entry is None:
                 entry = on_runtime_miss(resolution)
@@ -478,32 +529,34 @@ class VocoderCUDAGraphManager:
         self._capture_finished = True
 
         capture_start = time.perf_counter()
-        memory_before = self._memory_allocated()
-        prepared: dict[str, ManagedTarget] = {}
+        free_before = self._synchronized_free_memory()
+        prepared: dict[str, ManagedComponent] = {}
 
-        # Phase 1: every Target remains eager until all startup captures finish.
-        selected = [target for target in self.targets if self._target_configs[target.target_id].enabled]
-        for target in selected:
-            target_config = self._target_configs[target.target_id]
-            if target._bound_handle is not None:
-                raise RuntimeError(f"Target already bound before capture: {target.target_id}")
-            managed = ManagedTarget(
-                target=target,
+        # Phase 1: every Component remains eager until all startup captures finish.
+        selected = [
+            component for component in self.components if self._component_configs[component.component_id].enabled
+        ]
+        for component in selected:
+            component_config = self._component_configs[component.component_id]
+            if component._bound_handle is not None:
+                raise RuntimeError(f"Component already bound before capture: {component.component_id}")
+            managed = ManagedComponent(
+                component=component,
                 entries=OrderedDict(),
-                enable_lazy_capture=target_config.enable_lazy_capture,
+                enable_lazy_capture=component_config.enable_lazy_capture,
             )
             progress = (
                 tqdm(
-                    total=len(target.descriptors),
-                    desc=f"Capture {target.target_id}",
+                    total=len(component.descriptors),
+                    desc=f"Capture {component.component_id}",
                     unit="graph",
                     leave=True,
                 )
-                if target.descriptors
+                if component.descriptors
                 else None
             )
             try:
-                for descriptor in target.descriptors:
+                for descriptor in component.descriptors:
                     try:
                         self._capture_and_register(managed, descriptor)
                     finally:
@@ -513,33 +566,38 @@ class VocoderCUDAGraphManager:
                 if progress is not None:
                     progress.close()
             logger.info(
-                "Vocoder CUDA Graph Target %s captured %d/%d startup Descriptors",
-                target.target_id,
+                "Vocoder CUDA Graph Component %s captured %d/%d startup Descriptors",
+                component.component_id,
                 len(managed.entries),
-                len(target.descriptors),
+                len(component.descriptors),
             )
-            managed.max_graphs = len(managed.entries) + target_config.max_extra_graphs
+            managed.max_graphs = len(managed.entries) + component_config.max_extra_graphs
             if not managed.entries and not managed.enable_lazy_capture:
                 continue
-            prepared[target.target_id] = managed
+            prepared[component.component_id] = managed
 
         # Phase 2: runtime assembly/binding failures are programming or
         # lifecycle errors and must propagate after capture has completed.
-        active: dict[str, ManagedTarget] = {}
-        for target_id, managed in prepared.items():
-            target = managed.target
+        active: dict[str, ManagedComponent] = {}
+        for component_id, managed in prepared.items():
+            component = managed.component
             runtime_callable = self._build_runtime_callable(
                 managed,
-                self.stats_sink.recorder_for(target_id),
+                self.stats_sink.recorder_for(component_id),
             )
             # Bind one opaque runtime endpoint to the stable model-owned
-            # Target; GraphEntry/Descriptor internals stay manager-owned.
-            target._bind_handle(VocoderGraphHandle(runtime_callable))
-            active[target_id] = managed
+            # Component; GraphEntry/Descriptor internals stay manager-owned.
+            component._bind_handle(
+                VocoderGraphHandle(
+                    runtime_callable,
+                    lambda managed=managed: self._available_descriptors(managed),
+                )
+            )
+            active[component_id] = managed
 
-        self.managed_targets = active
-        memory_after = self._memory_allocated()
-        captured_memory = max(0, memory_after - memory_before)
+        self.managed_components = active
+        free_after = self._synchronized_free_memory()
+        captured_memory = max(0, free_before - free_after)
         logger.info(
             "Vocoder CUDA Graph capture finished in %.2fs, bound=%s, memory=%.2f MiB",
             time.perf_counter() - capture_start,
@@ -549,11 +607,12 @@ class VocoderCUDAGraphManager:
         return captured_memory
 
     def clear(self) -> None:
-        for managed in self.managed_targets.values():
-            managed.target._restore_eager()
-            managed.entries.clear()
+        for managed in self.managed_components.values():
+            managed.component._restore_eager()
+            while managed.entries:
+                self._evict_oldest(managed)
             managed.failed_descriptors.clear()
-        self.managed_targets.clear()
+        self.managed_components.clear()
         self._runtime_capture_stream = None
         if self.stats_sink.enabled:
             logger.info("Vocoder CUDA Graph runtime stats: %s", self.stats_sink.snapshot())

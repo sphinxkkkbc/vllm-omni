@@ -13,8 +13,8 @@ import torch
 
 from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
     BaseVocoderCUDAGraphRoutine,
+    VocoderCUDAGraphComponent,
     VocoderCUDAGraphDescriptor,
-    VocoderCUDAGraphTarget,
     VocoderRuntimeKey,
     VocoderRuntimeResolution,
 )
@@ -35,7 +35,7 @@ class _StaticBuffers:
 
 
 class _StaticAllocationRoutine(BaseVocoderCUDAGraphRoutine):
-    target_id = "static-allocation"
+    component_id = "static-allocation"
 
     @property
     def runnable(self):
@@ -102,18 +102,18 @@ class _StaticModel:
     supports_vocoder_cudagraph = True
     vocoder_cudagraph_shared_config_keys = frozenset()
 
-    def __init__(self, target: VocoderCUDAGraphTarget) -> None:
-        self.target = target
+    def __init__(self, component: VocoderCUDAGraphComponent) -> None:
+        self.component = component
 
-    def get_vocoder_cudagraph_targets(self) -> tuple[VocoderCUDAGraphTarget, ...]:
-        return (self.target,)
+    def get_vocoder_cudagraph_components(self) -> tuple[VocoderCUDAGraphComponent, ...]:
+        return (self.component,)
 
 
 def _vllm_config() -> Any:
     return SimpleNamespace(
         model_config=SimpleNamespace(
             vocoder_cudagraph_config={
-                "targets": {
+                "components": {
                     "static-allocation": {
                         "enable_lazy_capture": True,
                         "max_extra_graphs": 1,
@@ -130,26 +130,26 @@ def test_runtime_lazy_capture_preserves_existing_graph_after_static_allocation_g
     routine = _StaticAllocationRoutine()
     descriptor_a = VocoderCUDAGraphDescriptor(1)
     descriptor_b = VocoderCUDAGraphDescriptor(4096)
-    target = VocoderCUDAGraphTarget("static-allocation", routine, [descriptor_a])
+    component = VocoderCUDAGraphComponent("static-allocation", routine, [descriptor_a])
     manager = VocoderCUDAGraphManager(vllm_config=_vllm_config(), device=device)
 
     try:
-        manager.prepare(_StaticModel(target))
+        manager.prepare(_StaticModel(component))
         manager.capture_and_bind()
 
-        output_a = target(torch.zeros(1, device=device))
+        output_a = component(torch.zeros(1, device=device))
         torch.accelerator.synchronize(device)
         torch.testing.assert_close(output_a, torch.ones(1, device=device))
 
-        managed = manager.managed_targets["static-allocation"]
+        managed = manager.managed_components["static-allocation"]
         entry_b = manager._runtime_capture_and_register(managed, descriptor_b)
         assert entry_b is not None
 
-        output_b = target(torch.zeros(4096, device=device))
+        output_b = component(torch.zeros(4096, device=device))
         torch.accelerator.synchronize(device)
         torch.testing.assert_close(output_b, torch.full((1,), 4096.0, device=device))
 
-        output_a_again = target(torch.zeros(1, device=device))
+        output_a_again = component(torch.zeros(1, device=device))
         torch.accelerator.synchronize(device)
         torch.testing.assert_close(output_a_again, torch.ones(1, device=device))
     finally:

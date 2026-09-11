@@ -442,7 +442,7 @@ class OmniEngineArgs(EngineArgs):
             stage_id=self.stage_id,
             async_chunk=self.async_chunk,
             session_mode=self.session_mode,
-            vocoder_cudagraph=self.vocoder_cudagraph,
+            vocoder_cudagraph_config=self.vocoder_cudagraph,
             retains_state_across_chunks=self.retains_state_across_chunks,
             supports_running_prefix_cache_reset=self.supports_running_prefix_cache_reset,
             use_v2_model_runner=self.use_v2_model_runner,
