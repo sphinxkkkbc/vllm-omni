@@ -207,12 +207,14 @@ class VocoderCUDAGraphComponent:
         clone_output: bool = True,
         *,
         supported_config_keys: Set[str] = frozenset(),
+        capture_order_key: Callable[[VocoderCUDAGraphDescriptor], Any] | None = None,
     ) -> None:
         self.component_id = component_id
         self.routine = routine
         self.descriptors = tuple(descriptors)
         self.clone_output = bool(clone_output)
         self.supported_config_keys = frozenset(supported_config_keys)
+        self._capture_order_key = capture_order_key
         self._delegate: Callable[..., Any] = routine.eager_call
         # The Component owns the stable call site, not the runtime Handle
         # lifecycle. The Manager constructs and binds the Handle after capture.
@@ -220,6 +222,23 @@ class VocoderCUDAGraphComponent:
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self._delegate(*args, **kwargs)
+
+    @property
+    def capture_descriptors(self) -> tuple[VocoderCUDAGraphDescriptor, ...]:
+        """Startup descriptors ordered to establish the largest graph first.
+
+        By default the Descriptor variant is the ordering key. Components whose
+        variants do not directly express graph size may provide
+        ``capture_order_key`` instead.
+        """
+
+        key = self._capture_order_key or (lambda descriptor: descriptor.variant)
+        try:
+            return tuple(sorted(self.descriptors, key=key, reverse=True))
+        except TypeError as exc:
+            raise TypeError(
+                f"Component {self.component_id} needs capture_order_key for non-orderable Descriptor variants"
+            ) from exc
 
     @property
     def is_graph_bound(self) -> bool:

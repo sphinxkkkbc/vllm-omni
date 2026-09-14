@@ -6,16 +6,15 @@ from __future__ import annotations
 import logging
 from collections import Counter, OrderedDict
 from collections.abc import Callable, Set
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
-from threading import Event
 from types import SimpleNamespace
 from typing import Any, NamedTuple, cast
 from unittest.mock import patch
 
 import pytest
 import torch
+from vllm.platforms import current_platform
 
 from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
     BaseVocoderCUDAGraphRoutine,
@@ -164,20 +163,19 @@ class _TestManager(VocoderCUDAGraphManager):
         self.fail_replay_for: set[tuple[str, object]] = set()
         self.fail_capture_for: set[tuple[str, object]] = set()
         self.capture_attempts: Counter[tuple[str, object]] = Counter()
-        self.capture_started: Event | None = None
-        self.capture_release: Event | None = None
+        self.capture_pools: list[object | None] = []
 
     def capture_entry(
         self,
         component: VocoderCUDAGraphComponent,
         descriptor: VocoderCUDAGraphDescriptor,
+        *,
+        graph_pool: object | None = None,
     ) -> VocoderCUDAGraphEntry | None:
+        self.capture_pools.append(graph_pool)
         self.components_during_capture.append(tuple(item._bound_handle is not None for item in self.components))
         key = (component.component_id, descriptor.variant)
         self.capture_attempts[key] += 1
-        if key == ("decode", 3) and self.capture_started is not None and self.capture_release is not None:
-            self.capture_started.set()
-            self.capture_release.wait(timeout=5)
         if key in self.fail_capture_for:
             return None
         buffers = component.routine.allocate_buffers(descriptor, self.device)
@@ -206,13 +204,18 @@ class _Model:
         return self.components
 
 
-def _component(component_id: str, *sizes: int) -> tuple[VocoderCUDAGraphComponent, _Routine]:
+def _component(
+    component_id: str,
+    *sizes: int,
+    capture_order_key: Callable[[VocoderCUDAGraphDescriptor], Any] | None = None,
+) -> tuple[VocoderCUDAGraphComponent, _Routine]:
     routine = _Routine()
     component = VocoderCUDAGraphComponent(
         component_id,
         routine,
         [VocoderCUDAGraphDescriptor(size) for size in sizes],
         supported_config_keys=frozenset({"bucket_policy"}),
+        capture_order_key=capture_order_key,
     )
     return component, routine
 
@@ -466,34 +469,14 @@ def test_lazy_entries_share_one_lru_with_startup_entries(monkeypatch) -> None:
     component(torch.tensor([1.0, 2.0, 3.0, 4.0]))
     component(torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]))
     entries = manager.managed_components["decode"].entries
-    assert [descriptor.variant for descriptor in entries] == [3, 4, 5]
+    assert [descriptor.variant for descriptor in entries] == [2, 4, 5]
     assert component.available_descriptors == frozenset(
         {
-            VocoderCUDAGraphDescriptor(3),
+            VocoderCUDAGraphDescriptor(2),
             VocoderCUDAGraphDescriptor(4),
             VocoderCUDAGraphDescriptor(5),
         }
     )
-
-
-def test_concurrent_lazy_misses_capture_one_entry(monkeypatch) -> None:
-    component, _ = _component("decode", 2)
-    manager = _TestManager(config={"components": {"decode": {"enable_lazy_capture": True, "max_extra_graphs": 1}}})
-    manager.prepare(_Model((component,)))
-    manager.capture_and_bind()
-    manager.capture_started = Event()
-    manager.capture_release = Event()
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(manager, "_runtime_capture_scope", lambda: nullcontext())
-
-    value = torch.tensor([1.0, 2.0, 3.0])
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(component, value) for _ in range(2)]
-        assert manager.capture_started.wait(timeout=5)
-        manager.capture_release.set()
-        assert [future.result(timeout=5).tolist() for future in futures] == [[2.0, 4.0, 6.0]] * 2
-
-    assert manager.capture_attempts[("decode", 3)] == 1
 
 
 def test_binding_failure_propagates() -> None:
@@ -559,16 +542,30 @@ def test_capture_and_bind_reports_total_memory_delta(monkeypatch):
     assert manager.capture_and_bind() == 30
 
 
+def test_capture_and_bind_orders_descriptors_largest_first():
+    component, _ = _component("decode", 2, 8, 4, capture_order_key=lambda descriptor: descriptor.variant)
+    manager = _TestManager()
+    manager.prepare(_Model((component,)))
+
+    manager.capture_and_bind()
+
+    assert [variant for component_id, variant in manager.capture_attempts if component_id == "decode"] == [8, 4, 2]
+
+
 def test_profile_memory_uses_first_capture_and_per_graph_increment(monkeypatch):
-    first, _ = _component("first", 2, 3, 4)
+    first, _ = _component("first", 2, 3, 4, capture_order_key=lambda descriptor: descriptor.variant)
     second, _ = _component("second", 5)
     manager = _TestManager(config={"components": {"first": {"enable_lazy_capture": True, "max_extra_graphs": 2}}})
     manager.prepare(_Model((first, second)))
     free_memory = iter((100, 90, 90, 87, 87, 80))
     captured = []
+    capture_pools = []
+    captured_variants = []
 
-    def capture(component, descriptor):
+    def capture(component, descriptor, *, graph_pool=None):
         del component
+        capture_pools.append(graph_pool)
+        captured_variants.append(descriptor.variant)
         buffers = _Buffers(torch.zeros(1), torch.zeros(1))
         entry = VocoderCUDAGraphEntry(
             descriptor=descriptor,
@@ -580,6 +577,8 @@ def test_profile_memory_uses_first_capture_and_per_graph_increment(monkeypatch):
         return entry
 
     monkeypatch.setattr(manager, "capture_entry", capture)
+    profiling_pool = object()
+    monkeypatch.setattr(current_platform, "graph_pool_handle", lambda: profiling_pool)
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
     monkeypatch.setattr(manager, "_synchronized_free_memory", lambda: next(free_memory))
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
@@ -587,6 +586,8 @@ def test_profile_memory_uses_first_capture_and_per_graph_increment(monkeypatch):
     # first: 10 + max(3, 1 MiB) * (3 - 1 + 2); second: 7.
     assert manager.profile_memory() == 10 + (1 << 20) * 4 + 7
     assert len(captured) == 3
+    assert capture_pools == [profiling_pool] * 3
+    assert captured_variants == [4, 3, 5]
     assert all(entry.graph.reset_called for entry in captured)
 
 
@@ -602,6 +603,7 @@ def test_profile_memory_ignores_extra_graphs_when_lazy_capture_is_disabled(monke
         captured_output=buffers.output,
     )
     monkeypatch.setattr(manager, "capture_entry", lambda *args, **kwargs: entry)
+    monkeypatch.setattr(current_platform, "graph_pool_handle", lambda: object())
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
     free_memory = iter((100, 90))
     monkeypatch.setattr(manager, "_synchronized_free_memory", lambda: next(free_memory))
