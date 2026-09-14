@@ -40,7 +40,6 @@ class VocoderCUDAGraphEntry:
     graph: torch.cuda.CUDAGraph
     buffers: object
     captured_output: object
-    replay_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
 
 _FRAMEWORK_CONFIG_KEYS = frozenset(
@@ -173,7 +172,6 @@ class VocoderCUDAGraphManager:
         self.components: tuple[VocoderCUDAGraphComponent, ...] = ()
         self.managed_components: dict[str, ManagedComponent] = {}
         self._component_configs: dict[str, VocoderComponentRuntimeConfig] = {}
-        self._capture_lock = threading.RLock()
         self._runtime_capture_stream: torch.cuda.Stream | None = None
         self._prepared = False
         self._capture_finished = False
@@ -267,6 +265,8 @@ class VocoderCUDAGraphManager:
         self,
         component: VocoderCUDAGraphComponent,
         descriptor: VocoderCUDAGraphDescriptor,
+        *,
+        graph_pool: object | None = None,
     ) -> VocoderCUDAGraphEntry | None:
         routine = component.routine
         buffers: object | None = None
@@ -292,7 +292,7 @@ class VocoderCUDAGraphManager:
                     torch.inference_mode(),
                     torch.cuda.graph(
                         graph,
-                        pool=current_platform.get_global_graph_pool(),
+                        pool=(current_platform.get_global_graph_pool() if graph_pool is None else graph_pool),
                     ),
                 ):
                     captured_output = routine.forward_for_capture(buffers)
@@ -320,6 +320,7 @@ class VocoderCUDAGraphManager:
         if not self._prepared:
             raise RuntimeError("VocoderCUDAGraphManager must be prepared before profiling")
 
+        profiling_pool = current_platform.graph_pool_handle()
         captured: list[VocoderCUDAGraphEntry] = []
         estimate = 0
         try:
@@ -328,9 +329,9 @@ class VocoderCUDAGraphManager:
                 if not component_config.enabled or not component.descriptors:
                     continue
                 samples: list[int] = []
-                for descriptor in component.descriptors[:2]:
+                for descriptor in component.capture_descriptors[:2]:
                     free_before = self._synchronized_free_memory()
-                    entry = self.capture_entry(component, descriptor)
+                    entry = self.capture_entry(component, descriptor, graph_pool=profiling_pool)
                     if entry is None:
                         continue
                     free_after = self._synchronized_free_memory()
@@ -341,7 +342,7 @@ class VocoderCUDAGraphManager:
                 first_capture = samples[0]
                 per_graph = max(samples[1] if len(samples) > 1 else 0, 1 << 20)
                 lazy_graphs = component_config.max_extra_graphs if component_config.enable_lazy_capture else 0
-                extra_graphs = len(component.descriptors) - 1 + lazy_graphs
+                extra_graphs = len(component.capture_descriptors) - 1 + lazy_graphs
                 estimate += first_capture + per_graph * extra_graphs
                 logger.debug(
                     "Estimated vocoder Component %s CUDA graph memory: "
@@ -398,16 +399,14 @@ class VocoderCUDAGraphManager:
         self._destroy_entry(entry)
 
     def _touch_entry(self, managed: ManagedComponent, descriptor: VocoderCUDAGraphDescriptor) -> None:
-        with self._capture_lock:
-            if descriptor in managed.entries:
-                managed.entries.move_to_end(descriptor)
+        if descriptor in managed.entries:
+            managed.entries.move_to_end(descriptor)
 
     def _available_descriptors(
         self,
         managed: ManagedComponent,
     ) -> frozenset[VocoderCUDAGraphDescriptor]:
-        with self._capture_lock:
-            return frozenset(managed.entries.keys())
+        return frozenset(managed.entries.keys())
 
     @contextmanager
     def _runtime_capture_scope(self):
@@ -438,24 +437,23 @@ class VocoderCUDAGraphManager:
             return None
         if torch.cuda.is_current_stream_capturing():
             return None
-        with self._capture_lock:
-            existing = managed.entries.get(descriptor)
-            if existing is not None:
-                managed.entries.move_to_end(descriptor)
-                return existing
-            if descriptor in managed.failed_descriptors:
-                return None
-            if managed.max_graphs == 0:
-                return None
-            with self._runtime_capture_scope():
-                entry = self._capture_and_register(managed, descriptor)
-            if entry is not None:
-                logger.info(
-                    "Lazy-captured vocoder CUDA Graph Component %s Descriptor %r",
-                    managed.component.component_id,
-                    descriptor,
-                )
-            return entry
+        existing = managed.entries.get(descriptor)
+        if existing is not None:
+            managed.entries.move_to_end(descriptor)
+            return existing
+        if descriptor in managed.failed_descriptors:
+            return None
+        if managed.max_graphs == 0:
+            return None
+        with self._runtime_capture_scope():
+            entry = self._capture_and_register(managed, descriptor)
+        if entry is not None:
+            logger.info(
+                "Lazy-captured vocoder CUDA Graph Component %s Descriptor %r",
+                managed.component.component_id,
+                descriptor,
+            )
+        return entry
 
     def _make_runtime_miss_handler(
         self,
@@ -504,19 +502,18 @@ class VocoderCUDAGraphManager:
                     descriptor=descriptor,
                 )
             )
-            with entry.replay_lock:
-                try:
-                    routine.copy_runtime_inputs(args, kwargs, entry.buffers)
-                    entry.graph.replay()
-                    output = routine.output_after_replay(args, kwargs, entry.buffers, entry.captured_output)
-                    if clone_output:
-                        output = clone_tensor_tree(output)
-                except Exception:
-                    recorder.record_replay_error(graph_resolution)
-                    raise
-                if managed.enable_lazy_capture:
-                    self._touch_entry(managed, descriptor)
-                recorder.record_graph_hit(graph_resolution)
+            try:
+                routine.copy_runtime_inputs(args, kwargs, entry.buffers)
+                entry.graph.replay()
+                output = routine.output_after_replay(args, kwargs, entry.buffers, entry.captured_output)
+                if clone_output:
+                    output = clone_tensor_tree(output)
+            except Exception:
+                recorder.record_replay_error(graph_resolution)
+                raise
+            if managed.enable_lazy_capture:
+                self._touch_entry(managed, descriptor)
+            recorder.record_graph_hit(graph_resolution)
             return output
 
         return runtime_callable
@@ -545,18 +542,19 @@ class VocoderCUDAGraphManager:
                 entries=OrderedDict(),
                 enable_lazy_capture=component_config.enable_lazy_capture,
             )
+            capture_descriptors = component.capture_descriptors
             progress = (
                 tqdm(
-                    total=len(component.descriptors),
+                    total=len(capture_descriptors),
                     desc=f"Capture {component.component_id}",
                     unit="graph",
                     leave=True,
                 )
-                if component.descriptors
+                if capture_descriptors
                 else None
             )
             try:
-                for descriptor in component.descriptors:
+                for descriptor in capture_descriptors:
                     try:
                         self._capture_and_register(managed, descriptor)
                     finally:
@@ -569,7 +567,7 @@ class VocoderCUDAGraphManager:
                 "Vocoder CUDA Graph Component %s captured %d/%d startup Descriptors",
                 component.component_id,
                 len(managed.entries),
-                len(component.descriptors),
+                len(capture_descriptors),
             )
             managed.max_graphs = len(managed.entries) + component_config.max_extra_graphs
             if not managed.entries and not managed.enable_lazy_capture:
