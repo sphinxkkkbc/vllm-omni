@@ -28,6 +28,7 @@ from vllm_omni.worker.vocoder_cudagraph_manager import (
     ManagedComponent,
     VocoderCUDAGraphEntry,
     VocoderCUDAGraphManager,
+    VocoderGraphStatsSink,
     clone_tensor_tree,
 )
 
@@ -176,6 +177,8 @@ class _TestManager(VocoderCUDAGraphManager):
         self.components_during_capture.append(tuple(item._bound_handle is not None for item in self.components))
         key = (component.component_id, descriptor.variant)
         self.capture_attempts[key] += 1
+        if not component.validate_descriptor(descriptor):
+            return None
         if key in self.fail_capture_for:
             return None
         buffers = component.routine.allocate_buffers(descriptor, self.device)
@@ -228,6 +231,28 @@ def test_handle_exposes_runtime_call_and_read_only_graph_coverage() -> None:
     assert not hasattr(handle, "capture")
     assert not hasattr(handle, "replay")
     assert not hasattr(handle, "entries")
+
+
+def test_component_descriptor_validation_defaults_to_capture() -> None:
+    component, _ = _component("decode", 2)
+
+    assert component.validate_descriptor(VocoderCUDAGraphDescriptor(2))
+
+
+def test_stats_sink_bounds_detail_items_but_preserves_aggregate_counters() -> None:
+    sink = VocoderGraphStatsSink(enabled=True, max_log_items=2)
+    for variant in (1, 2, 3):
+        resolution = VocoderRuntimeResolution(
+            runtime_key=VocoderRuntimeKey(variant),
+            descriptor=VocoderCUDAGraphDescriptor(variant),
+        )
+        sink.record("hit", "decode", resolution)
+
+    snapshot = sink.snapshot()
+    assert snapshot["calls"] == {"decode": 3}
+    assert snapshot["outcomes"] == {("decode", "hit"): 3}
+    assert snapshot["descriptors"] == {("decode", 2): 1, ("decode", 3): 1}
+    assert snapshot["runtime_keys"] == {("decode", 2): 1, ("decode", 3): 1}
 
 
 def test_runtime_lazy_capture_logs_only_new_entries(monkeypatch) -> None:
@@ -378,6 +403,24 @@ def test_config_validation_catches_unknown_shared_component_and_extension_keys()
         manager.prepare(_Model((component,)))
 
 
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("enabled", 1, "must be a boolean"),
+        ("enable_lazy_capture", "true", "must be a boolean"),
+        ("max_extra_graphs", True, "must be a non-negative integer"),
+        ("max_extra_graphs", -1, "must be a non-negative integer"),
+        ("max_extra_graphs", 1.0, "must be a non-negative integer"),
+    ],
+)
+def test_component_policy_validation_rejects_invalid_types(key, value, message) -> None:
+    component, _ = _component("decode", 2)
+    manager = _TestManager(config={"components": {"decode": {key: value}}})
+
+    with pytest.raises(TypeError, match=message):
+        manager.prepare(_Model((component,)))
+
+
 def test_component_registry_rejects_duplicate_ids_and_descriptors() -> None:
     first, _ = _component("decode", 2)
     duplicate_id, _ = _component("decode", 3)
@@ -407,7 +450,7 @@ def test_disabled_component_remains_on_original_eager_callable() -> None:
     assert routine.eager_calls == 1
 
 
-def test_failed_descriptor_is_negative_cached_across_runtime_misses() -> None:
+def test_descriptor_rejection_falls_back_to_eager_without_capture(monkeypatch) -> None:
     component, routine = _component("decode", 2)
     manager = _TestManager(
         config={
@@ -419,15 +462,24 @@ def test_failed_descriptor_is_negative_cached_across_runtime_misses() -> None:
             }
         }
     )
-    manager.fail_capture_for.add(("decode", 2))
+    validation_calls = []
+
+    def reject(descriptor):
+        validation_calls.append(descriptor)
+        return False
+
+    component.validate_descriptor = reject
     manager.prepare(_Model((component,)))
     manager.capture_and_bind()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(manager, "_runtime_capture_scope", nullcontext)
 
     value = torch.tensor([1.0, 2.0])
     assert torch.equal(component(value), value * 2)
     assert torch.equal(component(value), value * 2)
     assert routine.eager_calls == 2
-    assert manager.capture_attempts[("decode", 2)] == 1
+    assert manager.capture_attempts[("decode", 2)] == 3
+    assert validation_calls == [VocoderCUDAGraphDescriptor(2)] * 3
 
 
 def test_successful_lazy_miss_registers_descriptor_and_replays_current_call(monkeypatch) -> None:
@@ -506,16 +558,38 @@ def test_prepare_and_capture_are_single_use_lifecycle_operations() -> None:
         manager.capture_and_bind()
 
 
-def test_capture_failure_isolated_to_descriptor_and_sibling_component() -> None:
+def test_descriptor_rejection_isolated_to_sibling_component() -> None:
     first, _ = _component("first", 2, 3)
     second, _ = _component("second", 4)
     manager = _TestManager()
-    manager.fail_capture_for.add(("first", 2))
+    first.validate_descriptor = lambda descriptor: descriptor.variant != 2
     manager.prepare(_Model((first, second)))
     manager.capture_and_bind()
 
     assert list(manager.managed_components["first"].entries) == [VocoderCUDAGraphDescriptor(3)]
     assert list(manager.managed_components["second"].entries) == [VocoderCUDAGraphDescriptor(4)]
+
+
+def test_capture_failure_propagates() -> None:
+    class _FailingRoutine(_Routine):
+        def allocate_buffers(self, descriptor, device):
+            del descriptor, device
+            raise RuntimeError("capture allocation failed")
+
+    component = VocoderCUDAGraphComponent(
+        "decode",
+        _FailingRoutine(),
+        [VocoderCUDAGraphDescriptor(2)],
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(vocoder_cudagraph_config=None),
+        compilation_config=SimpleNamespace(cudagraph_num_of_warmups=0),
+    )
+    manager = VocoderCUDAGraphManager(vllm_config=vllm_config, device=torch.device("cpu"))
+    manager.prepare(_Model((component,)))
+
+    with pytest.raises(RuntimeError, match="capture allocation failed"):
+        manager.capture_and_bind()
 
 
 def test_capture_and_bind_reports_total_memory_delta(monkeypatch):

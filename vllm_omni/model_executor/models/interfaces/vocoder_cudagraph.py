@@ -223,6 +223,11 @@ class VocoderCUDAGraphComponent:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self._delegate(*args, **kwargs)
 
+    def validate_descriptor(self, descriptor: VocoderCUDAGraphDescriptor) -> bool:
+        """Validate a descriptor against the Component's supported variants."""
+        del descriptor
+        return True
+
     @property
     def capture_descriptors(self) -> tuple[VocoderCUDAGraphDescriptor, ...]:
         """Startup descriptors ordered to establish the largest graph first.
