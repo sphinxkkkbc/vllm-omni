@@ -9,7 +9,8 @@ packages depend on these declarations; the worker-side manager consumes them.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Hashable, Sequence, Set
+from collections.abc import Callable, Generator, Hashable, Sequence, Set
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from typing import Any, ClassVar, Generic, Literal, Protocol, TypeVar, runtime_checkable
 
@@ -123,6 +124,10 @@ class VocoderCUDAGraphRoutine(Protocol):
         """
         ...
 
+    def capture_context(
+        self, descriptor: VocoderCUDAGraphDescriptor, buffers: object
+    ) -> AbstractContextManager[None]: ...
+
     def forward_for_capture(self, buffers: object) -> object: ...
 
     def after_capture(self, buffers: object) -> None:
@@ -189,6 +194,15 @@ class BaseVocoderCUDAGraphRoutine:
 
     def after_capture(self, buffers: object) -> None:
         del buffers
+
+    @contextmanager
+    def capture_context(self, descriptor: VocoderCUDAGraphDescriptor, buffers: object) -> Generator[None, None, None]:
+        del descriptor
+        self.prepare_for_capture(buffers)
+        try:
+            yield
+        finally:
+            self.after_capture(buffers)
 
 
 class VocoderCUDAGraphComponent:
