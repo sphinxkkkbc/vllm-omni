@@ -295,16 +295,11 @@ class VocoderCUDAGraphManager:
             int(getattr(self.vllm_config.compilation_config, "cudagraph_num_of_warmups", 0)),
         )
         for _ in range(num_warmups):
-            # Prepare the reusable static buffers before every warmup.
-            routine.prepare_for_capture(buffers)
-            try:
+            with routine.capture_context(descriptor, buffers):
                 routine.forward_for_capture(buffers)
-            finally:
-                routine.after_capture(buffers)
-        routine.prepare_for_capture(buffers)
         torch.cuda.current_stream(self.device).synchronize()
         graph = torch.cuda.CUDAGraph()
-        try:
+        with routine.capture_context(descriptor, buffers):
             with (
                 torch.inference_mode(),
                 torch.cuda.graph(
@@ -313,8 +308,6 @@ class VocoderCUDAGraphManager:
                 ),
             ):
                 captured_output = routine.forward_for_capture(buffers)
-        finally:
-            routine.after_capture(buffers)
         return VocoderCUDAGraphEntry(
             descriptor=descriptor,
             graph=graph,

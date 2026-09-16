@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 from collections import Counter, OrderedDict
 from collections.abc import Callable, Set
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, NamedTuple, cast
@@ -153,6 +153,58 @@ class _Routine(BaseVocoderCUDAGraphRoutine):
         return captured_output[: args[0].numel()]
 
 
+class _LifecycleRoutine(_Routine):
+    def __init__(self, *, fail_forward: bool = False, context_only: bool = False) -> None:
+        super().__init__()
+        self.events: list[str] = []
+        self.fail_forward = fail_forward
+        self.context_only = context_only
+
+    def prepare_for_capture(self, buffers: object) -> None:
+        del buffers
+        if self.context_only:
+            raise AssertionError("manager called prepare_for_capture directly")
+        self.events.append("prepare")
+
+    def forward_for_capture(self, buffers: object) -> torch.Tensor:
+        if self.context_only:
+            return _Routine.forward_for_capture(self, buffers)
+        self.events.append("forward")
+        if self.fail_forward:
+            raise RuntimeError("capture forward failed")
+        return super().forward_for_capture(buffers)
+
+    def after_capture(self, buffers: object) -> None:
+        del buffers
+        if self.context_only:
+            raise AssertionError("manager called after_capture directly")
+        self.events.append("after")
+
+    @contextmanager
+    def capture_context(self, descriptor: VocoderCUDAGraphDescriptor, buffers: object):
+        if self.context_only:
+            del descriptor, buffers
+            self.events.append("context-enter")
+            try:
+                yield
+            finally:
+                self.events.append("context-exit")
+            return
+        with super().capture_context(descriptor, buffers):
+            yield
+
+
+class _ScopedLifecycleRoutine(_LifecycleRoutine):
+    @contextmanager
+    def capture_context(self, descriptor: VocoderCUDAGraphDescriptor, buffers: object):
+        self.events.append("scope-enter")
+        try:
+            with super().capture_context(descriptor, buffers):
+                yield
+        finally:
+            self.events.append("scope-exit")
+
+
 class _TestManager(VocoderCUDAGraphManager):
     def __init__(self, *, config: dict[str, Any] | None = None) -> None:
         vllm_config = SimpleNamespace(
@@ -223,6 +275,20 @@ def _component(
     return component, routine
 
 
+def _manager_for_capture(*, warmups: int) -> VocoderCUDAGraphManager:
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(vocoder_cudagraph_config=None),
+        compilation_config=SimpleNamespace(cudagraph_num_of_warmups=warmups),
+    )
+    return VocoderCUDAGraphManager(vllm_config=vllm_config, device=torch.device("cpu"))
+
+
+def _mock_cuda_capture(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: SimpleNamespace(synchronize=lambda: None))
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", object)
+    monkeypatch.setattr(torch.cuda, "graph", lambda *_args, **_kwargs: nullcontext())
+
+
 def test_handle_exposes_runtime_call_and_read_only_graph_coverage() -> None:
     handle = VocoderGraphHandle(lambda value, *, offset=0: value + offset)
 
@@ -237,6 +303,50 @@ def test_component_descriptor_validation_defaults_to_capture() -> None:
     component, _ = _component("decode", 2)
 
     assert component.validate_descriptor(VocoderCUDAGraphDescriptor(2))
+
+
+def test_capture_context_wraps_each_warmup_and_capture_forward(monkeypatch) -> None:
+    routine = _LifecycleRoutine()
+    component = VocoderCUDAGraphComponent("decode", routine, [VocoderCUDAGraphDescriptor(2)])
+    manager = _manager_for_capture(warmups=2)
+    _mock_cuda_capture(monkeypatch)
+
+    manager.capture_entry(component, VocoderCUDAGraphDescriptor(2), graph_pool=object())
+
+    assert routine.events == ["prepare", "forward", "after"] * 3
+
+
+def test_capture_context_runs_cleanup_when_forward_raises() -> None:
+    routine = _LifecycleRoutine(fail_forward=True)
+    component = VocoderCUDAGraphComponent("decode", routine, [VocoderCUDAGraphDescriptor(2)])
+    manager = _manager_for_capture(warmups=1)
+
+    with pytest.raises(RuntimeError, match="capture forward failed"):
+        manager.capture_entry(component, VocoderCUDAGraphDescriptor(2))
+
+    assert routine.events == ["prepare", "forward", "after"]
+
+
+def test_manager_uses_capture_context_instead_of_prepare_or_after(monkeypatch) -> None:
+    routine = _LifecycleRoutine(context_only=True)
+    component = VocoderCUDAGraphComponent("decode", routine, [VocoderCUDAGraphDescriptor(2)])
+    manager = _manager_for_capture(warmups=1)
+    _mock_cuda_capture(monkeypatch)
+
+    manager.capture_entry(component, VocoderCUDAGraphDescriptor(2), graph_pool=object())
+
+    assert routine.events == ["context-enter", "context-exit"] * 2
+
+
+def test_capture_context_override_composes_default_lifecycle(monkeypatch) -> None:
+    routine = _ScopedLifecycleRoutine()
+    component = VocoderCUDAGraphComponent("decode", routine, [VocoderCUDAGraphDescriptor(2)])
+    manager = _manager_for_capture(warmups=1)
+    _mock_cuda_capture(monkeypatch)
+
+    manager.capture_entry(component, VocoderCUDAGraphDescriptor(2), graph_pool=object())
+
+    assert routine.events == ["scope-enter", "prepare", "forward", "after", "scope-exit"] * 2
 
 
 def test_stats_sink_bounds_detail_items_but_preserves_aggregate_counters() -> None:
