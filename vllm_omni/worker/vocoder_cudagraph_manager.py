@@ -6,12 +6,11 @@
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from collections import Counter, OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, cast
 
@@ -30,6 +29,8 @@ from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
 )
 
 logger = logging.getLogger(__name__)
+
+MAX_LOG_ITEMS = 100
 
 
 @dataclass
@@ -87,7 +88,6 @@ class ManagedComponent:
     component: VocoderCUDAGraphComponent
     entries: OrderedDict[VocoderCUDAGraphDescriptor, VocoderCUDAGraphEntry]
     enable_lazy_capture: bool
-    failed_descriptors: set[VocoderCUDAGraphDescriptor] = field(default_factory=set)
     max_graphs: int | None = None
 
 
@@ -124,15 +124,17 @@ class _ComponentRecorder:
 class VocoderGraphStatsSink:
     """Manager-read, Recorder-write runtime counters."""
 
-    def __init__(self, *, enabled: bool) -> None:
+    def __init__(self, *, enabled: bool, max_log_items: int = MAX_LOG_ITEMS) -> None:
+        if max_log_items <= 0:
+            raise ValueError("max_log_items must be positive")
         self.enabled = enabled
-        self._lock = threading.Lock()
+        self.max_log_items = max_log_items
         self._calls: Counter[str] = Counter()
         self._outcomes: Counter[tuple[str, str]] = Counter()
         # Counts graph specializations actually selected for replay.
-        self._descriptors: Counter[tuple[str, object]] = Counter()
+        self._descriptors: OrderedDict[tuple[str, object], int] = OrderedDict()
         # Counts runtime keys observed before Descriptor bucket selection.
-        self._runtime_keys: Counter[tuple[str, object]] = Counter()
+        self._runtime_keys: OrderedDict[tuple[str, object], int] = OrderedDict()
 
     def recorder_for(self, component_id: str) -> _ComponentRecorder | _NoOpRecorder:
         if not self.enabled:
@@ -145,22 +147,26 @@ class VocoderGraphStatsSink:
         component_id: str,
         resolution: VocoderRuntimeResolution,
     ) -> None:
-        with self._lock:
-            self._calls[component_id] += 1
-            self._outcomes[(component_id, outcome)] += 1
-            if resolution.descriptor is not None:
-                self._descriptors[(component_id, resolution.descriptor.variant)] += 1
-            key = (component_id, resolution.runtime_key.variant)
-            self._runtime_keys[key] += 1
+        self._calls[component_id] += 1
+        self._outcomes[(component_id, outcome)] += 1
+        if resolution.descriptor is not None:
+            self._record_detail(self._descriptors, (component_id, resolution.descriptor.variant))
+        key = (component_id, resolution.runtime_key.variant)
+        self._record_detail(self._runtime_keys, key)
+
+    def _record_detail(self, items: OrderedDict[tuple[str, object], int], key: tuple[str, object]) -> None:
+        if key not in items and len(items) == self.max_log_items:
+            items.popitem(last=False)
+        items[key] = items.get(key, 0) + 1
+        items.move_to_end(key)
 
     def snapshot(self) -> dict[str, object]:
-        with self._lock:
-            return {
-                "calls": dict(self._calls),
-                "outcomes": dict(self._outcomes),
-                "descriptors": dict(self._descriptors),
-                "runtime_keys": dict(self._runtime_keys),
-            }
+        return {
+            "calls": dict(self._calls),
+            "outcomes": dict(self._outcomes),
+            "descriptors": dict(self._descriptors),
+            "runtime_keys": dict(self._runtime_keys),
+        }
 
 
 class VocoderCUDAGraphManager:
@@ -197,6 +203,16 @@ class VocoderCUDAGraphManager:
             return 0
         torch.accelerator.synchronize()
         return int(torch.accelerator.get_memory_info()[0])
+
+    def _validate_boolean(self, value: object) -> bool:
+        if not isinstance(value, bool):
+            raise TypeError(f"{value} must be a boolean")
+        return value
+
+    def _validate_nonnegative(self, value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise TypeError(f"{value!r} must be a non-negative integer")
+        return value
 
     def prepare(self, model: SupportsVocoderCUDAGraph) -> None:
         if self._prepared:
@@ -245,9 +261,9 @@ class VocoderCUDAGraphManager:
             if unknown_keys:
                 names = ", ".join(sorted(unknown_keys))
                 raise ValueError(f"Unknown config key(s) for vocoder Component {component_id}: {names}")
-            enabled = raw_component.get("enabled", True)
-            lazy = raw_component.get("enable_lazy_capture", False)
-            max_extra = raw_component.get("max_extra_graphs", 0)
+            enabled = self._validate_boolean(raw_component.get("enabled", True))
+            lazy = self._validate_boolean(raw_component.get("enable_lazy_capture", False))
+            max_extra = self._validate_nonnegative(raw_component.get("max_extra_graphs", 0))
             self._component_configs[component_id] = VocoderComponentRuntimeConfig(
                 enabled=enabled,
                 enable_lazy_capture=lazy,
@@ -268,52 +284,43 @@ class VocoderCUDAGraphManager:
         *,
         graph_pool: object | None = None,
     ) -> VocoderCUDAGraphEntry | None:
+        if not component.validate_descriptor(descriptor):
+            return None
         routine = component.routine
         buffers: object | None = None
         graph = None
-        try:
-            buffers = routine.allocate_buffers(descriptor, self.device)
-            num_warmups = max(
-                1,
-                int(getattr(self.vllm_config.compilation_config, "cudagraph_num_of_warmups", 0)),
-            )
-            for _ in range(num_warmups):
-                # Prepare the reusable static buffers before every warmup.
-                routine.prepare_for_capture(buffers)
-                try:
-                    routine.forward_for_capture(buffers)
-                finally:
-                    routine.after_capture(buffers)
+        buffers = routine.allocate_buffers(descriptor, self.device)
+        num_warmups = max(
+            1,
+            int(getattr(self.vllm_config.compilation_config, "cudagraph_num_of_warmups", 0)),
+        )
+        for _ in range(num_warmups):
+            # Prepare the reusable static buffers before every warmup.
             routine.prepare_for_capture(buffers)
-            torch.cuda.current_stream(self.device).synchronize()
-            graph = torch.cuda.CUDAGraph()
             try:
-                with (
-                    torch.inference_mode(),
-                    torch.cuda.graph(
-                        graph,
-                        pool=(current_platform.get_global_graph_pool() if graph_pool is None else graph_pool),
-                    ),
-                ):
-                    captured_output = routine.forward_for_capture(buffers)
+                routine.forward_for_capture(buffers)
             finally:
                 routine.after_capture(buffers)
-            return VocoderCUDAGraphEntry(
-                descriptor=descriptor,
-                graph=graph,
-                buffers=buffers,
-                captured_output=captured_output,
-            )
-        except (torch.cuda.OutOfMemoryError, RuntimeError):
-            if graph is not None:
-                graph.reset()
-            logger.warning(
-                "Failed to capture vocoder CUDA Graph Component %s Descriptor %r; this Descriptor will remain eager",
-                component.component_id,
-                descriptor,
-                exc_info=True,
-            )
-            return None
+        routine.prepare_for_capture(buffers)
+        torch.cuda.current_stream(self.device).synchronize()
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with (
+                torch.inference_mode(),
+                torch.cuda.graph(
+                    graph,
+                    pool=(current_platform.get_global_graph_pool() if graph_pool is None else graph_pool),
+                ),
+            ):
+                captured_output = routine.forward_for_capture(buffers)
+        finally:
+            routine.after_capture(buffers)
+        return VocoderCUDAGraphEntry(
+            descriptor=descriptor,
+            graph=graph,
+            buffers=buffers,
+            captured_output=captured_output,
+        )
 
     def profile_memory(self) -> int:
         """Estimate startup graph memory with throwaway captures."""
@@ -369,18 +376,13 @@ class VocoderCUDAGraphManager:
         if existing is not None:
             managed.entries.move_to_end(descriptor)
             return existing
-        if descriptor in managed.failed_descriptors:
-            return None
 
         entry = self.capture_entry(managed.component, descriptor)
-        if entry is None:
-            managed.failed_descriptors.add(descriptor)
-            return None
-
-        managed.entries[descriptor] = entry
-        managed.entries.move_to_end(descriptor)
-        if managed.max_graphs is not None:
-            self._evict_lru_if_needed(managed)
+        if entry is not None:
+            managed.entries[descriptor] = entry
+            managed.entries.move_to_end(descriptor)
+            if managed.max_graphs is not None:
+                self._evict_lru_if_needed(managed)
         return entry
 
     def _evict_lru_if_needed(self, managed: ManagedComponent) -> None:
@@ -433,16 +435,12 @@ class VocoderCUDAGraphManager:
     ) -> VocoderCUDAGraphEntry | None:
         if not managed.enable_lazy_capture:
             return None
-        if descriptor in managed.failed_descriptors:
-            return None
         if torch.cuda.is_current_stream_capturing():
             return None
         existing = managed.entries.get(descriptor)
         if existing is not None:
             managed.entries.move_to_end(descriptor)
             return existing
-        if descriptor in managed.failed_descriptors:
-            return None
         if managed.max_graphs == 0:
             return None
         with self._runtime_capture_scope():
@@ -609,7 +607,6 @@ class VocoderCUDAGraphManager:
             managed.component._restore_eager()
             while managed.entries:
                 self._evict_oldest(managed)
-            managed.failed_descriptors.clear()
         self.managed_components.clear()
         self._runtime_capture_stream = None
         if self.stats_sink.enabled:
