@@ -50,6 +50,7 @@ class AuKCUDAGraphWrapper:
         self.max_graphs = max(1, int(max_graphs))
         self._cache: OrderedDict[tuple, _GraphEntry] = OrderedDict()
         self._pool_handle: int | None = None
+        logger.info("Initialized AuK DiT lazy CUDA graph cache: enabled=%s slots=%d", self.enabled, self.max_graphs)
 
     @classmethod
     def _bucket_inputs(
