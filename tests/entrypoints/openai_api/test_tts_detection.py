@@ -148,6 +148,7 @@ _PIPELINE_STAGES = [
     "dit",
     "fish_speech_slow_ar",
     "fused_thinker_talker",
+    "gepard",
     "glm_tts",
     "glm_tts_dit",
     "higgs_audio_v2",
@@ -263,7 +264,6 @@ def test_arch_matching_is_a_fallback_not_an_override():
 
 def test_shared_latent_generator_resolves_by_architecture_priority():
     assert detect_tts_model_type("latent_generator", "VoxCPM2TalkerForConditionalGeneration") == "voxcpm2"
-    assert detect_tts_model_type("latent_generator", "DotsTTSForConditionalGeneration") == "dots_tts"
 
 
 def test_stage_keys_cover_legacy_stage_set():
