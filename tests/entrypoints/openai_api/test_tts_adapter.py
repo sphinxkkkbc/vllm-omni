@@ -84,7 +84,6 @@ EXPECTED_MODEL_TYPES = {
     "step_audio2",
     "indextts2",
     "indextts2_5",
-    "dots_tts",
     "auk",
     "gepard",
 }
@@ -188,8 +187,8 @@ def test_auk_rejects_invalid_t_grid_before_dispatch(auk_adapter, t_grid):
 @pytest.mark.parametrize(
     ("task_type", "expected_instruction"),
     [
-        ("CustomVoice", "Say the following: 'target text'"),
-        ("Base", "Say the following with the same voice: 'target text'"),
+        ("CustomVoice", 'Say the following: "target text"'),
+        ("Base", 'Say the following with the same voice: "target text"'),
     ],
 )
 def test_auk_task_type_normalizes_benchmark_text(auk_adapter, task_type, expected_instruction, mocker):
@@ -209,8 +208,27 @@ def test_auk_task_type_normalizes_benchmark_text(auk_adapter, task_type, expecte
 
     assert request.input == ""
     assert request.instructions == expected_instruction
+    assert request.task_type is None
     warning_once.assert_called_once()
     assert "prefer a complete `instructions` prompt" in warning_once.call_args.args[0]
+
+    auk_adapter.normalize(request)
+
+    assert request.instructions == expected_instruction
+    warning_once.assert_called_once()
+
+
+def test_auk_task_type_quotes_embedded_delimiters(auk_adapter):
+    request = OpenAICreateSpeechRequest(
+        input='It\'s called "AuK"\\Flash',
+        task_type="CustomVoice",
+        duration_seconds=2,
+    )
+
+    auk_adapter.normalize(request)
+
+    assert request.instructions == 'Say the following: "It\'s called \\"AuK\\"\\\\Flash"'
+    assert request.task_type is None
 
 
 def test_auk_task_type_preserves_explicit_instructions(auk_adapter, mocker):
@@ -231,6 +249,7 @@ def test_auk_task_type_preserves_explicit_instructions(auk_adapter, mocker):
 
     assert request.input == ""
     assert request.instructions == "Use this complete AuK instruction."
+    assert request.task_type is None
     warning_once.assert_called_once()
     warning.assert_called_once()
     assert "without applying another task template" in warning.call_args.args[0]
@@ -255,6 +274,7 @@ def test_auk_task_type_does_not_double_wrap_preformatted_input(auk_adapter, mock
 
     assert request.input == ""
     assert request.instructions == instruction
+    assert request.task_type is None
     warning_once.assert_called_once()
     warning.assert_called_once()
     assert "already contains a complete task instruction" in warning.call_args.args[0]

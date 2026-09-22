@@ -90,6 +90,20 @@ def test_graph_inputs_use_bounded_length_buckets() -> None:
     assert wrapper.max_graphs == 32
 
 
+def test_full_graph_cache_retires_as_one_generation() -> None:
+    wrapper = AuKCUDAGraphWrapper(_make_dit("cpu"), max_graphs=2)
+    first = (64, 64, 50, False)
+    second = (128, 64, 50, False)
+    wrapper._cache[first] = object()
+
+    wrapper._retire_graph_generation_if_full()
+    assert list(wrapper._cache) == [first]
+
+    wrapper._cache[second] = object()
+    wrapper._retire_graph_generation_if_full()
+    assert not wrapper._cache
+
+
 @torch.inference_mode()
 @pytest.mark.parametrize("cfg_strength", [0.0, 2.0])
 def test_bucket_padding_preserves_real_frame_outputs(cfg_strength: float) -> None:
@@ -177,16 +191,33 @@ def test_single_request_graph_replay_matches_eager_and_updates_inputs(cfg_streng
 def test_graph_capture_failure_is_propagated(mocker) -> None:
     dit = _make_dit("cuda")
     wrapper = AuKCUDAGraphWrapper(dit)
-    mocker.patch.object(wrapper, "_capture", side_effect=RuntimeError("capture failed"))
+    capture = mocker.patch.object(wrapper, "_capture", side_effect=RuntimeError("capture failed"))
+    eager = mocker.spy(wrapper, "_run")
     inputs = _sample_inputs("cuda")
+    common = dict(
+        **inputs,
+        gen_frames=9,
+        t_grid=[0.0, 0.4, 1.0],
+        cfg_strength=0.0,
+    )
 
     with pytest.raises(RuntimeError, match="capture failed"):
         sample_latents(
             dit,
-            **inputs,
-            gen_frames=9,
-            t_grid=[0.0, 0.4, 1.0],
-            cfg_strength=0.0,
+            **common,
             generator=torch.Generator(device="cuda").manual_seed(7),
             sampler=wrapper,
         )
+
+    result = sample_latents(
+        dit,
+        **common,
+        generator=torch.Generator(device="cuda").manual_seed(7),
+        sampler=wrapper,
+    )
+
+    assert result.shape == (1, 9, 4)
+    assert capture.call_count == 1
+    assert eager.call_count == 2
+    assert not wrapper.enabled
+    assert not wrapper._cache

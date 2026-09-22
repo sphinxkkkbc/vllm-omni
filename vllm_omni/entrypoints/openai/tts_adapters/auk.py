@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 from typing import TYPE_CHECKING, Any
 
@@ -35,8 +36,8 @@ class AuKAdapter(ARTTSAdapter):
         if request.task_type in ("CustomVoice", "Base"):
             logger.warning_once(
                 "AuK `task_type` is a compatibility shortcut; prefer a complete `instructions` prompt. "
-                "CustomVoice applies `Say the following: '<input>'`; Base applies "
-                "`Say the following with the same voice: '<input>'`."
+                'CustomVoice applies `Say the following: "<input>"`; Base applies '
+                '`Say the following with the same voice: "<input>"`.'
             )
         if request.instructions and request.instructions.strip():
             logger.warning(
@@ -44,6 +45,7 @@ class AuKAdapter(ARTTSAdapter):
                 "using `instructions` without applying another task template."
             )
             request.input = ""
+            request.task_type = None
             return
         instruction = request.input.strip()
         if instruction.startswith(("Say the following:", "Say the following with the same voice:")):
@@ -53,16 +55,22 @@ class AuKAdapter(ARTTSAdapter):
             )
             request.instructions = instruction
             request.input = ""
+            request.task_type = None
             return
         if not instruction:
             return
+        quoted_instruction = json.dumps(instruction, ensure_ascii=False)
         if request.task_type == "Base":
-            request.instructions = f"Say the following with the same voice: '{instruction}'"
+            request.instructions = f"Say the following with the same voice: {quoted_instruction}"
         elif request.task_type == "CustomVoice":
-            request.instructions = f"Say the following: '{instruction}'"
+            request.instructions = f"Say the following: {quoted_instruction}"
         else:
             return
         request.input = ""
+        # task_type is a compatibility shortcut for AuK, not a model-side
+        # parameter. Consuming it makes normalization idempotent when the
+        # shared batch path validates and later prepares the same request.
+        request.task_type = None
 
     def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
         if not request.input.strip() and not (request.instructions and request.instructions.strip()):

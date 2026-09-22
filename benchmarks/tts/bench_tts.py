@@ -201,7 +201,7 @@ def print_summary_table(results: list[dict[str, Any]]) -> None:
     if not results:
         return
     header = (
-        f"{'Task':<16} {'Concurrency':>11} {'RTF mean':>10} "
+        f"{'Task':<16} {'Task Type':<12} {'Concurrency':>11} {'RTF mean':>10} "
         f"{'TTFP (ms)':>10} {'Throughput':>12} {'WER':>7} {'SIM':>7} {'UTMOS':>7}"
     )
     print(f"\n{'=' * len(header)}")
@@ -211,6 +211,7 @@ def print_summary_table(results: list[dict[str, Any]]) -> None:
     print("-" * len(header))
     for r in results:
         task = r.get("_task", "?")
+        task_type = r.get("_task_type", "-")
         conc = r.get("_concurrency", "?")
         rtf = r.get("mean_audio_rtf", float("nan"))
         ttfp = r.get("mean_audio_ttfp_ms", float("nan"))
@@ -223,7 +224,7 @@ def print_summary_table(results: list[dict[str, Any]]) -> None:
             return f"{v:.{digits}f}" if not math.isnan(v) else "  n/a"
 
         print(
-            f"{task:<16} {str(conc):>11} {fmt(rtf):>10} {fmt(ttfp, 0):>10} "
+            f"{task:<16} {task_type:<12} {str(conc):>11} {fmt(rtf):>10} {fmt(ttfp, 0):>10} "
             f"{fmt(throughput):>12} {fmt(wer):>7} {fmt(sim):>7} {fmt(utmos):>7}"
         )
     print("=" * len(header))
@@ -354,6 +355,10 @@ def main() -> None:
             if result is not None:
                 result["_task"] = task
                 result["_concurrency"] = concurrency
+                task_body = model_cfg.get("task_extra_body", {}).get(task, {})
+                task_type = task_body.get("task_type")
+                if task_type is not None:
+                    result["_task_type"] = task_type
                 all_results.append(result)
                 # Persist the metadata so plot_results.py can pick it up.
                 if args.output_dir and result_filename:

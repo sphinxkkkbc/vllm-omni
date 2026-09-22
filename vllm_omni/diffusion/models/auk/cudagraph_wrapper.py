@@ -83,6 +83,11 @@ class AuKCUDAGraphWrapper:
     ) -> tuple[int, int, int, bool]:
         return (x.shape[1], text.shape[1], ref.shape[1], uses_cfg)
 
+    def _retire_graph_generation_if_full(self) -> None:
+        """Retire all graphs together so none outlive shared workspaces."""
+        if len(self._cache) >= self.max_graphs:
+            self._cache.clear()
+
     @torch.no_grad()
     def __call__(
         self,
@@ -95,7 +100,6 @@ class AuKCUDAGraphWrapper:
         timestep: torch.Tensor,
         cfg_strength: float,
     ) -> torch.Tensor:
-        inputs = (x, text, c_mask, ref, ref_mask, timestep)
         uses_cfg = cfg_strength >= 1e-5
         if not self.enabled or x.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
             if uses_cfg:
@@ -108,9 +112,19 @@ class AuKCUDAGraphWrapper:
         key = self._key(x, text, ref, uses_cfg)
         entry = self._cache.get(key)
         if entry is None:
-            entry = self._capture(*inputs, cfg_strength=cfg_strength, uses_cfg=uses_cfg)
-            if len(self._cache) >= self.max_graphs:
-                self._cache.popitem(last=False)
+            # Same Retirement as #6587, details discussed in #7469
+            self._retire_graph_generation_if_full()
+            try:
+                entry = self._capture(*inputs, cfg_strength=cfg_strength, uses_cfg=uses_cfg)
+            except Exception:
+                self._cache.clear()
+                self.enabled = False
+                logger.exception(
+                    "Disabling AuK DiT CUDA graphs after capture failure for key=%s; "
+                    "subsequent requests will use eager execution.",
+                    key,
+                )
+                raise
             self._cache[key] = entry
         else:
             self._cache.move_to_end(key)

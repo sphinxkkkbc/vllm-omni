@@ -243,3 +243,20 @@ def test_unsupported_task_exits(model_configs_path: Path, capsys: pytest.Capture
     )
     with pytest.raises(SystemExit):
         bench_tts.main()
+
+
+def test_summary_table_includes_task_type(capsys: pytest.CaptureFixture) -> None:
+    bench_tts.print_summary_table(
+        [
+            {
+                "_task": "voice_clone",
+                "_task_type": "Base",
+                "_concurrency": 1,
+            }
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert "Task Type" in output
+    assert "voice_clone" in output
+    assert "Base" in output
