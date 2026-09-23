@@ -44,6 +44,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Accepted values for ``OmniDiffusionConfig.vae_fast_path``.
+VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
+
 
 def _move_diffusion_alias(
     normalized: dict[str, Any],
@@ -944,6 +947,12 @@ class OmniDiffusionConfig:
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    # Wan VAE decoder fast path. ``"lossless"`` installs the bit-exact fused
+    # kernels on every diffusers Wan VAE, ``"channels_last"`` additionally
+    # converts decoder convolution weights to channels-last memory format and
+    # fuses RMSNorm+SiLU (faster, not bit-exact), ``"off"`` keeps the reference
+    # diffusers implementation.
+    vae_fast_path: str = "lossless"
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
@@ -1050,6 +1059,15 @@ class OmniDiffusionConfig:
 
     # Model-specific function for collecting CFG KV caches (set at runtime)
     cfg_kv_collect_func: Any | None = None
+
+    # Conditioning keys fetched from the upstream stage over the omni connector
+    # rather than carried inline through the orchestrator. Empty disables the
+    # worker-side connector receive path.
+    stage_input_payload_keys: tuple[str, ...] = ()
+
+    # Keys handed to the next stage over the omni connector. Empty disables the
+    # worker-side connector send path.
+    stage_output_payload_keys: tuple[str, ...] = ()
 
     # Quantization: str method name, dict config, QuantizationConfig, or None.
     # str is resolved to {"method": <str>} internally.
@@ -1174,6 +1192,10 @@ class OmniDiffusionConfig:
             materialize_legacy_offload_flags,
         )
 
+        self.stage_input_payload_keys = tuple(self.stage_input_payload_keys)
+        self.stage_output_payload_keys = tuple(self.stage_output_payload_keys)
+        if self.vae_fast_path not in VAE_FAST_PATH_LEVELS:
+            raise ValueError(f"vae_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_fast_path!r}")
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "
@@ -1225,6 +1247,8 @@ class OmniDiffusionConfig:
             if self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
                 raise ValueError("native kv_transfer_config requires diffusion_kv_mode='paged_scheduler'")
             self.kv_transfer_config = parse_kv_transfer_config(self.kv_transfer_config)
+            if self.enable_sleep_mode:
+                raise ValueError("Native KV transfer does not support sleep mode: registered pages must remain mapped")
 
         self.master_port = self._resolve_master_port()
         self.request_batch_max_wait_ms = float(self.request_batch_max_wait_ms or 0.0)

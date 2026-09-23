@@ -115,28 +115,27 @@ def test_resolve_unknown_returns_none():
 
 
 @pytest.fixture
-def auk_adapter():
-    server = SimpleNamespace(
-        _max_instructions_length=4096,
-        _validate_ref_audio_format=lambda _audio: None,
-        _resolve_ref_audio=AsyncMock(return_value=([0.1] * 480, 24000, "key")),
-    )
+def auk_adapter(mocker):
+    server = mocker.Mock(spec=OmniOpenAIServingSpeech)
+    server._max_instructions_length = 4096
+    server._validate_ref_audio_format.return_value = None
+    server._resolve_ref_audio = AsyncMock(return_value=([0.1] * 480, 24000, "key"))
     return AuKAdapter(SpeechServingContext(server=server))
 
 
-def test_auk_adapter_detection():
+def test_auk_adapter_detection(mocker):
     assert detect_tts_model_type("encoder", "AuKForConditionalGeneration") == "auk"
     assert AuKAdapter.stage_keys == frozenset({"encoder"})
 
-    server = SimpleNamespace(
-        _diffusion_mode=False,
-        _tts_model_type=detect_tts_model_type("encoder", "AuKForConditionalGeneration"),
-        _adapter=None,
-        engine_client=SimpleNamespace(),
-    )
+    server = mocker.Mock(spec=OmniOpenAIServingSpeech)
+    server._diffusion_mode = False
+    server._tts_model_type = detect_tts_model_type("encoder", "AuKForConditionalGeneration")
+    server._adapter = None
+    server.engine_client = SimpleNamespace()
 
     adapter = OmniOpenAIServingSpeech._get_tts_adapter(server)
     assert isinstance(adapter, AuKAdapter)
+    server._drop_shadowing_uploads.assert_called_once_with()
 
 
 def test_auk_source_length_default_and_complete_instruction(auk_adapter):
@@ -200,10 +199,9 @@ def test_auk_task_type_normalizes_benchmark_text(auk_adapter, task_type, expecte
         ref_audio="reference.wav" if task_type == "Base" else None,
     )
 
-    server = SimpleNamespace(
-        _validate_speech_sample_rate=lambda _request: None,
-        _get_tts_adapter=lambda: auk_adapter,
-    )
+    server = mocker.Mock(spec=OmniOpenAIServingSpeech)
+    server._validate_speech_sample_rate.return_value = None
+    server._get_tts_adapter.return_value = auk_adapter
     assert OmniOpenAIServingSpeech._validate_tts_request(server, request) is None
 
     assert request.input == ""
@@ -241,10 +239,9 @@ def test_auk_task_type_preserves_explicit_instructions(auk_adapter, mocker):
         duration_seconds=2,
     )
 
-    server = SimpleNamespace(
-        _validate_speech_sample_rate=lambda _request: None,
-        _get_tts_adapter=lambda: auk_adapter,
-    )
+    server = mocker.Mock(spec=OmniOpenAIServingSpeech)
+    server._validate_speech_sample_rate.return_value = None
+    server._get_tts_adapter.return_value = auk_adapter
     assert OmniOpenAIServingSpeech._validate_tts_request(server, request) is None
 
     assert request.input == ""
@@ -265,10 +262,9 @@ def test_auk_task_type_does_not_double_wrap_preformatted_input(auk_adapter, mock
         duration_seconds=2,
         ref_audio="reference.wav",
     )
-    server = SimpleNamespace(
-        _validate_speech_sample_rate=lambda _request: None,
-        _get_tts_adapter=lambda: auk_adapter,
-    )
+    server = mocker.Mock(spec=OmniOpenAIServingSpeech)
+    server._validate_speech_sample_rate.return_value = None
+    server._get_tts_adapter.return_value = auk_adapter
 
     assert OmniOpenAIServingSpeech._validate_tts_request(server, request) is None
 
@@ -280,7 +276,7 @@ def test_auk_task_type_does_not_double_wrap_preformatted_input(auk_adapter, mock
     assert "already contains a complete task instruction" in warning.call_args.args[0]
 
 
-def test_auk_sampling_overrides_reach_stage1_pipeline(auk_adapter):
+def test_auk_sampling_overrides_reach_stage1_pipeline(auk_adapter, mocker):
     """Exercise one request from the Speech adapter through stage-1 admission."""
 
     class RecordingDiffusionStage:
@@ -367,7 +363,8 @@ def test_auk_sampling_overrides_reach_stage1_pipeline(auk_adapter):
     assert received.sampling_params.guidance_scale_provided is True
     assert received.sampling_params.seed == 9
 
-    runner = SimpleNamespace(device=torch.device("cpu"))
+    runner = mocker.Mock(spec=DiffusionModelRunner)
+    runner.device = torch.device("cpu")
     DiffusionModelRunner._initialize_generator(runner, received.sampling_params)
     assert received.sampling_params.generator.initial_seed() == 9
 
