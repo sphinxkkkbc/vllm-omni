@@ -131,11 +131,8 @@ async_chunk: false
 stages:
   - stage_id: 1
     vocoder_cudagraph:
-      capture_batch_sizes: [1, 2]
-      components:
-        qwen3_tts.stateless:
-          enabled: true
-          capture_bucket_sizes: [150, 325]
+      qwen3_tts.stateless:
+        capture_bucket_sizes: [150, 325]
 """,
         encoding="utf-8",
     )
@@ -144,13 +141,7 @@ stages:
 
     assert omni_config.stage_by_id(0).model_config.vocoder_cudagraph is None
     assert omni_config.stage_by_id(1).model_config.vocoder_cudagraph == {
-        "capture_batch_sizes": [1, 2],
-        "components": {
-            "qwen3_tts.stateless": {
-                "enabled": True,
-                "capture_bucket_sizes": [150, 325],
-            }
-        },
+        "qwen3_tts.stateless": {"capture_bucket_sizes": [150, 325]},
     }
 
 

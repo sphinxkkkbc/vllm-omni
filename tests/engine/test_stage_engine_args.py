@@ -846,7 +846,7 @@ def test_typed_engine_args_match_current_registry_backend_semantics(model_type, 
         )
 
 
-@pytest.mark.parametrize("config", [None, {"log_stats": True}])
+@pytest.mark.parametrize("config", [None, {"decode": {}}])
 def test_create_model_config_projects_vocoder_config(monkeypatch, config):
     from vllm_omni.config.model import OmniModelConfig
 

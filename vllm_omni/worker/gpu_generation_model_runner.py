@@ -80,6 +80,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         return (
             not self.model_config.enforce_eager
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            and bool(getattr(self.model_config, "vocoder_cudagraph_config", None))
             and supports_vocoder_cudagraph(self.get_model())
         )
 
