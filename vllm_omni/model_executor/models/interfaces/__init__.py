@@ -4,6 +4,7 @@
 from .vocoder_cudagraph import (
     BaseVocoderCUDAGraphRoutine,
     SupportsVocoderCUDAGraph,
+    VocoderCaptureMode,
     VocoderCUDAGraphComponent,
     VocoderCUDAGraphDescriptor,
     VocoderCUDAGraphRoutine,
@@ -15,6 +16,7 @@ from .vocoder_cudagraph import (
 
 __all__ = [
     "BaseVocoderCUDAGraphRoutine",
+    "VocoderCaptureMode",
     "SupportsVocoderCUDAGraph",
     "VocoderCUDAGraphDescriptor",
     "VocoderCUDAGraphRoutine",

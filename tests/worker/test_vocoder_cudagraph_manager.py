@@ -18,6 +18,8 @@ from vllm.platforms import current_platform
 
 from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
     BaseVocoderCUDAGraphRoutine,
+    SupportsVocoderCUDAGraph,
+    VocoderCaptureMode,
     VocoderCUDAGraphComponent,
     VocoderCUDAGraphDescriptor,
     VocoderGraphHandle,
@@ -206,17 +208,24 @@ class _ScopedLifecycleRoutine(_LifecycleRoutine):
 
 
 class _TestManager(VocoderCUDAGraphManager):
-    def __init__(self, *, config: dict[str, Any] | None = None) -> None:
+    def __init__(self, *, config: dict[str, Any] | None = None, log_stats: bool = False) -> None:
         vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(vocoder_cudagraph_config=config),
             compilation_config=SimpleNamespace(cudagraph_num_of_warmups=0),
+            observability_config=SimpleNamespace(cudagraph_metrics=log_stats),
         )
         super().__init__(vllm_config=vllm_config, device=torch.device("cpu"))
+        self._use_default_component_config = config is None
         self.components_during_capture: list[tuple[bool, ...]] = []
         self.fail_replay_for: set[tuple[str, object]] = set()
         self.fail_capture_for: set[tuple[str, object]] = set()
         self.capture_attempts: Counter[tuple[str, object]] = Counter()
         self.capture_pools: list[object | None] = []
+
+    def prepare(self, model: SupportsVocoderCUDAGraph) -> None:
+        if self._use_default_component_config:
+            self.config = {component.component_id: {} for component in model.get_vocoder_cudagraph_components()}
+        super().prepare(model)
 
     def capture_entry(
         self,
@@ -263,6 +272,7 @@ def _component(
     component_id: str,
     *sizes: int,
     capture_order_key: Callable[[VocoderCUDAGraphDescriptor], Any] | None = None,
+    capture_mode: VocoderCaptureMode = VocoderCaptureMode.PRECAPTURE,
 ) -> tuple[VocoderCUDAGraphComponent, _Routine]:
     routine = _Routine()
     component = VocoderCUDAGraphComponent(
@@ -271,6 +281,7 @@ def _component(
         [VocoderCUDAGraphDescriptor(size) for size in sizes],
         supported_config_keys=frozenset({"bucket_policy"}),
         capture_order_key=capture_order_key,
+        capture_mode=capture_mode,
     )
     return component, routine
 
@@ -365,6 +376,21 @@ def test_stats_sink_bounds_detail_items_but_preserves_aggregate_counters() -> No
     assert snapshot["runtime_keys"] == {("decode", 2): 1, ("decode", 3): 1}
 
 
+def test_stats_sink_logs_every_100_component_calls() -> None:
+    sink = VocoderGraphStatsSink(enabled=True)
+    resolution = VocoderRuntimeResolution(VocoderRuntimeKey(2), VocoderCUDAGraphDescriptor(2))
+
+    with patch.object(logging.Logger, "info") as log_info:
+        for _ in range(99):
+            sink.record("hit", "decode", resolution)
+        log_info.assert_not_called()
+        sink.record("hit", "decode", resolution)
+
+    log_info.assert_called_once()
+    assert log_info.call_args.args[1] == 100
+    assert log_info.call_args.args[2]["outcomes"] == {("decode", "hit"): 100}
+
+
 def test_runtime_lazy_capture_logs_only_new_entries(monkeypatch) -> None:
     component, _ = _component("decode", 2)
     manager = _TestManager()
@@ -379,7 +405,7 @@ def test_runtime_lazy_capture_logs_only_new_entries(monkeypatch) -> None:
     managed = ManagedComponent(
         component=component,
         entries=OrderedDict(),
-        enable_lazy_capture=True,
+        capture_mode=VocoderCaptureMode.PRECAPTURE_LAZY,
         max_graphs=1,
     )
     calls: list[VocoderCUDAGraphDescriptor] = []
@@ -447,7 +473,7 @@ def test_capture_binds_only_after_all_components_are_captured_and_clear_restores
 
 def test_coverage_miss_falls_back_but_validation_and_replay_errors_propagate() -> None:
     component, routine = _component("decode", 2)
-    manager = _TestManager(config={"log_stats": True})
+    manager = _TestManager(log_stats=True)
     manager.fail_replay_for.add(("decode", 2))
     manager.prepare(_Model((component,)))
     manager.capture_and_bind()
@@ -471,7 +497,7 @@ def test_coverage_miss_falls_back_but_validation_and_replay_errors_propagate() -
 
 def test_copy_and_postprocess_errors_propagate_without_eager_retry() -> None:
     component, routine = _component("decode", 2)
-    manager = _TestManager(config={"log_stats": True})
+    manager = _TestManager(log_stats=True)
     manager.prepare(_Model((component,)))
     manager.capture_and_bind()
 
@@ -484,7 +510,7 @@ def test_copy_and_postprocess_errors_propagate_without_eager_retry() -> None:
     assert routine.eager_calls == 0
 
     component, routine = _component("decode-postprocess", 2)
-    manager = _TestManager(config={"log_stats": True})
+    manager = _TestManager(log_stats=True)
     manager.prepare(_Model((component,)))
     manager.capture_and_bind()
 
@@ -497,18 +523,18 @@ def test_copy_and_postprocess_errors_propagate_without_eager_retry() -> None:
     assert routine.eager_calls == 0
 
 
-def test_config_validation_catches_unknown_shared_component_and_extension_keys() -> None:
+def test_config_validation_catches_unknown_component_and_extension_keys() -> None:
     component, _ = _component("decode", 2)
 
     manager = _TestManager(config={"unknown": 1})
-    with pytest.raises(ValueError, match="Unknown vocoder_cudagraph"):
-        manager.prepare(_Model((component,)))
-
-    manager = _TestManager(config={"components": {"missing": {"enabled": False}}})
     with pytest.raises(ValueError, match="Unknown vocoder CUDA Graph component"):
         manager.prepare(_Model((component,)))
 
-    manager = _TestManager(config={"components": {"decode": {"unknown_bucket_policy": [2]}}})
+    manager = _TestManager(config={"missing": {}})
+    with pytest.raises(ValueError, match="Unknown vocoder CUDA Graph component"):
+        manager.prepare(_Model((component,)))
+
+    manager = _TestManager(config={"decode": {"unknown_bucket_policy": [2]}})
     with pytest.raises(ValueError, match="Unknown config key"):
         manager.prepare(_Model((component,)))
 
@@ -516,16 +542,14 @@ def test_config_validation_catches_unknown_shared_component_and_extension_keys()
 @pytest.mark.parametrize(
     ("key", "value", "message"),
     [
-        ("enabled", 1, "must be a boolean"),
-        ("enable_lazy_capture", "true", "must be a boolean"),
         ("max_extra_graphs", True, "must be a non-negative integer"),
         ("max_extra_graphs", -1, "must be a non-negative integer"),
         ("max_extra_graphs", 1.0, "must be a non-negative integer"),
     ],
 )
 def test_component_policy_validation_rejects_invalid_types(key, value, message) -> None:
-    component, _ = _component("decode", 2)
-    manager = _TestManager(config={"components": {"decode": {key: value}}})
+    component, _ = _component("decode", 2, capture_mode=VocoderCaptureMode.PRECAPTURE_LAZY)
+    manager = _TestManager(config={"decode": {key: value}})
 
     with pytest.raises(TypeError, match=message):
         manager.prepare(_Model((component,)))
@@ -548,9 +572,9 @@ def test_component_registry_rejects_duplicate_ids_and_descriptors() -> None:
         manager.prepare(_Model((duplicate_descriptor,)))
 
 
-def test_disabled_component_remains_on_original_eager_callable() -> None:
+def test_omitted_component_remains_on_original_eager_callable() -> None:
     component, routine = _component("decode", 2)
-    manager = _TestManager(config={"components": {"decode": {"enabled": False}}})
+    manager = _TestManager(config={})
     manager.prepare(_Model((component,)))
     manager.capture_and_bind()
 
@@ -560,18 +584,36 @@ def test_disabled_component_remains_on_original_eager_callable() -> None:
     assert routine.eager_calls == 1
 
 
+def test_pure_lazy_profiles_descriptors_but_does_not_capture_at_startup(monkeypatch) -> None:
+    component, routine = _component("decode", 2, capture_mode=VocoderCaptureMode.PURE_LAZY)
+    manager = _TestManager(config={"decode": {"max_extra_graphs": 1}})
+    manager.prepare(_Model((component,)))
+    manager.capture_and_bind()
+
+    assert manager.capture_attempts[("decode", 2)] == 0
+    assert component.available_descriptors == frozenset()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(manager, "_runtime_capture_scope", nullcontext)
+    value = torch.ones(2)
+    assert torch.equal(component(value), value * 2)
+    assert component.available_descriptors == frozenset({VocoderCUDAGraphDescriptor(2)})
+    assert manager.capture_attempts[("decode", 2)] == 1
+    larger = torch.ones(3)
+    assert torch.equal(component(larger), larger * 2)
+    assert manager.capture_attempts[("decode", 3)] == 0
+    assert routine.eager_calls == 1
+
+
+def test_pure_lazy_requires_profiling_descriptors() -> None:
+    component, _ = _component("decode", capture_mode=VocoderCaptureMode.PURE_LAZY)
+    manager = _TestManager(config={"decode": {}})
+    with pytest.raises(ValueError, match="needs descriptors for memory profiling"):
+        manager.prepare(_Model((component,)))
+
+
 def test_descriptor_rejection_falls_back_to_eager_without_capture(monkeypatch) -> None:
-    component, routine = _component("decode", 2)
-    manager = _TestManager(
-        config={
-            "components": {
-                "decode": {
-                    "enable_lazy_capture": True,
-                    "max_extra_graphs": 1,
-                }
-            }
-        }
-    )
+    component, routine = _component("decode", 2, capture_mode=VocoderCaptureMode.PRECAPTURE_LAZY)
+    manager = _TestManager(config={"decode": {"max_extra_graphs": 1}})
     validation_calls = []
 
     def reject(descriptor):
@@ -593,8 +635,8 @@ def test_descriptor_rejection_falls_back_to_eager_without_capture(monkeypatch) -
 
 
 def test_successful_lazy_miss_registers_descriptor_and_replays_current_call(monkeypatch) -> None:
-    component, routine = _component("decode", 2)
-    manager = _TestManager(config={"components": {"decode": {"enable_lazy_capture": True, "max_extra_graphs": 1}}})
+    component, routine = _component("decode", 2, capture_mode=VocoderCaptureMode.PRECAPTURE_LAZY)
+    manager = _TestManager(config={"decode": {}})
     manager.prepare(_Model((component,)))
     manager.capture_and_bind()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -607,9 +649,28 @@ def test_successful_lazy_miss_registers_descriptor_and_replays_current_call(monk
     assert routine.eager_calls == 0
 
 
+@pytest.mark.parametrize("mode", [VocoderCaptureMode.PRECAPTURE_LAZY, VocoderCaptureMode.PURE_LAZY])
+def test_zero_lazy_graph_limit_keeps_all_captured_descriptors(monkeypatch, mode) -> None:
+    component, routine = _component("decode", 2, capture_mode=mode)
+    manager = _TestManager(config={"decode": {}})
+    manager.prepare(_Model((component,)))
+    manager.capture_and_bind()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(manager, "_runtime_capture_scope", nullcontext)
+
+    for size in (3, 4, 5):
+        value = torch.ones(size)
+        assert torch.equal(component(value), value * 2)
+
+    assert manager.managed_components["decode"].max_graphs is None
+    expected = {2, 3, 4, 5} if mode is VocoderCaptureMode.PRECAPTURE_LAZY else {3, 4, 5}
+    assert {descriptor.variant for descriptor in component.available_descriptors} == expected
+    assert routine.eager_calls == 0
+
+
 def test_lazy_capture_rejects_nested_outer_capture(monkeypatch) -> None:
-    component, routine = _component("decode", 2)
-    manager = _TestManager(config={"components": {"decode": {"enable_lazy_capture": True, "max_extra_graphs": 1}}})
+    component, routine = _component("decode", 2, capture_mode=VocoderCaptureMode.PRECAPTURE_LAZY)
+    manager = _TestManager(config={"decode": {"max_extra_graphs": 1}})
     manager.prepare(_Model((component,)))
     manager.capture_and_bind()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
@@ -620,9 +681,9 @@ def test_lazy_capture_rejects_nested_outer_capture(monkeypatch) -> None:
     assert manager.capture_attempts[("decode", 3)] == 0
 
 
-def test_lazy_entries_share_one_lru_with_startup_entries(monkeypatch) -> None:
-    component, _ = _component("decode", 2, 3)
-    manager = _TestManager(config={"components": {"decode": {"enable_lazy_capture": True, "max_extra_graphs": 1}}})
+def test_lazy_capacity_falls_back_without_evicting_startup_entries(monkeypatch) -> None:
+    component, routine = _component("decode", 2, 3, capture_mode=VocoderCaptureMode.PRECAPTURE_LAZY)
+    manager = _TestManager(config={"decode": {"max_extra_graphs": 1}})
     manager.prepare(_Model((component,)))
     manager.capture_and_bind()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -631,14 +692,16 @@ def test_lazy_entries_share_one_lru_with_startup_entries(monkeypatch) -> None:
     component(torch.tensor([1.0, 2.0, 3.0, 4.0]))
     component(torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0]))
     entries = manager.managed_components["decode"].entries
-    assert [descriptor.variant for descriptor in entries] == [2, 4, 5]
+    assert [descriptor.variant for descriptor in entries] == [3, 2, 4]
     assert component.available_descriptors == frozenset(
         {
+            VocoderCUDAGraphDescriptor(3),
             VocoderCUDAGraphDescriptor(2),
             VocoderCUDAGraphDescriptor(4),
-            VocoderCUDAGraphDescriptor(5),
         }
     )
+    assert manager.capture_attempts[("decode", 5)] == 0
+    assert routine.eager_calls == 1
 
 
 def test_binding_failure_propagates() -> None:
@@ -692,7 +755,7 @@ def test_capture_failure_propagates() -> None:
         [VocoderCUDAGraphDescriptor(2)],
     )
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(vocoder_cudagraph_config=None),
+        model_config=SimpleNamespace(vocoder_cudagraph_config={"decode": {}}),
         compilation_config=SimpleNamespace(cudagraph_num_of_warmups=0),
     )
     manager = VocoderCUDAGraphManager(vllm_config=vllm_config, device=torch.device("cpu"))
@@ -737,9 +800,16 @@ def test_capture_and_bind_orders_descriptors_largest_first():
 
 
 def test_profile_memory_uses_first_capture_and_per_graph_increment(monkeypatch):
-    first, _ = _component("first", 2, 3, 4, capture_order_key=lambda descriptor: descriptor.variant)
+    first, _ = _component(
+        "first",
+        2,
+        3,
+        4,
+        capture_order_key=lambda descriptor: descriptor.variant,
+        capture_mode=VocoderCaptureMode.PRECAPTURE_LAZY,
+    )
     second, _ = _component("second", 5)
-    manager = _TestManager(config={"components": {"first": {"enable_lazy_capture": True, "max_extra_graphs": 2}}})
+    manager = _TestManager(config={"first": {"max_extra_graphs": 2}, "second": {}})
     manager.prepare(_Model((first, second)))
     free_memory = iter((100, 90, 90, 87, 87, 80))
     captured = []
@@ -775,22 +845,8 @@ def test_profile_memory_uses_first_capture_and_per_graph_increment(monkeypatch):
     assert all(entry.graph.reset_called for entry in captured)
 
 
-def test_profile_memory_ignores_extra_graphs_when_lazy_capture_is_disabled(monkeypatch):
+def test_precapture_rejects_lazy_graph_capacity() -> None:
     component, _ = _component("decode", 2)
-    manager = _TestManager(config={"components": {"decode": {"max_extra_graphs": 4}}})
-    manager.prepare(_Model((component,)))
-    buffers = _Buffers(torch.zeros(1), torch.zeros(1))
-    entry = VocoderCUDAGraphEntry(
-        descriptor=component.descriptors[0],
-        graph=cast(torch.cuda.CUDAGraph, _Graph(buffers)),
-        buffers=buffers,
-        captured_output=buffers.output,
-    )
-    monkeypatch.setattr(manager, "capture_entry", lambda *args, **kwargs: entry)
-    monkeypatch.setattr(current_platform, "graph_pool_handle", lambda: object())
-    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
-    free_memory = iter((100, 90))
-    monkeypatch.setattr(manager, "_synchronized_free_memory", lambda: next(free_memory))
-    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
-
-    assert manager.profile_memory() == 10
+    manager = _TestManager(config={"decode": {"max_extra_graphs": 4}})
+    with pytest.raises(ValueError, match="requires a lazy capture mode"):
+        manager.prepare(_Model((component,)))

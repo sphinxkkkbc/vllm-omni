@@ -41,7 +41,7 @@ class _FakeManager:
 
 def _runner(*, enforce_eager: bool, mode: CUDAGraphMode):
     runner = object.__new__(GPUGenerationModelRunner)
-    runner.model_config = SimpleNamespace(enforce_eager=enforce_eager)
+    runner.model_config = SimpleNamespace(enforce_eager=enforce_eager, vocoder_cudagraph_config={"decode": {}})
     runner.compilation_config = SimpleNamespace(cudagraph_mode=mode)
     runner.vllm_config = SimpleNamespace()
     runner.device = torch.device("cpu")
@@ -62,6 +62,14 @@ def test_load_model_prepares_manager_from_unwrapped_model(monkeypatch) -> None:
     manager = _FakeManager.instances[0]
     assert manager.prepared_model is runner.model
     assert runner.vocoder_cudagraph_manager is manager
+
+
+def test_omitted_vocoder_config_keeps_upstream_runner(monkeypatch) -> None:
+    monkeypatch.setattr(OmniGPUModelRunner, "load_model", lambda self, *args, **kwargs: None)
+    runner = _runner(enforce_eager=False, mode=CUDAGraphMode.FULL)
+    runner.model_config.vocoder_cudagraph_config = None
+    GPUGenerationModelRunner.load_model(runner)
+    assert runner.vocoder_cudagraph_manager is None
 
 
 def test_enforce_eager_skips_manager_and_shutdown_restores_components(monkeypatch) -> None:

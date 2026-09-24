@@ -12,11 +12,24 @@ from __future__ import annotations
 from collections.abc import Callable, Generator, Hashable, Sequence, Set
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, ClassVar, Generic, Literal, Protocol, TypeVar, runtime_checkable
 
 import torch
 
 VariantT = TypeVar("VariantT", bound=Hashable)
+
+
+class VocoderCaptureMode(str, Enum):
+    """Model-owned capture timing for one Component; runtime graphs are never evicted."""
+
+    PRECAPTURE = "precapture"
+    PRECAPTURE_LAZY = "precapture_lazy"
+    PURE_LAZY = "pure_lazy"
+
+    @property
+    def allows_lazy_capture(self) -> bool:
+        return self is not VocoderCaptureMode.PRECAPTURE
 
 
 @dataclass(frozen=True)
@@ -222,13 +235,17 @@ class VocoderCUDAGraphComponent:
         *,
         supported_config_keys: Set[str] = frozenset(),
         capture_order_key: Callable[[VocoderCUDAGraphDescriptor], Any] | None = None,
+        capture_mode: VocoderCaptureMode = VocoderCaptureMode.PRECAPTURE,
     ) -> None:
         self.component_id = component_id
         self.routine = routine
+        # PURE_LAZY uses these only to profile the largest supported capture
+        # shapes; the other modes also use them for startup capture.
         self.descriptors = tuple(descriptors)
         self.clone_output = bool(clone_output)
         self.supported_config_keys = frozenset(supported_config_keys)
         self._capture_order_key = capture_order_key
+        self.capture_mode = VocoderCaptureMode(capture_mode)
         self._delegate: Callable[..., Any] = routine.eager_call
         # The Component owns the stable call site, not the runtime Handle
         # lifecycle. The Manager constructs and binds the Handle after capture.
