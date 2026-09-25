@@ -46,7 +46,8 @@ stages:
     gpu_memory_utilization: 0.35
     enforce_eager: false
     model_config:
-      # Maximum cached DiT shape graphs; older entries are evicted via LRU.
+      # Maximum number of cached DiT graphs. When the cache reaches this limit,
+      # capturing a new shape retires all existing graphs before capture.
       max_dit_graphs: 32
     default_sampling_params:
       seed: 0
