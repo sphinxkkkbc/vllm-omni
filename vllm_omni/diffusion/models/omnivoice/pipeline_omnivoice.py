@@ -241,6 +241,8 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         instruct = "None"
         voice_name = None
         seed = sampling_params.seed
+        if seed is None:
+            seed = (sampling_params.extra_args or {}).get("seed")
 
         if isinstance(prompt, dict):
             text = prompt.get("input") or prompt.get("text") or prompt.get("prompt")
