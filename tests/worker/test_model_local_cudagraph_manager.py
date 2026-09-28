@@ -16,21 +16,21 @@ import pytest
 import torch
 from vllm.platforms import current_platform
 
-from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
-    BaseVocoderCUDAGraphRoutine,
-    SupportsVocoderCUDAGraph,
-    VocoderCaptureMode,
-    VocoderCUDAGraphComponent,
-    VocoderCUDAGraphDescriptor,
-    VocoderGraphHandle,
-    VocoderRuntimeKey,
-    VocoderRuntimeResolution,
+from vllm_omni.model_executor.models.interfaces.model_local_cudagraph import (
+    BaseModelLocalCUDAGraphRoutine,
+    ModelLocalCaptureMode,
+    ModelLocalCUDAGraphComponent,
+    ModelLocalCUDAGraphDescriptor,
+    ModelLocalGraphHandle,
+    ModelLocalRuntimeKey,
+    ModelLocalRuntimeResolution,
+    SupportsModelLocalCUDAGraph,
 )
-from vllm_omni.worker.vocoder_cudagraph_manager import (
+from vllm_omni.worker.model_local_cudagraph_manager import (
     ManagedComponent,
-    VocoderCUDAGraphEntry,
-    VocoderCUDAGraphManager,
-    VocoderGraphStatsSink,
+    ModelLocalCUDAGraphEntry,
+    ModelLocalCUDAGraphManager,
+    ModelLocalGraphStatsSink,
     clone_tensor_tree,
 )
 
@@ -86,7 +86,7 @@ class _Graph:
         self.buffers.output.copy_(self.buffers.input * 2)
 
 
-class _Routine(BaseVocoderCUDAGraphRoutine):
+class _Routine(BaseModelLocalCUDAGraphRoutine):
     def __init__(self) -> None:
         self.eager_calls = 0
         self.validate_calls = 0
@@ -111,8 +111,8 @@ class _Routine(BaseVocoderCUDAGraphRoutine):
         self,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-        available: Set[VocoderCUDAGraphDescriptor],
-    ) -> VocoderRuntimeResolution:
+        available: Set[ModelLocalCUDAGraphDescriptor],
+    ) -> ModelLocalRuntimeResolution:
         del kwargs
         size = int(args[0].numel())
         descriptor = min(
@@ -120,9 +120,9 @@ class _Routine(BaseVocoderCUDAGraphRoutine):
             key=lambda item: item.variant if isinstance(item.variant, int) else 0,
             default=None,
         )
-        return VocoderRuntimeResolution(VocoderRuntimeKey(size), descriptor)
+        return ModelLocalRuntimeResolution(ModelLocalRuntimeKey(size), descriptor)
 
-    def allocate_buffers(self, descriptor: VocoderCUDAGraphDescriptor, device: torch.device) -> _Buffers:
+    def allocate_buffers(self, descriptor: ModelLocalCUDAGraphDescriptor, device: torch.device) -> _Buffers:
         assert isinstance(descriptor.variant, int)
         size = descriptor.variant
         return _Buffers(torch.zeros(size, device=device), torch.zeros(size, device=device))
@@ -183,7 +183,7 @@ class _LifecycleRoutine(_Routine):
         self.events.append("after")
 
     @contextmanager
-    def capture_context(self, descriptor: VocoderCUDAGraphDescriptor, buffers: object):
+    def capture_context(self, descriptor: ModelLocalCUDAGraphDescriptor, buffers: object):
         if self.context_only:
             del descriptor, buffers
             self.events.append("context-enter")
@@ -198,7 +198,7 @@ class _LifecycleRoutine(_Routine):
 
 class _ScopedLifecycleRoutine(_LifecycleRoutine):
     @contextmanager
-    def capture_context(self, descriptor: VocoderCUDAGraphDescriptor, buffers: object):
+    def capture_context(self, descriptor: ModelLocalCUDAGraphDescriptor, buffers: object):
         self.events.append("scope-enter")
         try:
             with super().capture_context(descriptor, buffers):
@@ -207,10 +207,10 @@ class _ScopedLifecycleRoutine(_LifecycleRoutine):
             self.events.append("scope-exit")
 
 
-class _TestManager(VocoderCUDAGraphManager):
+class _TestManager(ModelLocalCUDAGraphManager):
     def __init__(self, *, config: dict[str, Any] | None = None, log_stats: bool = False) -> None:
         vllm_config = SimpleNamespace(
-            model_config=SimpleNamespace(vocoder_cudagraph_config=config),
+            model_config=SimpleNamespace(model_local_cudagraph=config),
             compilation_config=SimpleNamespace(cudagraph_num_of_warmups=0),
             observability_config=SimpleNamespace(cudagraph_metrics=log_stats),
         )
@@ -222,18 +222,18 @@ class _TestManager(VocoderCUDAGraphManager):
         self.capture_attempts: Counter[tuple[str, object]] = Counter()
         self.capture_pools: list[object | None] = []
 
-    def prepare(self, model: SupportsVocoderCUDAGraph) -> None:
+    def prepare(self, model: SupportsModelLocalCUDAGraph) -> None:
         if self._use_default_component_config:
-            self.config = {component.component_id: {} for component in model.get_vocoder_cudagraph_components()}
+            self.config = {component.component_id: {} for component in model.get_model_local_cudagraph_components()}
         super().prepare(model)
 
     def capture_entry(
         self,
-        component: VocoderCUDAGraphComponent,
-        descriptor: VocoderCUDAGraphDescriptor,
+        component: ModelLocalCUDAGraphComponent,
+        descriptor: ModelLocalCUDAGraphDescriptor,
         *,
         graph_pool: object | None = None,
-    ) -> VocoderCUDAGraphEntry | None:
+    ) -> ModelLocalCUDAGraphEntry | None:
         self.capture_pools.append(graph_pool)
         self.components_during_capture.append(tuple(item._bound_handle is not None for item in self.components))
         key = (component.component_id, descriptor.variant)
@@ -249,7 +249,7 @@ class _TestManager(VocoderCUDAGraphManager):
             buffers,
             fail=(component.component_id, descriptor.variant) in self.fail_replay_for,
         )
-        return VocoderCUDAGraphEntry(
+        return ModelLocalCUDAGraphEntry(
             descriptor=descriptor,
             graph=cast(torch.cuda.CUDAGraph, graph),
             buffers=buffers,
@@ -258,27 +258,27 @@ class _TestManager(VocoderCUDAGraphManager):
 
 
 class _Model:
-    supports_vocoder_cudagraph = True
-    vocoder_cudagraph_shared_config_keys = frozenset({"shared_shape_policy"})
+    supports_model_local_cudagraph = True
+    model_local_cudagraph_shared_config_keys = frozenset({"shared_shape_policy"})
 
-    def __init__(self, components: tuple[VocoderCUDAGraphComponent, ...]) -> None:
+    def __init__(self, components: tuple[ModelLocalCUDAGraphComponent, ...]) -> None:
         self.components = components
 
-    def get_vocoder_cudagraph_components(self) -> tuple[VocoderCUDAGraphComponent, ...]:
+    def get_model_local_cudagraph_components(self) -> tuple[ModelLocalCUDAGraphComponent, ...]:
         return self.components
 
 
 def _component(
     component_id: str,
     *sizes: int,
-    capture_order_key: Callable[[VocoderCUDAGraphDescriptor], Any] | None = None,
-    capture_mode: VocoderCaptureMode = VocoderCaptureMode.PRECAPTURE,
-) -> tuple[VocoderCUDAGraphComponent, _Routine]:
+    capture_order_key: Callable[[ModelLocalCUDAGraphDescriptor], Any] | None = None,
+    capture_mode: ModelLocalCaptureMode = ModelLocalCaptureMode.PRECAPTURE,
+) -> tuple[ModelLocalCUDAGraphComponent, _Routine]:
     routine = _Routine()
-    component = VocoderCUDAGraphComponent(
+    component = ModelLocalCUDAGraphComponent(
         component_id,
         routine,
-        [VocoderCUDAGraphDescriptor(size) for size in sizes],
+        [ModelLocalCUDAGraphDescriptor(size) for size in sizes],
         supported_config_keys=frozenset({"bucket_policy"}),
         capture_order_key=capture_order_key,
         capture_mode=capture_mode,
@@ -286,12 +286,12 @@ def _component(
     return component, routine
 
 
-def _manager_for_capture(*, warmups: int) -> VocoderCUDAGraphManager:
+def _manager_for_capture(*, warmups: int) -> ModelLocalCUDAGraphManager:
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(vocoder_cudagraph_config=None),
+        model_config=SimpleNamespace(model_local_cudagraph=None),
         compilation_config=SimpleNamespace(cudagraph_num_of_warmups=warmups),
     )
-    return VocoderCUDAGraphManager(vllm_config=vllm_config, device=torch.device("cpu"))
+    return ModelLocalCUDAGraphManager(vllm_config=vllm_config, device=torch.device("cpu"))
 
 
 def _mock_cuda_capture(monkeypatch) -> None:
@@ -301,7 +301,7 @@ def _mock_cuda_capture(monkeypatch) -> None:
 
 
 def test_handle_exposes_runtime_call_and_read_only_graph_coverage() -> None:
-    handle = VocoderGraphHandle(lambda value, *, offset=0: value + offset)
+    handle = ModelLocalGraphHandle(lambda value, *, offset=0: value + offset)
 
     assert handle(2, offset=3) == 5
     assert handle.available_descriptors == frozenset()
@@ -313,34 +313,34 @@ def test_handle_exposes_runtime_call_and_read_only_graph_coverage() -> None:
 def test_component_descriptor_validation_defaults_to_capture() -> None:
     component, _ = _component("decode", 2)
 
-    assert component.validate_descriptor(VocoderCUDAGraphDescriptor(2))
+    assert component.validate_descriptor(ModelLocalCUDAGraphDescriptor(2))
 
 
 def test_capture_context_wraps_each_warmup_and_capture_forward(monkeypatch) -> None:
     routine = _LifecycleRoutine()
-    component = VocoderCUDAGraphComponent("decode", routine, [VocoderCUDAGraphDescriptor(2)])
+    component = ModelLocalCUDAGraphComponent("decode", routine, [ModelLocalCUDAGraphDescriptor(2)])
     manager = _manager_for_capture(warmups=2)
     _mock_cuda_capture(monkeypatch)
 
-    manager.capture_entry(component, VocoderCUDAGraphDescriptor(2), graph_pool=object())
+    manager.capture_entry(component, ModelLocalCUDAGraphDescriptor(2), graph_pool=object())
 
     assert routine.events == ["prepare", "forward", "after"] * 3
 
 
 def test_capture_context_runs_cleanup_when_forward_raises() -> None:
     routine = _LifecycleRoutine(fail_forward=True)
-    component = VocoderCUDAGraphComponent("decode", routine, [VocoderCUDAGraphDescriptor(2)])
+    component = ModelLocalCUDAGraphComponent("decode", routine, [ModelLocalCUDAGraphDescriptor(2)])
     manager = _manager_for_capture(warmups=1)
 
     with pytest.raises(RuntimeError, match="capture forward failed"):
-        manager.capture_entry(component, VocoderCUDAGraphDescriptor(2))
+        manager.capture_entry(component, ModelLocalCUDAGraphDescriptor(2))
 
     assert routine.events == ["prepare", "forward", "after"]
 
 
 def test_graph_capture_failure_resets_graph_and_uses_warmup_stream(monkeypatch) -> None:
     routine = _LifecycleRoutine()
-    component = VocoderCUDAGraphComponent("decode", routine, [VocoderCUDAGraphDescriptor(2)])
+    component = ModelLocalCUDAGraphComponent("decode", routine, [ModelLocalCUDAGraphDescriptor(2)])
     manager = _manager_for_capture(warmups=1)
     capture_stream = SimpleNamespace(synchronize=lambda: None)
     graph = SimpleNamespace(reset_called=False)
@@ -372,7 +372,7 @@ def test_graph_capture_failure_resets_graph_and_uses_warmup_stream(monkeypatch) 
     monkeypatch.setattr(torch.cuda, "graph", graph_context)
 
     with pytest.raises(RuntimeError, match="graph capture failed"):
-        manager.capture_entry(component, VocoderCUDAGraphDescriptor(2), graph_pool=object())
+        manager.capture_entry(component, ModelLocalCUDAGraphDescriptor(2), graph_pool=object())
 
     assert routine.events == ["prepare", "forward", "after"] * 2
     assert graph_streams == [capture_stream]
@@ -381,32 +381,32 @@ def test_graph_capture_failure_resets_graph_and_uses_warmup_stream(monkeypatch) 
 
 def test_manager_uses_capture_context_instead_of_prepare_or_after(monkeypatch) -> None:
     routine = _LifecycleRoutine(context_only=True)
-    component = VocoderCUDAGraphComponent("decode", routine, [VocoderCUDAGraphDescriptor(2)])
+    component = ModelLocalCUDAGraphComponent("decode", routine, [ModelLocalCUDAGraphDescriptor(2)])
     manager = _manager_for_capture(warmups=1)
     _mock_cuda_capture(monkeypatch)
 
-    manager.capture_entry(component, VocoderCUDAGraphDescriptor(2), graph_pool=object())
+    manager.capture_entry(component, ModelLocalCUDAGraphDescriptor(2), graph_pool=object())
 
     assert routine.events == ["context-enter", "context-exit"] * 2
 
 
 def test_capture_context_override_composes_default_lifecycle(monkeypatch) -> None:
     routine = _ScopedLifecycleRoutine()
-    component = VocoderCUDAGraphComponent("decode", routine, [VocoderCUDAGraphDescriptor(2)])
+    component = ModelLocalCUDAGraphComponent("decode", routine, [ModelLocalCUDAGraphDescriptor(2)])
     manager = _manager_for_capture(warmups=1)
     _mock_cuda_capture(monkeypatch)
 
-    manager.capture_entry(component, VocoderCUDAGraphDescriptor(2), graph_pool=object())
+    manager.capture_entry(component, ModelLocalCUDAGraphDescriptor(2), graph_pool=object())
 
     assert routine.events == ["scope-enter", "prepare", "forward", "after", "scope-exit"] * 2
 
 
 def test_stats_sink_bounds_detail_items_but_preserves_aggregate_counters() -> None:
-    sink = VocoderGraphStatsSink(enabled=True, max_log_items=2)
+    sink = ModelLocalGraphStatsSink(enabled=True, max_log_items=2)
     for variant in (1, 2, 3):
-        resolution = VocoderRuntimeResolution(
-            runtime_key=VocoderRuntimeKey(variant),
-            descriptor=VocoderCUDAGraphDescriptor(variant),
+        resolution = ModelLocalRuntimeResolution(
+            runtime_key=ModelLocalRuntimeKey(variant),
+            descriptor=ModelLocalCUDAGraphDescriptor(variant),
         )
         sink.record("hit", "decode", resolution)
 
@@ -418,8 +418,8 @@ def test_stats_sink_bounds_detail_items_but_preserves_aggregate_counters() -> No
 
 
 def test_stats_sink_logs_every_100_component_calls() -> None:
-    sink = VocoderGraphStatsSink(enabled=True)
-    resolution = VocoderRuntimeResolution(VocoderRuntimeKey(2), VocoderCUDAGraphDescriptor(2))
+    sink = ModelLocalGraphStatsSink(enabled=True)
+    resolution = ModelLocalRuntimeResolution(ModelLocalRuntimeKey(2), ModelLocalCUDAGraphDescriptor(2))
 
     with patch.object(logging.Logger, "info") as log_info:
         for _ in range(99):
@@ -435,9 +435,9 @@ def test_stats_sink_logs_every_100_component_calls() -> None:
 def test_runtime_lazy_capture_logs_only_new_entries(monkeypatch) -> None:
     component, _ = _component("decode", 2)
     manager = _TestManager()
-    descriptor = VocoderCUDAGraphDescriptor(3)
+    descriptor = ModelLocalCUDAGraphDescriptor(3)
     fake_buffers = _Buffers(torch.zeros(1), torch.zeros(1))
-    fake_entry = VocoderCUDAGraphEntry(
+    fake_entry = ModelLocalCUDAGraphEntry(
         descriptor=descriptor,
         graph=cast(torch.cuda.CUDAGraph, _Graph(fake_buffers)),
         buffers=fake_buffers,
@@ -446,10 +446,10 @@ def test_runtime_lazy_capture_logs_only_new_entries(monkeypatch) -> None:
     managed = ManagedComponent(
         component=component,
         entries=OrderedDict(),
-        capture_mode=VocoderCaptureMode.PRECAPTURE_LAZY,
+        capture_mode=ModelLocalCaptureMode.PRECAPTURE_LAZY,
         max_graphs=1,
     )
-    calls: list[VocoderCUDAGraphDescriptor] = []
+    calls: list[ModelLocalCUDAGraphDescriptor] = []
 
     def capture(managed_component, requested_descriptor):
         assert managed_component is managed
@@ -465,7 +465,7 @@ def test_runtime_lazy_capture_logs_only_new_entries(monkeypatch) -> None:
     assert result is fake_entry
     assert calls == [descriptor]
     log_info.assert_called_once_with(
-        "Lazy-captured vocoder CUDA Graph Component %s Descriptor %r",
+        "Lazy-captured model-local CUDA Graph Component %s Descriptor %r",
         "decode",
         descriptor,
     )
@@ -491,10 +491,10 @@ def test_capture_binds_only_after_all_components_are_captured_and_clear_restores
     assert manager.components_during_capture
     assert all(not any(bound) for bound in manager.components_during_capture)
     assert set(manager.managed_components) == {"first", "second"}
-    assert isinstance(first._bound_handle, VocoderGraphHandle)
-    assert isinstance(second._bound_handle, VocoderGraphHandle)
-    assert first.available_descriptors == frozenset({VocoderCUDAGraphDescriptor(4)})
-    assert second.available_descriptors == frozenset({VocoderCUDAGraphDescriptor(8)})
+    assert isinstance(first._bound_handle, ModelLocalGraphHandle)
+    assert isinstance(second._bound_handle, ModelLocalGraphHandle)
+    assert first.available_descriptors == frozenset({ModelLocalCUDAGraphDescriptor(4)})
+    assert second.available_descriptors == frozenset({ModelLocalCUDAGraphDescriptor(8)})
     value = torch.tensor([1.0, 2.0])
     first_output = first(value)
     assert torch.equal(first_output, value * 2)
@@ -526,7 +526,7 @@ def test_unified_fallback_uses_segmented_graph_after_all_components_bind() -> No
             return buffers.output
 
     unified_routine = _UnifiedRoutine()
-    unified = VocoderCUDAGraphComponent("unified", unified_routine, [VocoderCUDAGraphDescriptor(2)])
+    unified = ModelLocalCUDAGraphComponent("unified", unified_routine, [ModelLocalCUDAGraphDescriptor(2)])
     manager = _TestManager()
     manager.prepare(_Model((segmented, unified)))
     manager.capture_and_bind()
@@ -535,7 +535,7 @@ def test_unified_fallback_uses_segmented_graph_after_all_components_bind() -> No
     assert segmented_routine.eager_calls == 1
     assert all(not any(bound) for bound in manager.components_during_capture)
 
-    segmented_entry = manager.managed_components["segmented"].entries[VocoderCUDAGraphDescriptor(4)]
+    segmented_entry = manager.managed_components["segmented"].entries[ModelLocalCUDAGraphDescriptor(4)]
     replay_calls = 0
     original_replay = segmented_entry.graph.replay
 
@@ -608,11 +608,11 @@ def test_config_validation_catches_unknown_component_and_extension_keys() -> Non
     component, _ = _component("decode", 2)
 
     manager = _TestManager(config={"unknown": 1})
-    with pytest.raises(ValueError, match="Unknown vocoder CUDA Graph component"):
+    with pytest.raises(ValueError, match="Unknown model-local CUDA Graph component"):
         manager.prepare(_Model((component,)))
 
     manager = _TestManager(config={"missing": {}})
-    with pytest.raises(ValueError, match="Unknown vocoder CUDA Graph component"):
+    with pytest.raises(ValueError, match="Unknown model-local CUDA Graph component"):
         manager.prepare(_Model((component,)))
 
     manager = _TestManager(config={"decode": {"unknown_bucket_policy": [2]}})
@@ -629,7 +629,7 @@ def test_config_validation_catches_unknown_component_and_extension_keys() -> Non
     ],
 )
 def test_component_policy_validation_rejects_invalid_types(key, value, message) -> None:
-    component, _ = _component("decode", 2, capture_mode=VocoderCaptureMode.PRECAPTURE_LAZY)
+    component, _ = _component("decode", 2, capture_mode=ModelLocalCaptureMode.PRECAPTURE_LAZY)
     manager = _TestManager(config={"decode": {key: value}})
 
     with pytest.raises(TypeError, match=message):
@@ -640,13 +640,13 @@ def test_component_registry_rejects_duplicate_ids_and_descriptors() -> None:
     first, _ = _component("decode", 2)
     duplicate_id, _ = _component("decode", 3)
     manager = _TestManager()
-    with pytest.raises(ValueError, match="Duplicate vocoder CUDA Graph component_id"):
+    with pytest.raises(ValueError, match="Duplicate model-local CUDA Graph component_id"):
         manager.prepare(_Model((first, duplicate_id)))
 
-    duplicate_descriptor = VocoderCUDAGraphComponent(
+    duplicate_descriptor = ModelLocalCUDAGraphComponent(
         "duplicate",
         _Routine(),
-        [VocoderCUDAGraphDescriptor(2), VocoderCUDAGraphDescriptor(2)],
+        [ModelLocalCUDAGraphDescriptor(2), ModelLocalCUDAGraphDescriptor(2)],
     )
     manager = _TestManager()
     with pytest.raises(ValueError, match="Duplicate Descriptor"):
@@ -666,7 +666,7 @@ def test_omitted_component_remains_on_original_eager_callable() -> None:
 
 
 def test_pure_lazy_profiles_descriptors_but_does_not_capture_at_startup(monkeypatch) -> None:
-    component, routine = _component("decode", 2, capture_mode=VocoderCaptureMode.PURE_LAZY)
+    component, routine = _component("decode", 2, capture_mode=ModelLocalCaptureMode.PURE_LAZY)
     manager = _TestManager(config={"decode": {"max_extra_graphs": 1}})
     manager.prepare(_Model((component,)))
     manager.capture_and_bind()
@@ -677,7 +677,7 @@ def test_pure_lazy_profiles_descriptors_but_does_not_capture_at_startup(monkeypa
     monkeypatch.setattr(manager, "_runtime_capture_scope", nullcontext)
     value = torch.ones(2)
     assert torch.equal(component(value), value * 2)
-    assert component.available_descriptors == frozenset({VocoderCUDAGraphDescriptor(2)})
+    assert component.available_descriptors == frozenset({ModelLocalCUDAGraphDescriptor(2)})
     assert manager.capture_attempts[("decode", 2)] == 1
     larger = torch.ones(3)
     assert torch.equal(component(larger), larger * 2)
@@ -686,14 +686,14 @@ def test_pure_lazy_profiles_descriptors_but_does_not_capture_at_startup(monkeypa
 
 
 def test_pure_lazy_requires_profiling_descriptors() -> None:
-    component, _ = _component("decode", capture_mode=VocoderCaptureMode.PURE_LAZY)
+    component, _ = _component("decode", capture_mode=ModelLocalCaptureMode.PURE_LAZY)
     manager = _TestManager(config={"decode": {}})
     with pytest.raises(ValueError, match="needs descriptors for memory profiling"):
         manager.prepare(_Model((component,)))
 
 
 def test_descriptor_rejection_falls_back_to_eager_without_capture(monkeypatch) -> None:
-    component, routine = _component("decode", 2, capture_mode=VocoderCaptureMode.PRECAPTURE_LAZY)
+    component, routine = _component("decode", 2, capture_mode=ModelLocalCaptureMode.PRECAPTURE_LAZY)
     manager = _TestManager(config={"decode": {"max_extra_graphs": 1}})
     validation_calls = []
 
@@ -712,11 +712,11 @@ def test_descriptor_rejection_falls_back_to_eager_without_capture(monkeypatch) -
     assert torch.equal(component(value), value * 2)
     assert routine.eager_calls == 2
     assert manager.capture_attempts[("decode", 2)] == 3
-    assert validation_calls == [VocoderCUDAGraphDescriptor(2)] * 3
+    assert validation_calls == [ModelLocalCUDAGraphDescriptor(2)] * 3
 
 
 def test_successful_lazy_miss_registers_descriptor_and_replays_current_call(monkeypatch) -> None:
-    component, routine = _component("decode", 2, capture_mode=VocoderCaptureMode.PRECAPTURE_LAZY)
+    component, routine = _component("decode", 2, capture_mode=ModelLocalCaptureMode.PRECAPTURE_LAZY)
     manager = _TestManager(config={"decode": {}})
     manager.prepare(_Model((component,)))
     manager.capture_and_bind()
@@ -730,7 +730,7 @@ def test_successful_lazy_miss_registers_descriptor_and_replays_current_call(monk
     assert routine.eager_calls == 0
 
 
-@pytest.mark.parametrize("mode", [VocoderCaptureMode.PRECAPTURE_LAZY, VocoderCaptureMode.PURE_LAZY])
+@pytest.mark.parametrize("mode", [ModelLocalCaptureMode.PRECAPTURE_LAZY, ModelLocalCaptureMode.PURE_LAZY])
 def test_zero_lazy_graph_limit_keeps_all_captured_descriptors(monkeypatch, mode) -> None:
     component, routine = _component("decode", 2, capture_mode=mode)
     manager = _TestManager(config={"decode": {}})
@@ -744,13 +744,13 @@ def test_zero_lazy_graph_limit_keeps_all_captured_descriptors(monkeypatch, mode)
         assert torch.equal(component(value), value * 2)
 
     assert manager.managed_components["decode"].max_graphs is None
-    expected = {2, 3, 4, 5} if mode is VocoderCaptureMode.PRECAPTURE_LAZY else {3, 4, 5}
+    expected = {2, 3, 4, 5} if mode is ModelLocalCaptureMode.PRECAPTURE_LAZY else {3, 4, 5}
     assert {descriptor.variant for descriptor in component.available_descriptors} == expected
     assert routine.eager_calls == 0
 
 
 def test_lazy_capture_rejects_nested_outer_capture(monkeypatch) -> None:
-    component, routine = _component("decode", 2, capture_mode=VocoderCaptureMode.PRECAPTURE_LAZY)
+    component, routine = _component("decode", 2, capture_mode=ModelLocalCaptureMode.PRECAPTURE_LAZY)
     manager = _TestManager(config={"decode": {"max_extra_graphs": 1}})
     manager.prepare(_Model((component,)))
     manager.capture_and_bind()
@@ -763,7 +763,7 @@ def test_lazy_capture_rejects_nested_outer_capture(monkeypatch) -> None:
 
 
 def test_lazy_capacity_falls_back_without_evicting_startup_entries(monkeypatch) -> None:
-    component, routine = _component("decode", 2, 3, capture_mode=VocoderCaptureMode.PRECAPTURE_LAZY)
+    component, routine = _component("decode", 2, 3, capture_mode=ModelLocalCaptureMode.PRECAPTURE_LAZY)
     manager = _TestManager(config={"decode": {"max_extra_graphs": 1}})
     manager.prepare(_Model((component,)))
     manager.capture_and_bind()
@@ -776,9 +776,9 @@ def test_lazy_capacity_falls_back_without_evicting_startup_entries(monkeypatch) 
     assert [descriptor.variant for descriptor in entries] == [3, 2, 4]
     assert component.available_descriptors == frozenset(
         {
-            VocoderCUDAGraphDescriptor(3),
-            VocoderCUDAGraphDescriptor(2),
-            VocoderCUDAGraphDescriptor(4),
+            ModelLocalCUDAGraphDescriptor(3),
+            ModelLocalCUDAGraphDescriptor(2),
+            ModelLocalCUDAGraphDescriptor(4),
         }
     )
     assert manager.capture_attempts[("decode", 5)] == 0
@@ -861,8 +861,8 @@ def test_descriptor_rejection_isolated_to_sibling_component() -> None:
     manager.prepare(_Model((first, second)))
     manager.capture_and_bind()
 
-    assert list(manager.managed_components["first"].entries) == [VocoderCUDAGraphDescriptor(3)]
-    assert list(manager.managed_components["second"].entries) == [VocoderCUDAGraphDescriptor(4)]
+    assert list(manager.managed_components["first"].entries) == [ModelLocalCUDAGraphDescriptor(3)]
+    assert list(manager.managed_components["second"].entries) == [ModelLocalCUDAGraphDescriptor(4)]
 
 
 def test_capture_failure_propagates() -> None:
@@ -871,16 +871,16 @@ def test_capture_failure_propagates() -> None:
             del descriptor, device
             raise RuntimeError("capture allocation failed")
 
-    component = VocoderCUDAGraphComponent(
+    component = ModelLocalCUDAGraphComponent(
         "decode",
         _FailingRoutine(),
-        [VocoderCUDAGraphDescriptor(2)],
+        [ModelLocalCUDAGraphDescriptor(2)],
     )
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(vocoder_cudagraph_config={"decode": {}}),
+        model_config=SimpleNamespace(model_local_cudagraph={"decode": {}}),
         compilation_config=SimpleNamespace(cudagraph_num_of_warmups=0),
     )
-    manager = VocoderCUDAGraphManager(vllm_config=vllm_config, device=torch.device("cpu"))
+    manager = ModelLocalCUDAGraphManager(vllm_config=vllm_config, device=torch.device("cpu"))
     manager.prepare(_Model((component,)))
 
     with pytest.raises(RuntimeError, match="capture allocation failed"):
@@ -898,7 +898,7 @@ def test_capture_and_bind_reports_total_memory_delta(monkeypatch):
     def capture(component, descriptor):
         buffers = component.routine.allocate_buffers(descriptor, torch.device("cpu"))
         output = component.routine.forward_for_capture(buffers)
-        return VocoderCUDAGraphEntry(
+        return ModelLocalCUDAGraphEntry(
             descriptor=descriptor,
             graph=cast(torch.cuda.CUDAGraph, _Graph(buffers)),
             buffers=buffers,
@@ -928,7 +928,7 @@ def test_profile_memory_uses_first_capture_and_per_graph_increment(monkeypatch):
         3,
         4,
         capture_order_key=lambda descriptor: descriptor.variant,
-        capture_mode=VocoderCaptureMode.PRECAPTURE_LAZY,
+        capture_mode=ModelLocalCaptureMode.PRECAPTURE_LAZY,
     )
     second, _ = _component("second", 5)
     manager = _TestManager(config={"first": {"max_extra_graphs": 2}, "second": {}})
@@ -943,7 +943,7 @@ def test_profile_memory_uses_first_capture_and_per_graph_increment(monkeypatch):
         capture_pools.append(graph_pool)
         captured_variants.append(descriptor.variant)
         buffers = _Buffers(torch.zeros(1), torch.zeros(1))
-        entry = VocoderCUDAGraphEntry(
+        entry = ModelLocalCUDAGraphEntry(
             descriptor=descriptor,
             graph=cast(torch.cuda.CUDAGraph, _Graph(buffers)),
             buffers=buffers,
