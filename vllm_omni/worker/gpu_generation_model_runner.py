@@ -41,20 +41,20 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 from vllm.v1.worker.workspace import lock_workspace
 
-from vllm_omni.model_executor.models.interfaces.vocoder_cudagraph import (
-    SupportsVocoderCUDAGraph,
-    supports_vocoder_cudagraph,
+from vllm_omni.model_executor.models.interfaces.model_local_cudagraph import (
+    SupportsModelLocalCUDAGraph,
+    supports_model_local_cudagraph,
 )
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_payload_list
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.mixins import maybe_unpad_input_ids
+from vllm_omni.worker.model_local_cudagraph_manager import ModelLocalCUDAGraphManager
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
 )
-from vllm_omni.worker.vocoder_cudagraph_manager import VocoderCUDAGraphManager
 
 logger = logging.getLogger(__name__)
 
@@ -69,38 +69,38 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.vocoder_cudagraph_manager: VocoderCUDAGraphManager | None = None
+        self.model_local_cudagraph_manager: ModelLocalCUDAGraphManager | None = None
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
         if needs_omni_connector(self.model_config):
             self.init_omni_connectors(
                 model_config=self.model_config,
             )
 
-    def _vocoder_cudagraph_enabled(self) -> bool:
+    def _model_local_cudagraph_enabled(self) -> bool:
         return (
             not self.model_config.enforce_eager
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-            and bool(getattr(self.model_config, "vocoder_cudagraph_config", None))
-            and supports_vocoder_cudagraph(self.get_model())
+            and bool(getattr(self.model_config, "model_local_cudagraph", None))
+            and supports_model_local_cudagraph(self.get_model())
         )
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
-        if not self._vocoder_cudagraph_enabled():
+        if not self._model_local_cudagraph_enabled():
             return
 
         raw_model = self.get_model()
-        manager = VocoderCUDAGraphManager(
+        manager = ModelLocalCUDAGraphManager(
             vllm_config=self.vllm_config,
             device=self.device,
         )
-        manager.prepare(cast(SupportsVocoderCUDAGraph, raw_model))
-        self.vocoder_cudagraph_manager = manager
-        logger.info("Initialized runner-owned vocoder CUDA Graph manager")
+        manager.prepare(cast(SupportsModelLocalCUDAGraph, raw_model))
+        self.model_local_cudagraph_manager = manager
+        logger.info("Initialized runner-owned model-local CUDA Graph manager")
 
     @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
-        manager = self.vocoder_cudagraph_manager
+        manager = self.model_local_cudagraph_manager
         if manager is not None:
             set_cudagraph_capturing_enabled(True)
             try:
@@ -114,7 +114,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
     @torch.inference_mode()
     def capture_model(self) -> int:
-        manager = self.vocoder_cudagraph_manager
+        manager = self.model_local_cudagraph_manager
         if manager is None:
             return super().capture_model()
 
@@ -135,15 +135,15 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         lock_workspace()
         captured_bytes = max(0, free_before - free_after)
         logger.info(
-            "Runner-owned vocoder CUDA Graph capture replaced upstream model capture (%.2f MiB)",
+            "Runner-owned model-local CUDA Graph capture replaced upstream model capture (%.2f MiB)",
             captured_bytes / (1 << 20),
         )
         return captured_bytes
 
     def shutdown(self) -> None:
-        if self.vocoder_cudagraph_manager is not None:
-            self.vocoder_cudagraph_manager.clear()
-            self.vocoder_cudagraph_manager = None
+        if self.model_local_cudagraph_manager is not None:
+            self.model_local_cudagraph_manager.clear()
+            self.model_local_cudagraph_manager = None
         super().shutdown()
 
     def _update_request_states(self, scheduler_output: SchedulerOutput):
@@ -304,7 +304,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 # The raw model's declared Components own graph replay for this
                 # stage. Keep the upstream root wrapper on its eager runnable.
-                force_eager=self.vocoder_cudagraph_manager is not None,
+                force_eager=self.model_local_cudagraph_manager is not None,
             )
 
             logger.debug(
@@ -684,9 +684,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
         """
-        if self.vocoder_cudagraph_manager is not None:
+        if self.model_local_cudagraph_manager is not None:
             # Warmup/profile calls must not accidentally trigger the upstream
-            # root CUDAGraphWrapper once vocoder Components own graph capture.
+            # root CUDAGraphWrapper once model-local Components own graph capture.
             cudagraph_runtime_mode = CUDAGraphMode.NONE
 
         mm_config = self.vllm_config.model_config.multimodal_config

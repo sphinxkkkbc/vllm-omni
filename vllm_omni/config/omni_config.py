@@ -168,7 +168,7 @@ class _ModelEngineOverrides(TypedDict, total=False):
     enable_broadcast_weight_load: bool
     num_weight_load_threads: int
     disable_autocast: bool
-    vocoder_cudagraph: dict[str, Any]
+    model_local_cudagraph: dict[str, Any]
     # Upstream ModelConfig inputs that users pass as global CLI flags.
     served_model_name: str | list[str]
     allowed_local_media_path: str
@@ -459,9 +459,9 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
     requires_full_payload_input: bool = False
-    # User-facing per-stage runner-owned vocoder graph configuration. It is
-    # projected to OmniModelConfig.vocoder_cudagraph_config by OmniEngineArgs.
-    vocoder_cudagraph: dict[str, Any] | None = None
+    # User-facing per-stage runner-owned model-local graph configuration. It is
+    # projected to OmniModelConfig.model_local_cudagraph by OmniEngineArgs.
+    model_local_cudagraph: dict[str, Any] | None = None
     # Upstream ModelConfig inputs that users pass as global CLI flags.
     served_model_name: str | list[str] | None = None
     allowed_local_media_path: str | None = None
@@ -1702,11 +1702,11 @@ def _build_stage_config(
         ),
     )
     if (
-        stage_config.model_config.vocoder_cudagraph is not None
+        stage_config.model_config.model_local_cudagraph is not None
         and topology.execution_type != StageExecutionType.LLM_GENERATION
     ):
         raise ValueError(
-            "vocoder_cudagraph is supported only for LLM_GENERATION stages; "
+            "model_local_cudagraph is supported only for LLM_GENERATION stages; "
             f"stage {topology.stage_id} uses {topology.execution_type.value}"
         )
     return stage_config

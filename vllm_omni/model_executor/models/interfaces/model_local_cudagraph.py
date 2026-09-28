@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Model-facing contracts for runner-owned vocoder CUDA Graphs.
+"""Model-facing contracts for runner-owned model-local CUDA Graphs.
 
 This module intentionally contains no worker lifecycle implementation. Model
 packages depend on these declarations; the worker-side manager consumes them.
@@ -20,7 +20,7 @@ import torch
 VariantT = TypeVar("VariantT", bound=Hashable)
 
 
-class VocoderCaptureMode(str, Enum):
+class ModelLocalCaptureMode(str, Enum):
     """Model-owned capture timing for one Component; runtime graphs are never evicted."""
 
     PRECAPTURE = "precapture"
@@ -29,33 +29,33 @@ class VocoderCaptureMode(str, Enum):
 
     @property
     def allows_lazy_capture(self) -> bool:
-        return self is not VocoderCaptureMode.PRECAPTURE
+        return self is not ModelLocalCaptureMode.PRECAPTURE
 
 
 @dataclass(frozen=True)
-class VocoderCUDAGraphDescriptor(Generic[VariantT]):
+class ModelLocalCUDAGraphDescriptor(Generic[VariantT]):
     """One immutable, Component-scoped capture specialization."""
 
     variant: VariantT
 
 
 @dataclass(frozen=True)
-class VocoderRuntimeKey(Generic[VariantT]):
+class ModelLocalRuntimeKey(Generic[VariantT]):
     """Actual runtime input identity before capture-bucket selection."""
 
     variant: VariantT
 
 
 @dataclass(frozen=True)
-class VocoderRuntimeResolution:
+class ModelLocalRuntimeResolution:
     """A valid runtime invocation mapped to an available Descriptor, if any."""
 
-    runtime_key: VocoderRuntimeKey
-    descriptor: VocoderCUDAGraphDescriptor | None
+    runtime_key: ModelLocalRuntimeKey
+    descriptor: ModelLocalCUDAGraphDescriptor | None
 
 
-class VocoderGraphHandle:
-    """Opaque runtime endpoint for one bound vocoder CUDA Graph Component.
+class ModelLocalGraphHandle:
+    """Opaque runtime endpoint for one bound model-local CUDA Graph Component.
 
     The Handle type is shared by the model-facing Component and worker-side
     Manager, but Handle instances are manager-created and manager-owned. It
@@ -69,7 +69,7 @@ class VocoderGraphHandle:
     def __init__(
         self,
         call: Callable[..., Any],
-        get_available_descriptors: Callable[[], frozenset[VocoderCUDAGraphDescriptor]] = frozenset,
+        get_available_descriptors: Callable[[], frozenset[ModelLocalCUDAGraphDescriptor]] = frozenset,
     ) -> None:
         self._call = call
         self._get_available_descriptors = get_available_descriptors
@@ -78,13 +78,13 @@ class VocoderGraphHandle:
         return self._call(*args, **kwargs)
 
     @property
-    def available_descriptors(self) -> frozenset[VocoderCUDAGraphDescriptor]:
+    def available_descriptors(self) -> frozenset[ModelLocalCUDAGraphDescriptor]:
         """A read-only snapshot of descriptors currently backed by graphs."""
 
         return self._get_available_descriptors()
 
 
-class VocoderCUDAGraphRoutine(Protocol):
+class ModelLocalCUDAGraphRoutine(Protocol):
     """Model-specific adapter for graph-shape resolution and static-buffer handling.
 
     A Routine owns graph-shape resolution and static-buffer adaptation. Request/model
@@ -107,17 +107,17 @@ class VocoderCUDAGraphRoutine(Protocol):
         self,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-        available: Set[VocoderCUDAGraphDescriptor],
-    ) -> VocoderRuntimeResolution: ...
+        available: Set[ModelLocalCUDAGraphDescriptor],
+    ) -> ModelLocalRuntimeResolution: ...
 
     def make_lazy_descriptor(
         self,
-        runtime_key: VocoderRuntimeKey,
-    ) -> VocoderCUDAGraphDescriptor | None: ...
+        runtime_key: ModelLocalRuntimeKey,
+    ) -> ModelLocalCUDAGraphDescriptor | None: ...
 
     def allocate_buffers(
         self,
-        descriptor: VocoderCUDAGraphDescriptor,
+        descriptor: ModelLocalCUDAGraphDescriptor,
         device: torch.device,
     ) -> object:
         """Allocate descriptor-owned static buffers used by capture and replay.
@@ -138,7 +138,7 @@ class VocoderCUDAGraphRoutine(Protocol):
         ...
 
     def capture_context(
-        self, descriptor: VocoderCUDAGraphDescriptor, buffers: object
+        self, descriptor: ModelLocalCUDAGraphDescriptor, buffers: object
     ) -> AbstractContextManager[None]: ...
 
     def forward_for_capture(self, buffers: object) -> object: ...
@@ -179,7 +179,7 @@ class VocoderCUDAGraphRoutine(Protocol):
         ...
 
 
-class BaseVocoderCUDAGraphRoutine:
+class BaseModelLocalCUDAGraphRoutine:
     """Model-specific adapter between runtime calls and static CUDA Graph buffers.
 
     A Routine owns graph-shape resolution and static-buffer adaptation.
@@ -198,9 +198,9 @@ class BaseVocoderCUDAGraphRoutine:
 
     def make_lazy_descriptor(
         self,
-        runtime_key: VocoderRuntimeKey,
-    ) -> VocoderCUDAGraphDescriptor | None:
-        return VocoderCUDAGraphDescriptor(runtime_key.variant)
+        runtime_key: ModelLocalRuntimeKey,
+    ) -> ModelLocalCUDAGraphDescriptor | None:
+        return ModelLocalCUDAGraphDescriptor(runtime_key.variant)
 
     def prepare_for_capture(self, buffers: object) -> None:
         del buffers
@@ -209,7 +209,9 @@ class BaseVocoderCUDAGraphRoutine:
         del buffers
 
     @contextmanager
-    def capture_context(self, descriptor: VocoderCUDAGraphDescriptor, buffers: object) -> Generator[None, None, None]:
+    def capture_context(
+        self, descriptor: ModelLocalCUDAGraphDescriptor, buffers: object
+    ) -> Generator[None, None, None]:
         del descriptor
         self.prepare_for_capture(buffers)
         try:
@@ -218,24 +220,24 @@ class BaseVocoderCUDAGraphRoutine:
             self.after_capture(buffers)
 
 
-class VocoderCUDAGraphComponent:
+class ModelLocalCUDAGraphComponent:
     """Resolved planning declaration and stable model-owned call site.
 
     Before Manager binding, the delegate is ``Routine.eager_call``. After
-    binding, it is the Manager-created ``VocoderGraphHandle``. Restoring or
+    binding, it is the Manager-created ``ModelLocalGraphHandle``. Restoring or
     clearing the Component returns the delegate to ``Routine.eager_call``.
     """
 
     def __init__(
         self,
         component_id: str,
-        routine: VocoderCUDAGraphRoutine,
-        descriptors: Sequence[VocoderCUDAGraphDescriptor],
+        routine: ModelLocalCUDAGraphRoutine,
+        descriptors: Sequence[ModelLocalCUDAGraphDescriptor],
         clone_output: bool = True,
         *,
         supported_config_keys: Set[str] = frozenset(),
-        capture_order_key: Callable[[VocoderCUDAGraphDescriptor], Any] | None = None,
-        capture_mode: VocoderCaptureMode = VocoderCaptureMode.PRECAPTURE,
+        capture_order_key: Callable[[ModelLocalCUDAGraphDescriptor], Any] | None = None,
+        capture_mode: ModelLocalCaptureMode = ModelLocalCaptureMode.PRECAPTURE,
     ) -> None:
         self.component_id = component_id
         self.routine = routine
@@ -245,22 +247,22 @@ class VocoderCUDAGraphComponent:
         self.clone_output = bool(clone_output)
         self.supported_config_keys = frozenset(supported_config_keys)
         self._capture_order_key = capture_order_key
-        self.capture_mode = VocoderCaptureMode(capture_mode)
+        self.capture_mode = ModelLocalCaptureMode(capture_mode)
         self._delegate: Callable[..., Any] = routine.eager_call
         # The Component owns the stable call site, not the runtime Handle
         # lifecycle. The Manager constructs and binds the Handle after capture.
-        self._bound_handle: VocoderGraphHandle | None = None
+        self._bound_handle: ModelLocalGraphHandle | None = None
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self._delegate(*args, **kwargs)
 
-    def validate_descriptor(self, descriptor: VocoderCUDAGraphDescriptor) -> bool:
+    def validate_descriptor(self, descriptor: ModelLocalCUDAGraphDescriptor) -> bool:
         """Validate a descriptor against the Component's supported variants."""
         del descriptor
         return True
 
     @property
-    def capture_descriptors(self) -> tuple[VocoderCUDAGraphDescriptor, ...]:
+    def capture_descriptors(self) -> tuple[ModelLocalCUDAGraphDescriptor, ...]:
         """Startup descriptors ordered to establish the largest graph first.
 
         By default the Descriptor variant is the ordering key. Components whose
@@ -283,16 +285,16 @@ class VocoderCUDAGraphComponent:
         return self._bound_handle is not None
 
     @property
-    def available_descriptors(self) -> frozenset[VocoderCUDAGraphDescriptor]:
+    def available_descriptors(self) -> frozenset[ModelLocalCUDAGraphDescriptor]:
         """Descriptors currently backed by active non-eager graph entries."""
 
         if self._bound_handle is None:
             return frozenset()
         return self._bound_handle.available_descriptors
 
-    def _bind_handle(self, handle: VocoderGraphHandle) -> None:
-        if not isinstance(handle, VocoderGraphHandle):
-            raise TypeError("VocoderCUDAGraphComponent requires a VocoderGraphHandle")
+    def _bind_handle(self, handle: ModelLocalGraphHandle) -> None:
+        if not isinstance(handle, ModelLocalGraphHandle):
+            raise TypeError("ModelLocalCUDAGraphComponent requires a ModelLocalGraphHandle")
         if self._bound_handle is not None:
             raise RuntimeError(f"Component already bound: {self.component_id}")
         self._bound_handle = handle
@@ -304,13 +306,13 @@ class VocoderCUDAGraphComponent:
 
 
 @runtime_checkable
-class SupportsVocoderCUDAGraph(Protocol):
-    supports_vocoder_cudagraph: ClassVar[Literal[True]]
+class SupportsModelLocalCUDAGraph(Protocol):
+    supports_model_local_cudagraph: ClassVar[Literal[True]]
 
-    def get_vocoder_cudagraph_components(self) -> Sequence[VocoderCUDAGraphComponent]: ...
+    def get_model_local_cudagraph_components(self) -> Sequence[ModelLocalCUDAGraphComponent]: ...
 
 
-def supports_vocoder_cudagraph(model: object) -> bool:
-    return bool(getattr(model, "supports_vocoder_cudagraph", False)) and callable(
-        getattr(model, "get_vocoder_cudagraph_components", None)
+def supports_model_local_cudagraph(model: object) -> bool:
+    return bool(getattr(model, "supports_model_local_cudagraph", False)) and callable(
+        getattr(model, "get_model_local_cudagraph_components", None)
     )

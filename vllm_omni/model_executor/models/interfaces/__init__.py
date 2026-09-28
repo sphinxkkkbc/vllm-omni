@@ -1,28 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from .vocoder_cudagraph import (
-    BaseVocoderCUDAGraphRoutine,
-    SupportsVocoderCUDAGraph,
-    VocoderCaptureMode,
-    VocoderCUDAGraphComponent,
-    VocoderCUDAGraphDescriptor,
-    VocoderCUDAGraphRoutine,
-    VocoderGraphHandle,
-    VocoderRuntimeKey,
-    VocoderRuntimeResolution,
-    supports_vocoder_cudagraph,
+from .model_local_cudagraph import (
+    BaseModelLocalCUDAGraphRoutine,
+    ModelLocalCaptureMode,
+    ModelLocalCUDAGraphComponent,
+    ModelLocalCUDAGraphDescriptor,
+    ModelLocalCUDAGraphRoutine,
+    ModelLocalGraphHandle,
+    ModelLocalRuntimeKey,
+    ModelLocalRuntimeResolution,
+    SupportsModelLocalCUDAGraph,
+    supports_model_local_cudagraph,
 )
 
 __all__ = [
-    "BaseVocoderCUDAGraphRoutine",
-    "VocoderCaptureMode",
-    "SupportsVocoderCUDAGraph",
-    "VocoderCUDAGraphDescriptor",
-    "VocoderCUDAGraphRoutine",
-    "VocoderCUDAGraphComponent",
-    "VocoderGraphHandle",
-    "VocoderRuntimeKey",
-    "VocoderRuntimeResolution",
-    "supports_vocoder_cudagraph",
+    "BaseModelLocalCUDAGraphRoutine",
+    "ModelLocalCaptureMode",
+    "SupportsModelLocalCUDAGraph",
+    "ModelLocalCUDAGraphDescriptor",
+    "ModelLocalCUDAGraphRoutine",
+    "ModelLocalCUDAGraphComponent",
+    "ModelLocalGraphHandle",
+    "ModelLocalRuntimeKey",
+    "ModelLocalRuntimeResolution",
+    "supports_model_local_cudagraph",
 ]
