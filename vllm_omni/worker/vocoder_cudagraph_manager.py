@@ -171,7 +171,7 @@ class VocoderCUDAGraphManager:
         self._component_configs: dict[str, VocoderComponentRuntimeConfig] = {}
         self._runtime_capture_stream: torch.cuda.Stream | None = None
         self._prepared = False
-        self._capture_finished = False
+        self._capture_attempted = False
 
         raw_config = getattr(vllm_config.model_config, "vocoder_cudagraph_config", None)
         if raw_config is None:
@@ -267,8 +267,6 @@ class VocoderCUDAGraphManager:
         if not component.validate_descriptor(descriptor):
             return None
         routine = component.routine
-        buffers: object | None = None
-        graph = None
         buffers = routine.allocate_buffers(descriptor, self.device)
         num_warmups = max(
             1,
@@ -277,17 +275,23 @@ class VocoderCUDAGraphManager:
         for _ in range(num_warmups):
             with routine.capture_context(descriptor, buffers):
                 routine.forward_for_capture(buffers)
-        torch.cuda.current_stream(self.device).synchronize()
+        capture_stream = torch.cuda.current_stream(self.device)
+        capture_stream.synchronize()
         graph = torch.cuda.CUDAGraph()
-        with routine.capture_context(descriptor, buffers):
-            with (
-                torch.inference_mode(),
-                torch.cuda.graph(
-                    graph,
-                    pool=(current_platform.get_global_graph_pool() if graph_pool is None else graph_pool),
-                ),
-            ):
-                captured_output = routine.forward_for_capture(buffers)
+        try:
+            with routine.capture_context(descriptor, buffers):
+                with (
+                    torch.inference_mode(),
+                    torch.cuda.graph(
+                        graph,
+                        pool=(current_platform.get_global_graph_pool() if graph_pool is None else graph_pool),
+                        stream=capture_stream,
+                    ),
+                ):
+                    captured_output = routine.forward_for_capture(buffers)
+        except BaseException:
+            graph.reset()
+            raise
         return VocoderCUDAGraphEntry(
             descriptor=descriptor,
             graph=graph,
@@ -473,84 +477,96 @@ class VocoderCUDAGraphManager:
         return runtime_callable
 
     def capture_and_bind(self) -> int:
+        # Capture every Component before binding any Handle. During capture,
+        # calls through other Components must stay eager; after binding, a
+        # unified graph's eager_call fallback can invoke segmented graph
+        # Components and interleave them with uncaptured eager operations.
         if not self._prepared:
             raise RuntimeError("VocoderCUDAGraphManager must be prepared before capture")
-        if self._capture_finished:
-            raise RuntimeError("Vocoder CUDA Graph capture has already completed")
-        self._capture_finished = True
+        if self._capture_attempted:
+            raise RuntimeError("Vocoder CUDA Graph capture has already been attempted")
+        self._capture_attempted = True
 
         capture_start = time.perf_counter()
         free_before = self._synchronized_free_memory()
         prepared: dict[str, ManagedComponent] = {}
-
-        # Phase 1: every Component remains eager until all startup captures finish.
+        captured: dict[str, ManagedComponent] = {}
+        active: dict[str, ManagedComponent] = {}
         selected = [component for component in self.components if component.component_id in self._component_configs]
         for component in selected:
-            component_config = self._component_configs[component.component_id]
             if component._bound_handle is not None:
                 raise RuntimeError(f"Component already bound before capture: {component.component_id}")
-            managed = ManagedComponent(
-                component=component,
-                entries=OrderedDict(),
-                capture_mode=component.capture_mode,
-            )
-            capture_descriptors = (
-                component.capture_descriptors if component.capture_mode is not VocoderCaptureMode.PURE_LAZY else ()
-            )
-            progress = (
-                tqdm(
-                    total=len(capture_descriptors),
-                    desc=f"Capture {component.component_id}",
-                    unit="graph",
-                    leave=True,
+        try:
+            # Prepare every Component before capturing any of them.
+            for component in selected:
+                prepared[component.component_id] = ManagedComponent(
+                    component=component,
+                    entries=OrderedDict(),
+                    capture_mode=component.capture_mode,
                 )
-                if capture_descriptors
-                else None
-            )
-            try:
-                for descriptor in capture_descriptors:
-                    try:
-                        self._capture_and_register(managed, descriptor)
-                    finally:
-                        assert progress is not None
-                        progress.update(1)
-            finally:
-                if progress is not None:
-                    progress.close()
-            logger.info(
-                "Vocoder CUDA Graph Component %s captured %d/%d startup Descriptors",
-                component.component_id,
-                len(managed.entries),
-                len(capture_descriptors),
-            )
-            # Zero means no runtime graph-count limit, not zero lazy slots.
-            managed.max_graphs = (
-                None
-                if managed.capture_mode.allows_lazy_capture and component_config.max_extra_graphs == 0
-                else len(managed.entries) + component_config.max_extra_graphs
-            )
-            if not managed.entries and not managed.capture_mode.allows_lazy_capture:
-                continue
-            prepared[component.component_id] = managed
 
-        # Phase 2: runtime assembly/binding failures are programming or
-        # lifecycle errors and must propagate after capture has completed.
-        active: dict[str, ManagedComponent] = {}
-        for component_id, managed in prepared.items():
-            component = managed.component
-            runtime_callable = self._build_runtime_callable(
-                managed,
-                self.stats_sink.recorder_for(component_id),
-            )
-            # Bind one opaque runtime endpoint to the stable model-owned
-            # Component; GraphEntry/Descriptor internals stay manager-owned.
-            component._bind_handle(
-                VocoderGraphHandle(
-                    runtime_callable,
-                    lambda managed=managed: self._available_descriptors(managed),
+            for component_id, managed in prepared.items():
+                component = managed.component
+                component_config = self._component_configs[component_id]
+                capture_descriptors = (
+                    component.capture_descriptors if component.capture_mode is not VocoderCaptureMode.PURE_LAZY else ()
                 )
-            )
-            active[component_id] = managed
+                progress = (
+                    tqdm(
+                        total=len(capture_descriptors),
+                        desc=f"Capture {component.component_id}",
+                        unit="graph",
+                        leave=True,
+                    )
+                    if capture_descriptors
+                    else None
+                )
+                try:
+                    for descriptor in capture_descriptors:
+                        try:
+                            self._capture_and_register(managed, descriptor)
+                        finally:
+                            assert progress is not None
+                            progress.update(1)
+                finally:
+                    if progress is not None:
+                        progress.close()
+                logger.info(
+                    "Vocoder CUDA Graph Component %s captured %d/%d startup Descriptors",
+                    component.component_id,
+                    len(managed.entries),
+                    len(capture_descriptors),
+                )
+                # Zero means no runtime graph-count limit, not zero lazy slots.
+                managed.max_graphs = (
+                    None
+                    if managed.capture_mode.allows_lazy_capture and component_config.max_extra_graphs == 0
+                    else len(managed.entries) + component_config.max_extra_graphs
+                )
+                if not managed.entries and not managed.capture_mode.allows_lazy_capture:
+                    continue
+                captured[component_id] = managed
+
+            for component_id, managed in captured.items():
+                component = managed.component
+                runtime_callable = self._build_runtime_callable(
+                    managed,
+                    self.stats_sink.recorder_for(component_id),
+                )
+                component._bind_handle(
+                    VocoderGraphHandle(
+                        runtime_callable,
+                        lambda managed=managed: self._available_descriptors(managed),
+                    )
+                )
+                active[component_id] = managed
+        except BaseException:
+            for managed in prepared.values():
+                managed.component._restore_eager()
+                for entry in managed.entries.values():
+                    self._destroy_entry(entry)
+                managed.entries.clear()
+            raise
 
         self.managed_components = active
         free_after = self._synchronized_free_memory()

@@ -338,6 +338,47 @@ def test_capture_context_runs_cleanup_when_forward_raises() -> None:
     assert routine.events == ["prepare", "forward", "after"]
 
 
+def test_graph_capture_failure_resets_graph_and_uses_warmup_stream(monkeypatch) -> None:
+    routine = _LifecycleRoutine()
+    component = VocoderCUDAGraphComponent("decode", routine, [VocoderCUDAGraphDescriptor(2)])
+    manager = _manager_for_capture(warmups=1)
+    capture_stream = SimpleNamespace(synchronize=lambda: None)
+    graph = SimpleNamespace(reset_called=False)
+
+    def reset_graph():
+        graph.reset_called = True
+
+    graph.reset = reset_graph
+    graph_streams = []
+
+    def graph_context(*_args, **kwargs):
+        graph_streams.append(kwargs["stream"])
+        return nullcontext()
+
+    original_forward = routine.forward_for_capture
+    forward_calls = 0
+
+    def forward(buffers):
+        nonlocal forward_calls
+        forward_calls += 1
+        if forward_calls == 2:
+            routine.events.append("forward")
+            raise RuntimeError("graph capture failed")
+        return original_forward(buffers)
+
+    monkeypatch.setattr(routine, "forward_for_capture", forward)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: capture_stream)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: graph)
+    monkeypatch.setattr(torch.cuda, "graph", graph_context)
+
+    with pytest.raises(RuntimeError, match="graph capture failed"):
+        manager.capture_entry(component, VocoderCUDAGraphDescriptor(2), graph_pool=object())
+
+    assert routine.events == ["prepare", "forward", "after"] * 2
+    assert graph_streams == [capture_stream]
+    assert graph.reset_called
+
+
 def test_manager_uses_capture_context_instead_of_prepare_or_after(monkeypatch) -> None:
     routine = _LifecycleRoutine(context_only=True)
     component = VocoderCUDAGraphComponent("decode", routine, [VocoderCUDAGraphDescriptor(2)])
@@ -469,6 +510,46 @@ def test_capture_binds_only_after_all_components_are_captured_and_clear_restores
     assert first.available_descriptors == frozenset()
     assert torch.equal(first(value), value * 2)
     assert first_routine.eager_calls == 1
+
+
+def test_unified_fallback_uses_segmented_graph_after_all_components_bind() -> None:
+    segmented, segmented_routine = _component("segmented", 4)
+
+    class _UnifiedRoutine(_Routine):
+        def eager_call(self, value: torch.Tensor) -> torch.Tensor:
+            self.eager_calls += 1
+            return segmented(value) + 1
+
+        def forward_for_capture(self, buffers: object) -> torch.Tensor:
+            assert isinstance(buffers, _Buffers)
+            buffers.output.copy_(segmented(buffers.input) + 1)
+            return buffers.output
+
+    unified_routine = _UnifiedRoutine()
+    unified = VocoderCUDAGraphComponent("unified", unified_routine, [VocoderCUDAGraphDescriptor(2)])
+    manager = _TestManager()
+    manager.prepare(_Model((segmented, unified)))
+    manager.capture_and_bind()
+
+    # Unified capture called segmented after its capture, but before binding.
+    assert segmented_routine.eager_calls == 1
+    assert all(not any(bound) for bound in manager.components_during_capture)
+
+    segmented_entry = manager.managed_components["segmented"].entries[VocoderCUDAGraphDescriptor(4)]
+    replay_calls = 0
+    original_replay = segmented_entry.graph.replay
+
+    def replay() -> None:
+        nonlocal replay_calls
+        replay_calls += 1
+        original_replay()
+
+    segmented_entry.graph.replay = replay
+    value = torch.tensor([1.0, 2.0, 3.0])  # Misses the unified graph, fits the segmented graph.
+    torch.testing.assert_close(unified(value), value * 2 + 1)
+    assert unified_routine.eager_calls == 1
+    assert segmented_routine.eager_calls == 1
+    assert replay_calls == 1
 
 
 def test_coverage_miss_falls_back_but_validation_and_replay_errors_propagate() -> None:
@@ -710,12 +791,53 @@ def test_binding_failure_propagates() -> None:
     manager = _TestManager()
     manager.prepare(_Model((first, second)))
 
-    def fail_bind(_handle) -> None:
+    captured_graphs = []
+    original_capture = manager.capture_entry
+
+    def capture(component, descriptor):
+        entry = original_capture(component, descriptor)
+        captured_graphs.append(entry.graph)
+        return entry
+
+    manager.capture_entry = capture
+    original_bind = second._bind_handle
+
+    def fail_bind(handle) -> None:
+        original_bind(handle)
         raise RuntimeError("bind failed")
 
-    first._bind_handle = fail_bind
+    second._bind_handle = fail_bind
     with pytest.raises(RuntimeError, match="bind failed"):
         manager.capture_and_bind()
+
+    assert first._bound_handle is None
+    assert second._bound_handle is None
+    assert manager.managed_components == {}
+    assert all(graph.reset_called for graph in captured_graphs)
+
+
+def test_startup_capture_failure_releases_previous_entries() -> None:
+    component, _ = _component("decode", 2, 3)
+    manager = _TestManager()
+    manager.prepare(_Model((component,)))
+    captured_graphs = []
+    original_capture = manager.capture_entry
+
+    def capture(component, descriptor):
+        if descriptor.variant == 2:
+            raise RuntimeError("second startup capture failed")
+        entry = original_capture(component, descriptor)
+        captured_graphs.append(entry.graph)
+        return entry
+
+    manager.capture_entry = capture
+    with pytest.raises(RuntimeError, match="second startup capture failed"):
+        manager.capture_and_bind()
+
+    assert component._bound_handle is None
+    assert manager.managed_components == {}
+    assert len(captured_graphs) == 1
+    assert captured_graphs[0].reset_called
 
 
 def test_prepare_and_capture_are_single_use_lifecycle_operations() -> None:
@@ -727,7 +849,7 @@ def test_prepare_and_capture_are_single_use_lifecycle_operations() -> None:
         manager.prepare(model)
 
     manager.capture_and_bind()
-    with pytest.raises(RuntimeError, match="capture has already completed"):
+    with pytest.raises(RuntimeError, match="capture has already been attempted"):
         manager.capture_and_bind()
 
 
