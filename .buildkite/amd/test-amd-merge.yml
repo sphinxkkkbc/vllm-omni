@@ -9,15 +9,26 @@ steps:
   steps:
     - label: "Simple · Model Executor Test · Shard %N/%t"
       agent_pool: mi300_1
-      parallelism: 2
+      parallelism: 3
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
+      timeout_in_minutes: 90
       commands:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
         # that is not supported on CPU
-        - "pytest -sv tests/model_executor -m 'core_model and cpu' --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
+        - "pytest -sv tests/model_executor -m 'core_model and cpu and not omni' --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB"
+
+    - label: "Simple · Omni Processor Test"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 60
+      commands:
+        - export VLLM_ROCM_USE_AITER=0
+        - "pytest -sv tests/model_executor/models/test_omni_processing.py -m 'core_model and cpu and omni'"
 
     - label: "Simple · Diffusion Test · Shard %N/%t"
       agent_pool: mi300_1
@@ -25,6 +36,7 @@ steps:
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
+      timeout_in_minutes: 45
       commands:
         - export VLLM_ROCM_USE_AITER=0
         # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
@@ -126,7 +138,9 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       commands:
-        - timeout 30m pytest -s -v tests/e2e/offline_inference/test_z_image.py
+        # A cold Z-Image run spends about six minutes loading weights before
+        # the first-request AITER compilation, which can itself exceed 23m.
+        - timeout 55m pytest -s -v tests/e2e/offline_inference/test_z_image.py
 
     - label: "Diffusion GPU Worker Test"
       agent_pool: mi300_2
