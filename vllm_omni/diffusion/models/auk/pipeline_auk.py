@@ -28,6 +28,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.auk.auk_transformer import AuKTransformer, dit_state_dict, sample_latents
 from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE
 from vllm_omni.diffusion.models.auk.cudagraph_wrapper import AuKCUDAGraphWrapper
+from vllm_omni.diffusion.models.auk.vae_cudagraph import AuKVAEDecodeGraph
 from vllm_omni.diffusion.models.interface import (
     SupportAudioInput,
     SupportAudioOutput,
@@ -189,6 +190,19 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         self.cudagraph_wrapper = AuKCUDAGraphWrapper(
             self.dit, enabled=not od_config.enforce_eager, max_graphs=max_dit_graphs
         )
+        # The compiled decode buckets are warmed by setup_compile(), which the
+        # model runner calls at startup unless the stage is enforce_eager. The
+        # bucket list and the plain-graph cache size come from the stage's
+        # model_config, like the other codec graph wrappers' knobs.
+        model_config = getattr(od_config, "model_config", None) or {}
+        vae_decode_kwargs: dict[str, Any] = {}
+        if model_config.get("auk_vae_compile_shapes") is not None:
+            vae_decode_kwargs["compile_shapes"] = [int(size) for size in model_config["auk_vae_compile_shapes"]]
+        if model_config.get("auk_vae_max_graphs") is not None:
+            vae_decode_kwargs["max_graphs"] = int(model_config["auk_vae_max_graphs"])
+        if model_config.get("auk_vae_tile_frames") is not None:
+            vae_decode_kwargs["tile_frames"] = int(model_config["auk_vae_tile_frames"])
+        self.vae_decode = AuKVAEDecodeGraph(self.vae, enabled=not od_config.enforce_eager, **vae_decode_kwargs)
 
         logger.info(
             "AuK pipeline ready: variant=%s dtype=%s latent_dim=%d hop=%d sample_rate=%d",
@@ -198,6 +212,27 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             self.hop_size,
             self.sample_rate,
         )
+
+    def setup_compile(self) -> None:
+        """Compile the DiT as configured, then capture the codec decode buckets.
+
+        Defining this hook replaces the runner's generic transformer compile,
+        so the DiT's ``diffusion_compile_granularity`` is honoured here: full
+        compiles the whole transformer lazily, exactly as the runner would;
+        regional is a no-op because the DiT declares no repeated blocks. The
+        startup cost worth paying is the VAE decode, whose buckets are
+        compiled and captured before the first request.
+        """
+        granularity = self.od_config.diffusion_compile_granularity
+        if granularity == "full":
+            self.dit.compile(dynamic=self.od_config.diffusion_compile_dynamic)
+            logger.info(
+                "AuK DiT configured for lazy full torch.compile with dynamic=%s",
+                self.od_config.diffusion_compile_dynamic,
+            )
+        else:
+            logger.info("AuK DiT declares no repeated blocks; regional torch.compile is a no-op, running eager")
+        self.vae_decode.warmup(self.device)
 
     # The assembled checkpoint is not a diffusers layout: __init__ reads
     # auk.safetensors and vae.safetensors directly, so the loader has no
@@ -443,7 +478,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
             if output_type == "latent":
                 return [DiffusionOutput(output=latents.detach().cpu())]
 
-            wav = self.vae.decode(latents)
+            wav = self.vae_decode(latents)
 
         # One mono waveform per request; the formatter expects [T].
         wav = wav.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
