@@ -184,7 +184,7 @@ def _make_llm_metadata(
         default_sampling_params=types.SimpleNamespace(name=f"sp-{stage_id}-{replica_id}"),
         custom_process_input_func=None,
         engine_input_source=[] if stage_id == 0 else [stage_id - 1],
-        engine_output_type="token_ids",
+        engine_output_type="text",
         replica_id=replica_id,
         is_comprehension=is_comprehension,
     )
@@ -296,11 +296,21 @@ def test_stage_engine_core_client_module_reload_keeps_forward_refs_deferred():
     """Regression test for forward references in make_async_mp_client."""
     import vllm_omni.engine.stage_engine_core_client as client_mod
 
-    importlib.reload(client_mod)
+    # Snapshot the module namespace so a reload cannot strand other test
+    # modules that captured the pre-reload class objects (isinstance checks
+    # against the stale class would then fail). ``importlib.reload`` mutates
+    # the module dict in place; restoring it leaves the runtime exactly as it
+    # was before this test ran.
+    saved = dict(client_mod.__dict__)
+    try:
+        importlib.reload(client_mod)
 
-    assert client_mod.StageEngineCoreClientBase.make_async_mp_client.__annotations__["return"] == (
-        "StageEngineCoreClient | DPLBStageEngineCoreClient"
-    )
+        assert client_mod.StageEngineCoreClientBase.make_async_mp_client.__annotations__["return"] == (
+            "StageEngineCoreClient | DPLBStageEngineCoreClient"
+        )
+    finally:
+        client_mod.__dict__.clear()
+        client_mod.__dict__.update(saved)
 
 
 def test_async_omni_engine_initialize_stages_passes_log_stats_and_client_config_to_runtime(monkeypatch):
@@ -1318,6 +1328,32 @@ def test_stage_runtime_multi_api_failure_shuts_down_before_exceptional_context_e
         "shutdown",
         "exceptional-exit:Stage 0 returned deferred TCP addresses; multi-API launch requires fixed ports or IPC addresses",
     ]
+
+
+@pytest.mark.parametrize("engine_output_type", ["", "tokens", "text+speech", "AUDIO"])
+def test_stage_runtime_rejects_invalid_output_type_during_initialization(mocker, engine_output_type):
+    runtime = StageRuntime(
+        stage_configs=[types.SimpleNamespace()],
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        async_chunk=False,
+    )
+    cfg = types.SimpleNamespace(model_config=types.SimpleNamespace(skip_tokenizer_init=True))
+    stage_plan = _make_llm_plan(0, stage_id=0, vllm_config=cfg)
+    stage_plan.replicas[0].metadata.engine_output_type = engine_output_type
+    stage_client = mocker.Mock()
+    mocker.patch.object(runtime, "_prepare_stage_plans", return_value=[stage_plan])
+    initialize_replicas = mocker.patch.object(runtime, "_initialize_stage_replicas", return_value={0: [stage_client]})
+
+    # Keep output-processor construction real: no request is needed to parse
+    # the type, even though the engine replica is already initialized here.
+    with pytest.raises(ValueError, match="Unknown modality"):
+        runtime.initialize()
+
+    initialize_replicas.assert_called_once()
+    stage_client.shutdown.assert_called_once_with()
+    assert runtime.stage_pools == []
 
 
 def test_stage_runtime_passes_log_stats_to_output_processor(monkeypatch):
