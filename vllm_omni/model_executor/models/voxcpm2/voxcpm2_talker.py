@@ -76,6 +76,7 @@ class _ForwardContextLike(Protocol):
 
 class VoxCPM2PreprocessInput(TypedDict, total=False):
     additional_information: dict[str, Any]
+    req_id: str
     request_id: str
     _omni_seed: int | None
     text_token_ids: list[list[int]]
@@ -89,6 +90,7 @@ class VoxCPM2PreprocessInput(TypedDict, total=False):
 
 
 class VoxCPM2PostprocessInput(TypedDict, total=False):
+    req_id: str
     request_id: str
 
 
@@ -885,6 +887,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
+        self.mrv2_audio_multimodal_only = True
 
         self.model = MiniCPM4PagedForVoxCPM2(
             vllm_config=vllm_config,
@@ -3124,6 +3127,26 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 mm["meta"] = {"req_id": [], "sparse_audio": ["1"]}
             self._audio_queue.clear()
 
+        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        if bool(getattr(model_config, "use_v2_model_runner", False)):
+            # MRv2's generic pooler slices lists by full batch index. Expand
+            # VoxCPM2's sparse request order before it sees the payload. Use
+            # empty slots for audio-free requests; the audio-only materializer
+            # drops them and never publishes the scaffold hidden states.
+            sparse_ids = mm.get("meta", {}).get("req_id", [])
+            audio_by_req = dict(zip(sparse_ids, mm.get("model_outputs", []), strict=True))
+            request_ids = kwargs.get("request_ids", self._last_audio_output_req_ids)
+            if len(request_ids) != len(set(request_ids)):
+                raise ValueError("VoxCPM2 MRv2 batch contains duplicate request IDs")
+            if not set(audio_by_req).issubset(request_ids):
+                raise ValueError("VoxCPM2 MRv2 audio contains a request outside the current batch")
+            empty = torch.empty(0, dtype=torch.float32)
+            sample_rate = torch.tensor(self._sample_rate, dtype=torch.int32)
+            mm = {
+                "model_outputs": [audio_by_req.get(req_id, empty) for req_id in request_ids],
+                "sr": [sample_rate for _ in request_ids],
+            }
+
         return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs=mm)
 
     # -------------------- Chinese token splitting --------------------
@@ -3138,6 +3161,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         return self._multichar_zh_split
 
     # -------------------- preprocess / postprocess --------------------
+
+    @staticmethod
+    def _resolve_request_id(info: dict[str, Any], fallback: str = "default") -> str:
+        # MRv2 stores the scheduler identity as req_id; MRv1 injects it as
+        # request_id. Prefer the scheduler-owned field if both are present.
+        return str(info.get("req_id") or info.get("request_id") or fallback)
 
     def preprocess(
         self,
@@ -3154,7 +3183,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         span_len = int(input_ids.shape[0])
         dev = input_ids.device
-        req_id = info_dict.get("request_id", "default")
+        req_id = self._resolve_request_id(info_dict)
         is_prefill = bool(info_dict.get("_omni_is_prefill", span_len > 1))
 
         if is_prefill:
@@ -3298,7 +3327,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         return input_ids, embeds, {}
 
     def postprocess(self, hidden_states: torch.Tensor, **info: Unpack[VoxCPM2PostprocessInput]) -> dict[str, Any]:
-        req_id = info.get("request_id", self._current_request_id or "default")
+        req_id = self._resolve_request_id(info, self._current_request_id or "default")
         if self._enable_profiling:
             state = self._active_states.get(req_id)
             if state and state.decode_step_count > 0:

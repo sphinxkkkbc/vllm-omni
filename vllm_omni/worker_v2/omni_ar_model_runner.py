@@ -305,6 +305,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             pending_aux_output=pending_aux_output,
             streaming_audio=streaming_audio,
             extra_multimodal_outputs=extra_outputs,
+            audio_multimodal_only=bool(getattr(self.model, "mrv2_audio_multimodal_only", False)),
         )
         self._release_multimodal_snapshot(snapshot_slot, async_output.copy_event)
         _guard_graph_replay_for_pooler_copy(
@@ -718,6 +719,19 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
     non-blocking copies on the copy stream.
     """
 
+    @staticmethod
+    def _audio_payloads_only(
+        pooler_payload: list[dict[str, Any] | None] | None,
+    ) -> list[dict[str, torch.Tensor] | None] | None:
+        audio_payloads: list[dict[str, torch.Tensor] | None] = []
+        for payload in pooler_payload or []:
+            audio = payload.get("model_outputs") if payload else None
+            if isinstance(audio, torch.Tensor) and audio.numel() > 0:
+                audio_payloads.append({"model_outputs": audio, "sr": payload["sr"]})
+            else:
+                audio_payloads.append(None)
+        return audio_payloads if any(audio_payloads) else None
+
     def __init__(
         self,
         model_runner_output: OmniModelRunnerOutput,
@@ -736,6 +750,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         pending_aux_output: Any | None = None,
         streaming_audio: StreamingAudioOutput | None = None,
         extra_multimodal_outputs: tuple[dict[str, Any], torch.cuda.Event] | None = None,
+        audio_multimodal_only: bool = False,
     ):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
@@ -745,6 +760,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self._async_chunk = bool(async_chunk)
         self._finalize_output = finalize_output
         self._finalize_multimodal = finalize_multimodal
+        self._audio_multimodal_only = audio_multimodal_only
         self._has_fault: torch.Tensor | None = None
 
         # Snapshot input_batch metadata needed for pooler_output slicing
@@ -967,6 +983,13 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 self._padded_total_tokens,
             )
             pooler_payload = cast(list[dict[str, Any] | None], pooler_output) if pooler_output else None
+            if self._audio_multimodal_only:
+                self.model_runner_output.pooler_output = None
+                self.model_runner_output.inter_stage_outputs = None
+                self.model_runner_output.multimodal_outputs = self._audio_payloads_only(pooler_payload)
+                if self._finalize_output is not None:
+                    return self._finalize_output(self.model_runner_output)
+                return self.model_runner_output
             self.model_runner_output.pooler_output = pooler_payload
             self.model_runner_output.inter_stage_outputs = pooler_payload
             self.model_runner_output.multimodal_outputs = (

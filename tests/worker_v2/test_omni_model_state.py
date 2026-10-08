@@ -152,6 +152,7 @@ def test_output_spans_follow_reordered_mixed_batch():
     # batch=[2, 0]: prefill (3 tokens) reordered ahead of decode (1 token).
     state = _make_state(have_multimodal_outputs=True)
     batch = _DummyInputBatch([2, 0])
+    batch.req_ids = ["prefill", "decode"]
     batch.num_scheduled_tokens = [3, 1]
     batch.query_start_loc_np = [0, 3]
     state.intermediate_buffer.buffers[2] = {"req_id": "prefill"}
@@ -162,6 +163,7 @@ def test_output_spans_follow_reordered_mixed_batch():
     )
     state.postprocess_model_output(torch.zeros(4, 2), batch, SimpleNamespace())
     assert seen["request_token_spans"] == [(0, 3), (3, 4)]
+    assert seen["request_ids"] == ["prefill", "decode"]
     assert [info["req_id"] for info in seen["model_intermediate_buffer"]] == ["prefill", "decode"]
 
 

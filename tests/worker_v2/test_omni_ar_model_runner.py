@@ -103,6 +103,27 @@ def test_async_output_blocking_event_preserves_masks_and_aux_output(monkeypatch,
     np.testing.assert_array_equal(copied[0][1], [2, 0])
 
 
+def test_voxcpm2_audio_slices_by_batch_request() -> None:
+    audio = torch.arange(8, dtype=torch.float32)
+    payloads = OmniARModelRunner._build_pooler_output_from_cpu(
+        hidden_cpu=torch.zeros(2, 4),
+        mm_cpu={
+            "model_outputs": [torch.empty(0), audio],
+            "sr": [torch.tensor(48000), torch.tensor(48000)],
+        },
+        query_start_loc_np=np.array([0, 1, 2]),
+        num_scheduled_tokens=np.array([1, 1]),
+        num_reqs=2,
+    )
+
+    assert payloads[0]["model_outputs"].numel() == 0
+    assert torch.equal(payloads[1]["model_outputs"], audio)
+    audio_payloads = OmniAsyncOutput._audio_payloads_only(payloads)
+    assert audio_payloads[0] is None
+    assert torch.equal(audio_payloads[1]["model_outputs"], audio)
+    assert "hidden" not in audio_payloads[1]
+
+
 @pytest.mark.parametrize("needs_history", [False, True])
 def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) -> None:
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
