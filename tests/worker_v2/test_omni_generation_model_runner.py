@@ -34,6 +34,7 @@ def test_profile_run_accepts_release_flag_without_running_codec(monkeypatch, ran
     synchronize.assert_called_once_with()
     runner.model.assert_not_called()
 
+
 class _GraphModel:
     supports_model_local_cudagraph = True
 

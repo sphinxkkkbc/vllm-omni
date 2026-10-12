@@ -294,6 +294,60 @@ def _manager_for_capture(*, warmups: int) -> ModelLocalCUDAGraphManager:
     return ModelLocalCUDAGraphManager(vllm_config=vllm_config, device=torch.device("cpu"))
 
 
+@pytest.mark.parametrize("fail_capture", [False, True])
+def test_runtime_capture_scope_joins_side_stream_even_on_failure(monkeypatch, fail_capture) -> None:
+    from vllm_omni.worker import model_local_cudagraph_manager as manager_module
+
+    manager = _manager_for_capture(warmups=1)
+    events = []
+    caller = SimpleNamespace(wait_event=lambda event: events.append(("caller-wait", event)))
+    capture_stream = SimpleNamespace(wait_event=lambda event: events.append(("capture-wait", event)))
+    created_events = []
+
+    class Event:
+        def __init__(self):
+            created_events.append(self)
+
+        def record(self, stream):
+            events.append(("record", self, stream))
+
+    @contextmanager
+    def stream_context(stream):
+        assert stream is capture_stream
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: capture_stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: caller)
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "stream", stream_context)
+    monkeypatch.setattr(manager_module, "set_cudagraph_capturing_enabled", lambda enabled: events.append(enabled))
+    failure = RuntimeError("capture failed")
+    with pytest.raises(RuntimeError) if fail_capture else nullcontext() as raised:
+        with manager._runtime_capture_scope():
+            events.append("capture")
+            if fail_capture:
+                raise failure
+
+    if fail_capture:
+        assert raised.value is failure
+    ready, complete = created_events
+    assert events == [
+        ("record", ready, caller),
+        ("capture-wait", ready),
+        True,
+        "enter",
+        "capture",
+        "exit",
+        ("record", complete, capture_stream),
+        ("caller-wait", complete),
+        False,
+    ]
+
+
 def _mock_cuda_capture(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: SimpleNamespace(synchronize=lambda: None))
     monkeypatch.setattr(torch.cuda, "CUDAGraph", object)
@@ -550,6 +604,50 @@ def test_unified_fallback_uses_segmented_graph_after_all_components_bind() -> No
     assert unified_routine.eager_calls == 1
     assert segmented_routine.eager_calls == 1
     assert replay_calls == 1
+
+
+@pytest.mark.parametrize("fail_capture", [False, True])
+def test_lazy_unified_capture_uses_eager_sibling_and_restores_handles(monkeypatch, fail_capture) -> None:
+    segmented, segmented_routine = _component("segmented", 4, capture_mode=ModelLocalCaptureMode.PURE_LAZY)
+
+    class UnifiedRoutine(_Routine):
+        def forward_for_capture(self, buffers):
+            assert isinstance(buffers, _Buffers)
+            buffers.output.copy_(segmented(buffers.input) + 1)
+            if fail_capture:
+                raise RuntimeError("unified capture failed")
+            return buffers.output
+
+    unified = ModelLocalCUDAGraphComponent(
+        "unified", UnifiedRoutine(), [ModelLocalCUDAGraphDescriptor(2)], capture_mode=ModelLocalCaptureMode.PURE_LAZY
+    )
+    manager = _TestManager()
+    manager.prepare(_Model((segmented, unified)))
+    manager.capture_and_bind()
+    monkeypatch.setattr(manager, "_runtime_capture_scope", nullcontext)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    manager._runtime_capture_and_register(manager.managed_components["segmented"], ModelLocalCUDAGraphDescriptor(4))
+    handles = (segmented._bound_handle, unified._bound_handle)
+    graph = manager.managed_components["segmented"].entries[ModelLocalCUDAGraphDescriptor(4)].graph
+    original_replay = graph.replay
+    replay_calls = []
+
+    def replay():
+        replay_calls.append(True)
+        original_replay()
+
+    monkeypatch.setattr(graph, "replay", replay)
+    with pytest.raises(RuntimeError, match="unified capture failed") if fail_capture else nullcontext():
+        manager._runtime_capture_and_register(manager.managed_components["unified"], ModelLocalCUDAGraphDescriptor(2))
+
+    assert segmented_routine.eager_calls == 1
+    assert replay_calls == []
+    assert segmented._bound_handle is handles[0]
+    assert unified._bound_handle is handles[1]
+    assert (ModelLocalCUDAGraphDescriptor(2) in manager.managed_components["unified"].entries) is not fail_capture
+    value = torch.tensor([1.0, 2.0])
+    torch.testing.assert_close(segmented(value), value * 2)
+    assert replay_calls == [True]
 
 
 def test_coverage_miss_falls_back_but_validation_and_replay_errors_propagate() -> None:

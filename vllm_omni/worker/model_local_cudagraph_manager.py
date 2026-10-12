@@ -387,11 +387,14 @@ class ModelLocalCUDAGraphManager:
         try:
             with torch.cuda.stream(self._runtime_capture_stream):
                 yield
+        finally:
+            try:
+                # Join the capture stream even when capture raises.
                 complete = torch.cuda.Event()
                 complete.record(self._runtime_capture_stream)
-            caller.wait_event(complete)
-        finally:
-            set_cudagraph_capturing_enabled(False)
+                caller.wait_event(complete)
+            finally:
+                set_cudagraph_capturing_enabled(False)
 
     def _runtime_capture_and_register(
         self,
@@ -407,8 +410,21 @@ class ModelLocalCUDAGraphManager:
             return existing
         if managed.max_graphs is not None and len(managed.entries) >= managed.max_graphs:
             return None
-        with self._runtime_capture_scope():
-            entry = self._capture_and_register(managed, descriptor)
+        bound_components = [
+            (item.component, item.component._bound_handle)
+            for item in self.managed_components.values()
+            if item.component._bound_handle is not None
+        ]
+        try:
+            # Lazy capture must not replay sibling graphs from the shared pool.
+            for component, _ in bound_components:
+                component._restore_eager()
+            with self._runtime_capture_scope():
+                entry = self._capture_and_register(managed, descriptor)
+        finally:
+            for component, handle in bound_components:
+                assert handle is not None
+                component._bind_handle(handle)
         if entry is not None:
             logger.info(
                 "Lazy-captured model-local CUDA Graph Component %s Descriptor %r",
