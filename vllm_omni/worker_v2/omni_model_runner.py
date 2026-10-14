@@ -582,6 +582,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens=batch_req_state.num_scheduled_tokens,
                     num_computed_tokens=self.req_states.num_computed_tokens_np[batch_req_state.idx_mapping_np],
                     max_num_scheduled_tokens=max_query_len,
+                    num_prompt_tokens=self.req_states.prompt_len.np[batch_req_state.idx_mapping_np],
                 )
                 if runner_assisted_request is not None:
                     if not isinstance(runner_assisted_request, RunnerAssistedFullAttentionMetadataRequest):

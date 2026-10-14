@@ -2302,6 +2302,25 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
     # -------------------- vllm hooks --------------------
 
+    def _scheduled_patch_count(
+        self, req_ids, num_scheduled_tokens, num_computed_tokens, num_prompt_tokens
+    ) -> int | None:
+        """Predict CPU eligibility before preprocess; GPU active remains authoritative."""
+        if num_prompt_tokens is None or len(num_prompt_tokens) != len(req_ids):
+            return None
+        patch_count = 0
+        for req_id, num_scheduled_token, num_computed_token, num_prompt_token in zip(
+            req_ids, num_scheduled_tokens, num_computed_tokens, num_prompt_tokens, strict=True
+        ):
+            state = self._active_states.get(req_id)
+            if state is None:
+                return None
+            if state.is_stopping:
+                continue
+            is_prefill = int(num_computed_token) < int(num_prompt_token) or not state.prefill_completed
+            patch_count += not is_prefill or int(num_computed_token) + int(num_scheduled_token) == int(num_prompt_token)
+        return patch_count
+
     def get_runner_assisted_full_attention_metadata_request(
         self,
         *,
@@ -2310,6 +2329,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         num_scheduled_tokens: Sequence[int],
         num_computed_tokens: Sequence[int],
         max_num_scheduled_tokens: int,
+        num_prompt_tokens: Sequence[int] | None = None,
     ) -> RunnerAssistedFullAttentionMetadataRequest | None:
         if not self._enable_unified_decode_graph or not self._enable_cuda_graph:
             return None
@@ -2318,6 +2338,20 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         has_prefill = any(int(n) == 0 for n in num_computed_tokens) or any(
             not getattr(self._active_states.get(req_id), "prefill_completed", False) for req_id in req_ids
         )
+        exact = getattr(getattr(self, "_runtime_config", None), "enable_exact_patch_batch", False)
+        patch_count = None
+        if exact:
+            if len(num_scheduled_tokens) != num_reqs:
+                return None
+            patch_count = self._scheduled_patch_count(
+                req_ids, num_scheduled_tokens, num_computed_tokens, num_prompt_tokens
+            )
+            if patch_count is None:
+                return None
+            has_prefill |= any(
+                int(num_computed_token) < int(num_prompt_token)
+                for num_computed_token, num_prompt_token in zip(num_computed_tokens, num_prompt_tokens, strict=True)
+            )
         if self._mixed_unified_graph_enabled() and has_prefill:
             tts_compiled = (
                 getattr(self.tts.feat_decoder.estimator, "_compiled", False) if self._tts is not None else False
@@ -2336,17 +2370,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             tokens = self._mixed_token_capacity(sum(int(n) for n in num_scheduled_tokens), bucket)
             if tokens is None:
                 return None
-            exact = getattr(getattr(self, "_runtime_config", None), "enable_exact_patch_batch", False)
+            key = (bucket, tokens, patch_count) if exact else (bucket, tokens)
             if (
-                not exact
-                and (bucket, tokens) not in self._mixed_graphs
+                key not in self._mixed_graphs
                 and self._mixed_graph_cache_limit > 0
                 and len(self._mixed_graphs) >= self._mixed_graph_cache_limit
             ):
                 return None
-            return RunnerAssistedFullAttentionMetadataRequest(
-                bucket, exact or (bucket, tokens) not in self._mixed_graphs, tokens
-            )
+            return RunnerAssistedFullAttentionMetadataRequest(bucket, key not in self._mixed_graphs, tokens)
         model_state = getattr(self, "_mrv2_model_state", None)
         per_patch_single = num_reqs == 1 and getattr(model_state, "per_patch_audio", False)
         if (num_reqs <= 1 and not per_patch_single) or num_reqs > self._unified_decode_graph_max_batch_size:
@@ -2376,10 +2407,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         bucket_size = self._select_unified_graph_bucket_size(num_reqs)
         if bucket_size is None:
             return None
+        key = (bucket_size, patch_count) if exact else bucket_size
         return RunnerAssistedFullAttentionMetadataRequest(
             num_reqs_padded=bucket_size,
-            for_cudagraph_capture=getattr(getattr(self, "_runtime_config", None), "enable_exact_patch_batch", False)
-            or bucket_size not in self._unified_graphs,
+            for_cudagraph_capture=key not in self._unified_graphs,
         )
 
     def set_runner_assisted_full_attention_metadata_context(

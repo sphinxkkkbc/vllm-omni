@@ -406,3 +406,39 @@ def test_mixed_invalid_capacity_falls_through_without_decode_graph(monkeypatch, 
     monkeypatch.setattr(model, "_unified_decode_graph_skip_reason", normal_dispatch)
     with pytest.raises(FallbackReachedError):
         model.forward(torch.zeros(2, dtype=torch.long), torch.arange(2), inputs_embeds=torch.zeros(2, 4))
+
+
+@pytest.mark.parametrize("kind,patch_count", [("mid", 1), ("last", 2), ("zero", 0), ("decode", 2)])
+def test_exact_metadata_reuses_actual_patch_variant(kind, patch_count):
+    model = _ready_metadata_model()
+    model._runtime_config = SimpleNamespace(enable_exact_patch_batch=True)
+    model._mrv2_model_state = SimpleNamespace(per_patch_audio=True, tensor_for=lambda *_: torch.ones(1))
+    first = VoxCPM2RequestState(request_id="a", prefill_completed=kind == "decode")
+    second = VoxCPM2RequestState(request_id="b", prefill_completed=kind != "zero")
+    # Deliberately stale: selection must use current scheduler progress.
+    first.is_last_prefill_chunk = kind != "last"
+    model._active_states = {"a": first, "b": second}
+    scheduled = [1, 1] if kind == "decode" else [2, 2] if kind == "zero" else [2, 1]
+    computed = [20, 30] if kind == "decode" else [4, 20] if kind == "last" else [0, 0] if kind == "zero" else [0, 20]
+    prompts = [10, 10] if kind == "decode" else [6, 6] if kind == "zero" else [6, 10]
+    args = dict(
+        req_ids=["a", "b"],
+        num_reqs=2,
+        num_scheduled_tokens=scheduled,
+        num_computed_tokens=computed,
+        max_num_scheduled_tokens=max(scheduled),
+        num_prompt_tokens=prompts,
+    )
+    request = model.get_runner_assisted_full_attention_metadata_request(**args)
+    assert request.for_cudagraph_capture
+    if kind == "decode":
+        model._unified_graphs[(4, patch_count)] = object()
+    else:
+        model._mixed_graphs[(4, 4, patch_count)] = object()
+        model._mixed_graph_cache_limit = 1
+    assert not model.get_runner_assisted_full_attention_metadata_request(**args).for_cudagraph_capture
+    if kind == "mid":
+        args["num_computed_tokens"] = [4, 20]  # Same request/token bucket, new patch count.
+        assert model.get_runner_assisted_full_attention_metadata_request(**args) is None
+        model._mixed_graph_cache_limit = 0
+        assert model.get_runner_assisted_full_attention_metadata_request(**args).for_cudagraph_capture
