@@ -2297,6 +2297,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         for state, committed in zip(states, commit_mask, strict=True):
             state.audio_patch_ready = False
             logits = self._state_tensor(state, "precomputed_stop_logits") if committed else None
+            # An already-scheduled extra step may enqueue stale stop logits.
+            # GPU active_slots prevents patch commits and valid PCM output;
+            # the scheduler ignores repeated stop results for finished requests.
             self._results_queue.append((state.request_id, logits))
             self._audio_queue.append((state.request_id, None))
 
@@ -4070,6 +4073,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             if model_state is not None:
                 state.prefill_chunk_start = num_computed_tokens
             chunk_end = num_computed_tokens + span_len
+            # span_len equals num_scheduled_tokens. Agreement with
+            # _scheduled_patch_count assumes prefill_embeds.shape[0] equals the
+            # runner's num_prompt_tokens. build_voxcpm2_prompt must ensure this
+            # prerequisite, including reference-audio positions.
             state.is_last_prefill_chunk = chunk_end == state.prefill_embeds.shape[0]
             if chunk_end > state.prefill_embeds.shape[0]:
                 raise ValueError(
