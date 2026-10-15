@@ -126,9 +126,33 @@ def test_full_payload_receive_is_polled_without_scheduled_tokens(mocker):
     plane.recv_full_payload_inputs.assert_called_once_with(scheduler_output)
 
 
+def test_duplex_kv_reanchor_runs_after_block_table_writes():
+    # Same model hook as the V1 AR runner: reanchor reads the committed block tables.
+    runner = object.__new__(OmniGPUModelRunner)
+    order = []
+    for name in ("_prepare_native_data_plane", "finish_requests", "free_states", "add_requests", "update_requests"):
+        setattr(runner, name, lambda *_args: None)
+    runner._sync_native_data_plane_payloads = lambda *_args: None
+    runner.block_tables = SimpleNamespace(apply_staged_writes=lambda: order.append("block_tables"))
+    runner.model = SimpleNamespace(
+        apply_duplex_kv_reanchor=lambda r, scheduler_output: order.append(("reanchor", r, scheduler_output))
+    )
+    runner.aux_output_connector = None
+    output = object()
+    runner.kv_connector = SimpleNamespace(no_forward=lambda _s: output)
+    runner._merge_ec_connector_no_forward = lambda _s, value: value
+    runner._attach_native_data_plane_signals = lambda value: value
+    scheduler_output = SchedulerOutput.make_empty()
+
+    assert runner.execute_model(scheduler_output) is output
+    assert order == ["block_tables", ("reanchor", runner, scheduler_output)]
+
+
 @pytest.mark.parametrize("output_form", ["tuple", "omni"])
 @pytest.mark.parametrize("profile_only", [False, True])
-def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form, profile_only):
+def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form, profile_only, monkeypatch):
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda *args, **kwargs: (0, 0))
     runner = object.__new__(OmniGPUModelRunner)
     hidden = torch.ones(1, 2)
 
@@ -147,7 +171,7 @@ def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form, profile
         _capture_descs={CUDAGraphMode.PIECEWISE: [piecewise], CUDAGraphMode.FULL: [full]},
         _candidates={(1, 0): [piecewise, full]},
     )
-    runner.model_state = SimpleNamespace(capture_mtp_graphs=MagicMock())
+    runner.model_state = SimpleNamespace(capture_mtp_graphs=MagicMock(), _is_mtp_graph_runner=lambda: True)
     runner._dispatch_mtp_batch_descriptor = MagicMock(return_value="desc")
 
     def assert_unwrapped(_self, *, profile_only: bool = False):
@@ -161,10 +185,10 @@ def test_capture_model_unwraps_exclude_full_and_capture_mtp(output_form, profile
 
     assert runner.model.forward is original_forward  # restored after capture
     assert runner.cudagraph_manager._capture_descs == {CUDAGraphMode.PIECEWISE: [piecewise]}
-    if profile_only:
-        runner.model_state.capture_mtp_graphs.assert_not_called()
-    else:
-        runner.model_state.capture_mtp_graphs.assert_called_once_with(runner._dispatch_mtp_batch_descriptor)
+    # The MTP graphs are captured in the profiling pass too, so their pool is in the estimate.
+    runner.model_state.capture_mtp_graphs.assert_called_once_with(
+        runner._dispatch_mtp_batch_descriptor, restore_capturing=profile_only
+    )
 
 
 @pytest.mark.parametrize(

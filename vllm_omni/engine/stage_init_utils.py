@@ -19,6 +19,7 @@ import multiprocessing as mp
 import os
 import tempfile
 import time
+import warnings
 from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
@@ -574,6 +575,7 @@ class StageMetadata:
     prompt_transform_func: Callable | None = None
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
+    async_chunk_prewarm_payload_func: Callable | None = None
     # Multi-replica: replica_id distinguishes replicas of the same stage.
     # For single-replica stages this defaults to 0.
     replica_id: int = 0
@@ -659,6 +661,12 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         _mod, _fn = _ckf_path.rsplit(".", 1)
         cfg_kv_collect_func = getattr(importlib.import_module(_mod), _fn)
 
+    async_chunk_prewarm_payload_func: Callable | None = None
+    _acp_path = _get_attr_or_item(stage_config, "async_chunk_prewarm_payload_func")
+    if _acp_path:
+        _mod, _fn = _acp_path.rsplit(".", 1)
+        async_chunk_prewarm_payload_func = getattr(importlib.import_module(_mod), _fn)
+
     model_stage = engine_args.get("model_stage")
 
     if stage_type == "diffusion":
@@ -698,6 +706,7 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         runtime_cfg=runtime_cfg,
         prompt_transform_func=prompt_transform_func,
         prompt_expand_func=prompt_expand_func,
+        async_chunk_prewarm_payload_func=async_chunk_prewarm_payload_func,
     )
 
 
@@ -761,6 +770,7 @@ def extract_stage_metadata_from_omni_stage_config(
         runtime_cfg=stage_config.runtime_config,
         prompt_transform_func=_resolve_omni_metadata_hook(stage_config.prompt_transform_func),
         prompt_expand_func=_resolve_omni_metadata_hook(stage_config.prompt_expand_func),
+        async_chunk_prewarm_payload_func=_resolve_omni_metadata_hook(stage_config.async_chunk_prewarm_payload_func),
     )
 
 
@@ -1111,6 +1121,25 @@ def _project_omni_stage_engine_args(
         "has_sampling_extra_args",
     }
     runtime_excluded_fields = {"devices", "num_replicas", "env", "num_gpus", "cuda_mps"}
+    if is_diffusion:
+        # Diffusion owns these fields. Model defaults must not overwrite the
+        # explicit diffusion selection copied above. Retain explicit model
+        # inputs for callers using the shared model config representation.
+        model_explicit = getattr(stage_config.model_config, "_omni_explicit_fields", ())
+        diffusion_explicit = getattr(diffusion_stage.diffusion_config, "_omni_explicit_fields", ())
+        for name in ("moe_backend", "linear_backend"):
+            if name not in model_explicit:
+                model_excluded_fields.add(name)
+            elif name in diffusion_explicit:
+                model_value = getattr(stage_config.model_config, name)
+                diffusion_value = getattr(diffusion_stage.diffusion_config, name)
+                if model_value != diffusion_value:
+                    warnings.warn(
+                        f"stage {stage_config.stage_id}: model_config.{name}={model_value!r} overrides "
+                        f"diffusion_config.{name}={diffusion_value!r}.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
     if not is_diffusion:
         # These values configure OmniDiffusionConfig or its worker process;
         # OmniEngineArgs has no matching fields for LLM stages.
@@ -1245,6 +1274,19 @@ def _finalize_engine_args_dict(
     sampling_extra_args_keys: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Apply representation-independent engine adapter behavior."""
+    from vllm.config import KernelConfig
+
+    # The legacy kwargs path does not pass through the typed config validators.
+    # Validate only present fields so an omitted MoE choice still gets its
+    # established model-specific default below.
+    kernel_values = {
+        name: engine_args_dict[name]
+        for name in ("moe_backend", "linear_backend")
+        if engine_args_dict.get(name) is not None
+    }
+    kernels = KernelConfig(**kernel_values)
+    for name in kernel_values:
+        engine_args_dict[name] = getattr(kernels, name)
     pipeline_model_root = model
     model = engine_args_dict.pop("model", None) or model
     stage_defines_tokenizer = (
