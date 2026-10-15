@@ -221,7 +221,7 @@ def test_mrv2_buffer_access_uses_bound_slot_without_runner_id_lookup(monkeypatch
     state.store_decode_state(owner, torch.tensor([[0.0, 1.0]]), torch.ones(6), torch.ones(4, 2))
     assert state.tensor_for(owner, "curr_embed_for_next").tolist() == [[1.0] * 6]
     model._audio_queue = [(owner.request_id, torch.tensor([3.0]))]
-    state.make_audio_output(torch.zeros(1, 6), ["first"])
+    state.make_audio_output(torch.zeros(1, 6))
     assert state.audio_buffer[1, 0].item() == 3.0
     state.remove_request(1)
     assert owner.slot_index is None
@@ -440,7 +440,7 @@ def test_length_limit_decodes_pending_latent_tail(
     state.prepare_audio_length_limits(batch, req_states)
     audio = model._collect_audio_batch([state.slots[1], state.slots[0]])
     model._audio_queue = list(audio.items())
-    state.make_audio_output(torch.zeros(2, 6), ["ending", "running"])
+    state.make_audio_output(torch.zeros(2, 6))
     output = state.prepare_streaming_audio_output(batch, req_states, {"voxcpm2_audio_pending": True}).get_output()
 
     assert calls == [(1, 2, tail_patches * 4)]

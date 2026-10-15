@@ -613,11 +613,9 @@ class VoxCPM2ModelState(OmniModelState):
             state.decode_pad_len = tail
             state.pending_vae_count = 0
 
-    def make_audio_output(self, model_outputs: torch.Tensor, request_ids: list[str]) -> Any:
+    def make_audio_output(self, model_outputs: torch.Tensor) -> Any:
         from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-        if not {request_id for request_id, _ in self.model._audio_queue}.issubset(request_ids):
-            raise ValueError("VoxCPM2 MRV2 audio contains a request outside the current batch")
         for owner, audio in self.model._audio_queue:
             if audio is None:
                 continue

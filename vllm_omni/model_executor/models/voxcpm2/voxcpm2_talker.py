@@ -2441,6 +2441,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         dev = input_ids.device
 
         self._last_audio_output_req_ids = [req_id for req_id, _, _, _ in self._pending_requests]
+        assert len(self._last_audio_output_req_ids) == len(set(self._last_audio_output_req_ids)), (
+            "VoxCPM2 pending batch contains duplicate request IDs"
+        )
         num_reqs = len(self._pending_requests)
         from .model_state import VoxCPM2BatchSlots
 
@@ -3634,7 +3637,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         model_state = getattr(self, "_mrv2_model_state", None)
         if model_state is not None:
-            return model_state.make_audio_output(model_outputs, self._last_audio_output_req_ids)
+            return model_state.make_audio_output(model_outputs)
 
         mm: dict[str, Any] = {}
         if self._audio_queue:
