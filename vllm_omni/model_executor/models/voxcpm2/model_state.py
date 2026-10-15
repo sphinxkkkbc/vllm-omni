@@ -616,8 +616,6 @@ class VoxCPM2ModelState(OmniModelState):
     def make_audio_output(self, model_outputs: torch.Tensor, request_ids: list[str]) -> Any:
         from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-        if len(request_ids) != len(set(request_ids)):
-            raise ValueError("VoxCPM2 MRV2 batch contains duplicate request IDs")
         if not {request_id for request_id, _ in self.model._audio_queue}.issubset(request_ids):
             raise ValueError("VoxCPM2 MRV2 audio contains a request outside the current batch")
         for owner, audio in self.model._audio_queue:

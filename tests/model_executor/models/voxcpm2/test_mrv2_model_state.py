@@ -349,7 +349,8 @@ def test_partial_audio_emits_on_sampled_stop(monkeypatch: pytest.MonkeyPatch) ->
     state.add_request(1, SimpleNamespace(req_id="second"))
     model._audio_queue = [("first", torch.arange(17, dtype=torch.float32))]
 
-    model.make_omni_output(torch.zeros(2, 4), request_ids=["second", "first"])
+    model._last_audio_output_req_ids = ["second", "first"]
+    model.make_omni_output(torch.zeros(2, 4))
     assert _audio_output(state, [1, 0], [0, 0]) == [None, None]
     output = _audio_output(state, [1, 0], [0, 1])
     assert output[0] is None
@@ -365,16 +366,17 @@ def test_full_chunk_emits_and_then_accumulates_next_chunk(monkeypatch: pytest.Mo
     state.add_request(1, SimpleNamespace(req_id="second"))
     first_patch = torch.arange(32, dtype=torch.bfloat16)
     model._audio_queue = [("first", first_patch)]
-    model.make_omni_output(torch.zeros(2, 4), request_ids=["second", "first"])
+    model._last_audio_output_req_ids = ["second", "first"]
+    model.make_omni_output(torch.zeros(2, 4))
     assert _audio_output(state, [1, 0], [0, 0]) == [None, None]
     model._audio_queue = [("first", torch.arange(32, 64, dtype=torch.float32))]
-    model.make_omni_output(torch.zeros(2, 4), request_ids=["second", "first"])
+    model.make_omni_output(torch.zeros(2, 4))
     output = _audio_output(state, [1, 0], [0, 0])
     assert output[0] is None
     assert output[1]["model_outputs"].tolist() == list(range(64))
     assert state.audio_output_lengths[0] == 0
     model._audio_queue = [("first", torch.tensor([7.0, 8.0]))]
-    model.make_omni_output(torch.zeros(2, 4), request_ids=["second", "first"])
+    model.make_omni_output(torch.zeros(2, 4))
     assert _audio_output(state, [1, 0], [0, 1])[1]["model_outputs"].tolist() == [7.0, 8.0]
 
 
@@ -384,7 +386,8 @@ def test_length_limit_flushes_partial_chunk(monkeypatch: pytest.MonkeyPatch) -> 
     state = _state(model, 1, torch.device("cpu"), monkeypatch)
     state.add_request(0, SimpleNamespace(req_id="first"))
     model._audio_queue = [("first", torch.tensor([2.0, 3.0]))]
-    model.make_omni_output(torch.zeros(1, 4), request_ids=["first"])
+    model._last_audio_output_req_ids = ["first"]
+    model.make_omni_output(torch.zeros(1, 4))
     assert _audio_output(state, [0], [0], max_seq_len=2)[0]["model_outputs"].tolist() == [2.0, 3.0]
 
 
@@ -522,13 +525,14 @@ def test_partial_chunk_follows_request_to_new_slot_after_preemption(monkeypatch:
     state = _state(model, 2, torch.device("cpu"), monkeypatch)
     state.add_request(0, SimpleNamespace(req_id="first"))
     model._audio_queue = [("first", torch.arange(32, dtype=torch.float32))]
-    model.make_omni_output(torch.zeros(1, 4), request_ids=["first"])
+    model._last_audio_output_req_ids = ["first"]
+    model.make_omni_output(torch.zeros(1, 4))
     assert _audio_output(state, [0], [0]) == [None]
     state.on_request_preempted("first", 0)
     state.remove_request(0)
     state.add_request(1, SimpleNamespace(req_id="first"))
     model._audio_queue = [("first", torch.arange(32, 64, dtype=torch.float32))]
-    model.make_omni_output(torch.zeros(1, 4), request_ids=["first"])
+    model.make_omni_output(torch.zeros(1, 4))
     assert _audio_output(state, [1], [0])[0]["model_outputs"].tolist() == list(range(64))
 
 
@@ -928,7 +932,8 @@ def test_mrv2_output_does_not_copy_audio_to_host(monkeypatch: pytest.MonkeyPatch
     model._audio_queue = [("first", torch.ones(8, device=device))]
     state.intermediate_buffer.req_id_to_index = {"first": 0}
     monkeypatch.setattr(torch.Tensor, "cpu", lambda *_args, **_kwargs: pytest.fail("model-side audio D2H"))
-    output = model.make_omni_output(torch.zeros(1, 4, device=device), request_ids=["first"])
+    model._last_audio_output_req_ids = ["first"]
+    output = model.make_omni_output(torch.zeros(1, 4, device=device))
     assert state.audio_buffer.device.type == "cuda"
     assert output.multimodal_outputs["voxcpm2_audio_pending"] is True
 

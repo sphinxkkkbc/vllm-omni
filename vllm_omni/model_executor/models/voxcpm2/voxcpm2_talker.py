@@ -3634,10 +3634,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         model_state = getattr(self, "_mrv2_model_state", None)
         if model_state is not None:
-            request_ids = kwargs.get("request_ids")
-            if request_ids is None:
-                request_ids = self._last_audio_output_req_ids
-            return model_state.make_audio_output(model_outputs, request_ids)
+            return model_state.make_audio_output(model_outputs, self._last_audio_output_req_ids)
 
         mm: dict[str, Any] = {}
         if self._audio_queue:

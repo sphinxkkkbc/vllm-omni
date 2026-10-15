@@ -1545,7 +1545,6 @@ class OmniModelState(DefaultModelState):
                 buffer_list = self.intermediate_buffer.gather(input_batch)
                 make_output_kwargs = {
                     "model_intermediate_buffer": buffer_list,
-                    "request_ids": list(input_batch.req_ids),
                     "request_token_spans": [
                         (
                             int(input_batch.query_start_loc_np[i]),

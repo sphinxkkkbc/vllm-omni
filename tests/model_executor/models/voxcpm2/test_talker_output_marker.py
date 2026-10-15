@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """VoxCPM2 dense-mode audio outputs must carry the sparse-alignment marker.
 
 Dense mode (`_uses_sparse_audio_outputs()` False) still yields a strict
@@ -138,9 +138,9 @@ def test_mrv2_sparse_audio_preserves_request_order(monkeypatch):
     talker._last_audio_output_req_ids = ["r1", "r0"]
     talker._audio_queue = [("r1", torch.tensor([2.0])), ("r0", torch.tensor([1.0]))]
 
-    # The runner's batch order is authoritative even if model-local requests
-    # were visited in a different order during this step.
-    talker.make_omni_output(torch.zeros(2), request_ids=["r0", "r1"])
+    # Output follows the runner's slot mapping, even when preprocess visited
+    # the requests in a different order.
+    talker.make_omni_output(torch.zeros(2))
     output = _materialize_mrv2_audio(talker, ["r0", "r1"])
 
     assert output[0]["model_outputs"].item() == 1.0

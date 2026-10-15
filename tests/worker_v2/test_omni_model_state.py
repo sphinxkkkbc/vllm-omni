@@ -185,7 +185,6 @@ def test_output_spans_follow_reordered_mixed_batch():
     )
     state.postprocess_model_output(torch.zeros(4, 2), batch, SimpleNamespace())
     assert seen["request_token_spans"] == [(0, 3), (3, 4)]
-    assert seen["request_ids"] == ["prefill", "decode"]
     assert [info["req_id"] for info in seen["model_intermediate_buffer"]] == ["prefill", "decode"]
 
 
