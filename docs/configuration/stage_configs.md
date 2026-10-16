@@ -197,10 +197,13 @@ one stage to migrate or roll back independently. This does not change
 `PipelineConfig` topology, input adapters, or the connector payload contract.
 An omitted stage override preserves the deploy-level selection.
 
-MRv2 native downstream receivers currently support turn-based requests only;
-streaming sessions and resumable input require the V1 prompt-replacement path.
-Selecting a runner does not add the session capabilities it lacks. Platform
-fallbacks and stage overrides are validated after configuration resolution.
+MRv2 native downstream receivers accept turn-based requests. A pipeline that
+sets `supports_duplex_mrv2` also accepts duplex sessions on those stages.
+Qwen3-Omni and MiniCPM-o 4.5 set that flag. Resumable streaming input uses the
+V1 prompt-replacement path unless the pipeline implements the MRv2 equivalent.
+Selecting a runner does not add session capabilities the pipeline lacks.
+Platform fallbacks and stage overrides are validated after configuration
+resolution.
 
 ### Stage fields
 
@@ -332,6 +335,8 @@ The stage-based CLI paradigm facilitates the execution of discrete pipeline stag
   `--omni-master-address`, `--omni-master-port`, and standard port declarations (e.g., `--port`).
 - **Worker Stages** operate without a distinct API server (i.e., using `--headless`), are assigned sequential `--stage-id` identifiers, and must reference the corresponding
   `--omni-master-address` and `--omni-master-port` parameters to successfully register with Stage 0.
+
+You may also explicitly pass `--stage-id none` to run only the API server and orchestrator if you want to run every stage as headless.
 
 For migrated architectures, the system automatically resolves and loads the bundled deployment YAML. Consequently, the primary execution path
 does **not** necessitate the explicit definition of `--deploy-config`:
