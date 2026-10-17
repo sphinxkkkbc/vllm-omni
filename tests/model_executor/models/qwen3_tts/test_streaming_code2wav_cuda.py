@@ -192,3 +192,34 @@ def test_icl_two_request_graph_batch_preserves_reordered_state():
             torch.testing.assert_close(graph_wav, eager_wav, rtol=0, atol=0)
             assert graph_wav.abs().max() > 0
         cursor += length
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@torch.inference_mode()
+def test_initial_full_window_matches_split_priming_and_continuation():
+    decoder = _make_decoder().to(device="cuda", dtype=torch.bfloat16)
+    decoder.config.head_dim = decoder.config.hidden_size // decoder.config.num_attention_heads
+    for module in decoder.modules():
+        if hasattr(module, "embedding_sum") and hasattr(module, "cluster_usage"):
+            module.embedding_sum.uniform_(-1, 1)
+            module.cluster_usage.fill_(1)
+    # Exercise the real default window, including a prefix larger than max_frames.
+    decoder.config.sliding_window = 72
+    whole = StreamingCodecDecoder(decoder, 1)
+    split = StreamingCodecDecoder(decoder, 1)
+    codes = torch.randint(0, decoder.config.codebook_size, (1, 73, whole.nq), device="cuda", dtype=torch.int32)
+    slots = torch.zeros(1, device="cuda", dtype=torch.int32)
+    pos = torch.zeros_like(slots)
+    with pytest.raises(ValueError, match="at most"):
+        whole(codes[:, :72], slots, pos)
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.streaming_decoder import StreamingDecodeGraphs
+
+    graph = StreamingDecodeGraphs(whole, [1], frames=72, initial=True)
+    actual = graph(codes[:, :72], slots, pos).clone()
+    pieces = []
+    for start in range(0, 72, split.max_frames):
+        pieces.append(split(codes[:, start : min(start + split.max_frames, 72)], slots, pos + start))
+    torch.testing.assert_close(actual, torch.cat(pieces, dim=1), rtol=0.02, atol=0.02)
+    torch.testing.assert_close(
+        whole(codes[:, 72:], slots, pos + 72), split(codes[:, 72:], slots, pos + 72), rtol=0.02, atol=0.02
+    )

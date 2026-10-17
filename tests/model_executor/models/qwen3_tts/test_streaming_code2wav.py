@@ -10,6 +10,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _Codec:
+    RING = 5
     max_frames = 3
     window = 3
     spf = 2
@@ -18,7 +19,7 @@ class _Codec:
         self.state = [999] * num_slots
         self.calls = []
 
-    def __call__(self, codes, slots, positions):
+    def __call__(self, codes, slots, positions, *, initial=False):
         self.calls.append((codes.clone(), slots.tolist(), positions.tolist()))
         out = torch.empty(codes.shape[0], codes.shape[1] * self.spf)
         for row, (slot, pos) in enumerate(zip(slots.tolist(), positions.tolist(), strict=True)):
@@ -30,7 +31,7 @@ class _Codec:
 
 
 class _Graphs:
-    def __init__(self, sd, batch_sizes, frames):
+    def __init__(self, sd, batch_sizes, frames, *, initial=False):
         self.sd = sd
         self.frames = frames
         self.storage = torch.empty(max(batch_sizes), frames * sd.spf)
@@ -210,3 +211,44 @@ def test_icl_equal_shapes_share_priming_and_incremental_batches(monkeypatch):
     torch.testing.assert_close(rolling[0], torch.tensor([[23.0, 23.0]]))
     torch.testing.assert_close(rolling[1], torch.tensor([[20.0, 20.0]]))
     assert [call[0].shape[0] for call in backend.decoder.calls[-1:]] == [2]
+
+
+def test_reference_larger_than_continuation_limit_primes_in_one_call(monkeypatch):
+    monkeypatch.setattr(module, "StreamingCodecDecoder", _Codec)
+    backend = module.StreamingCode2Wav(
+        None, num_slots=1, max_batch_size=1, batch_sizes=[1], frame_sizes=[1, 3], capture=False
+    )
+    cache = {"prefix_frames": 4}
+    first = _decode(backend, [[1, 2, 3, 4, 5]], ["icl"], [cache])[0]
+    assert [call[0].shape[1] for call in backend.decoder.calls] == [4, 1]
+    assert [call[2] for call in backend.decoder.calls] == [[0], [4]]
+    torch.testing.assert_close(first, torch.tensor([[15.0, 15.0]]))
+    follow = _decode(backend, [[6]], ["icl"], [cache])[0]
+    assert backend.decoder.calls[-1][2] == [5]
+    torch.testing.assert_close(follow, torch.tensor([[21.0, 21.0]]))
+
+
+def test_reference_graph_is_captured_lazily_once_per_length(backend):
+    assert set(backend.prefix_graphs) == {3}
+    cache = {"prefix_frames": 2}
+    _decode(backend, [[1, 2, 3]], ["a"], [cache])
+    assert set(backend.prefix_graphs) == {2, 3}
+    graph = backend.prefix_graphs[2]
+    backend.release(["a"])
+    _decode(backend, [[4, 5, 6]], ["b"], [{"prefix_frames": 2}])
+    assert backend.prefix_graphs[2] is graph
+
+
+def test_icl_terminal_padding_trims_pcm_and_preserves_owned_output(backend):
+    cache = {"prefix_frames": 2}
+    _decode(backend, [[1, 2, 3]], ["icl"], [cache])
+    # A live two-frame chunk must not be padded into the three-frame graph.
+    _decode(backend, [[4, 5]], ["icl"], [cache])
+    assert backend.decoder.calls[-1][0].shape[1] == 2
+    terminal = _decode(backend, [[6, 7]], ["icl"], [cache], terminal=[True])[0]
+    assert backend.decoder.calls[-1][0].shape[1] == 3
+    torch.testing.assert_close(terminal, torch.tensor([[21.0, 21.0, 28.0, 28.0]]))
+    assert backend.request_states["icl"].position == 5
+    backend.release(["icl"])
+    _decode(backend, [[8, 9, 10]], ["other"], [{}])
+    torch.testing.assert_close(terminal, torch.tensor([[21.0, 21.0, 28.0, 28.0]]))
