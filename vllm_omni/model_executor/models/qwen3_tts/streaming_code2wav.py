@@ -32,6 +32,7 @@ class _IclWork:
     cache: dict[str, Any]
     generated: torch.Tensor
     prefix_codes: torch.Tensor | None = None
+    terminal: bool = False
 
 
 class StreamingCode2Wav:
@@ -65,13 +66,17 @@ class StreamingCode2Wav:
         self.request_states: dict[str, _RequestDecodeState] = {}
         self.fallback_ids: set[str] = set()
         self.graphs: dict[int, StreamingDecodeGraphs] = {}
+        self.prefix_graphs: dict[int, StreamingDecodeGraphs] = {}
+        self.capture_batch_sizes: list[int] = []
         if capture:
             sizes = sorted({size for size in batch_sizes if 0 < size <= min(num_slots, self.max_batch_size)})
+            self.capture_batch_sizes = sizes
             captured_frames = {min(size, self.decoder.max_frames) for size in frame_sizes if size > 0}
-            if "icl" in self.decode_modes:
-                captured_frames.update((1, 2, 4, 8, 16, 32, self.decoder.max_frames))
             for frames in sorted(captured_frames):
                 self.graphs[frames] = StreamingDecodeGraphs(self.decoder, sizes, frames=frames)
+            if "icl" in self.decode_modes:
+                frames = min(self.decoder.window, self.decoder.RING)
+                self.prefix_graphs[frames] = StreamingDecodeGraphs(self.decoder, sizes, frames=frames, initial=True)
 
     def release(self, request_ids: set[str] | list[str]) -> None:
         for request_id in request_ids:
@@ -101,13 +106,21 @@ class StreamingCode2Wav:
         offset = 0
         while offset < frames_total:
             remaining = frames_total - offset
-            if prefix and self.graphs:
-                frames = next((size for size in sorted(self.graphs, reverse=True) if size <= remaining), 1)
-            else:
-                frames = min(remaining, sd.max_frames)
+            initial = prefix and offset == 0
+            frames = min(remaining, sd.RING if initial else sd.max_frames)
             value = values[:, :, offset : offset + frames].transpose(1, 2).to(torch.int32).contiguous()
-            fn = self.graphs.get(frames, sd)
-            wav = fn(value, slot_tensor, position_tensor + offset)
+            graphs = self.prefix_graphs if initial else self.graphs
+            if initial and frames not in self.prefix_graphs and self.capture_batch_sizes:
+                self.prefix_graphs[frames] = StreamingDecodeGraphs(
+                    sd, self.capture_batch_sizes, frames=frames, initial=True
+                )
+            fn = graphs.get(frames)
+            if fn is not None:
+                wav = fn(value, slot_tensor, position_tensor + offset)
+            elif initial:
+                wav = sd(value, slot_tensor, position_tensor + offset, initial=True)
+            else:
+                wav = sd(value, slot_tensor, position_tensor + offset)
             if pcm is not None:
                 pcm[:, offset * sd.spf : (offset + frames) * sd.spf].copy_(wav)
             offset += frames
@@ -134,6 +147,12 @@ class StreamingCode2Wav:
         for item in work:
             state = item.state
             to_decode = item.generated
+            if item.terminal:
+                frames = next(
+                    (size for size in sorted(self.graphs) if size >= to_decode.shape[-1]), to_decode.shape[-1]
+                )
+                if frames > to_decode.shape[-1]:
+                    to_decode = torch.nn.functional.pad(to_decode, (0, frames - to_decode.shape[-1]))
             position = state.prefix_frames + state.position
             suffix_groups[to_decode.shape[-1]].append((item, to_decode, position))
 
@@ -149,7 +168,7 @@ class StreamingCode2Wav:
                 for index, (item, _, _) in enumerate(part):
                     state = item.state
                     new_frames = item.generated.shape[-1]
-                    result = pcm[index : index + 1, -new_frames * sd.spf :]
+                    result = pcm[index : index + 1, : new_frames * sd.spf]
                     if state.position == 0 and item.cache.get("skip_first_audio", False):
                         result = result[:, sd.spf :]
                     outputs[item.row] = result
@@ -199,10 +218,17 @@ class StreamingCode2Wav:
                     state = _RequestDecodeState(cache, self.free_slots.popleft(), prefix_frames=prefix_frames)
                     self.request_states[request_id] = state
                     icl_work.append(
-                        _IclWork(row, state, cache, row_codes[:, :, prefix_frames:], row_codes[:, :, :prefix_frames])
+                        _IclWork(
+                            row,
+                            state,
+                            cache,
+                            row_codes[:, :, prefix_frames:],
+                            row_codes[:, :, :prefix_frames],
+                            terminal=terminal[row],
+                        )
                     )
                 else:
-                    icl_work.append(_IclWork(row, state, cache, row_codes))
+                    icl_work.append(_IclWork(row, state, cache, row_codes, terminal=terminal[row]))
                 continue
             if (
                 cache.get("_is_dummy_run", False)

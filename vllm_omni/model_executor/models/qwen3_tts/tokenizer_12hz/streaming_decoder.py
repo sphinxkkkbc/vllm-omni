@@ -674,16 +674,22 @@ class StreamingCodecDecoder(nn.Module):
 
     # ------------------------------------------------------------------ forward
     @torch.no_grad()
-    def forward(self, codes: torch.Tensor, slots: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, codes: torch.Tensor, slots: torch.Tensor, pos: torch.Tensor, *, initial: bool = False
+    ) -> torch.Tensor:
         """``codes`` [B, T, NQ] int, ``slots``/``pos`` [B] int32 -> waveform [B, T * spf] float32.
 
         ``pos[b]`` is the index of the row's first frame in its stream; 0 starts
         a new stream in ``slots[b]``. Frames beyond ``max_frames`` per call must
-        be split by the caller.
+        be split by the caller. ``initial=True`` permits up to RING frames
+        when every row starts at pos=0; callers must guarantee this contract.
         """
         B, T, _ = codes.shape
-        if T > self.max_frames:
-            raise ValueError(f"at most {self.max_frames} frames per call, got {T}")
+        # Initial calls must have pos=0 for every row. No old KV is live, so
+        # all ring positions can be written before attention reads them.
+        limit = self.RING if initial else self.max_frames
+        if T > limit:
+            raise ValueError(f"at most {limit} frames per call, got {T}")
         dev, dt = codes.device, self.dtype
         codes = codes.reshape(B * T, self.nq).to(torch.int32).contiguous()
         emb = torch.empty(B * T, 2 * self.half, device=dev, dtype=dt)
@@ -768,8 +774,11 @@ class StreamingCodecDecoder(nn.Module):
 class StreamingDecodeGraphs:
     """CUDA graphs of ``StreamingCodecDecoder`` for a fixed frame count per batch bucket."""
 
-    def __init__(self, sd: StreamingCodecDecoder, batch_sizes: list[int], frames: int = 1) -> None:
+    def __init__(
+        self, sd: StreamingCodecDecoder, batch_sizes: list[int], frames: int = 1, *, initial: bool = False
+    ) -> None:
         self.sd, self.frames = sd, frames
+        self.initial = initial
         self.graphs: dict[int, tuple] = {}
         dev = sd.device
         pool = torch.cuda.graph_pool_handle()
@@ -777,11 +786,11 @@ class StreamingDecodeGraphs:
             codes = torch.zeros(bsz, frames, sd.nq, dtype=torch.int32, device=dev)
             slots = torch.full((bsz,), sd.scratch_slot, dtype=torch.int32, device=dev)
             pos = torch.zeros(bsz, dtype=torch.int32, device=dev)
-            sd(codes, slots, pos)
+            sd(codes, slots, pos, initial=initial)
             current_omni_platform.synchronize()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, pool=pool):
-                out = sd(codes, slots, pos)
+                out = sd(codes, slots, pos, initial=initial)
             self.graphs[bsz] = (graph, codes, slots, pos, out)
         self.sizes = sorted(self.graphs)
 
@@ -790,7 +799,7 @@ class StreamingDecodeGraphs:
         n = int(codes.shape[0])
         size = next((b for b in self.sizes if b >= n), None)
         if size is None:
-            return self.sd(codes, slots.to(torch.int32), pos.to(torch.int32))
+            return self.sd(codes, slots.to(torch.int32), pos.to(torch.int32), initial=self.initial)
         graph, s_codes, s_slots, s_pos, out = self.graphs[size]
         s_codes[:n].copy_(codes)
         s_slots[:n].copy_(slots)
