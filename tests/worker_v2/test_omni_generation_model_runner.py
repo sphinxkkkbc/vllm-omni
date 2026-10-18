@@ -50,6 +50,8 @@ class _FakeStagedField:
 
 def _make_runner(model_output, num_reqs=1, prompt_len=10):
     runner = object.__new__(OmniGenerationModelRunner)
+    runner._retains_state_across_chunks = False
+    runner._remove_request = MagicMock()
     from vllm_omni.worker_v2.staged_writes import StagedWrites
 
     runner._staged_writes = StagedWrites()
@@ -112,7 +114,8 @@ def test_control_only_step_keeps_lifecycle_and_skips_input_construction(aux_enab
         runner.aux_output_connector.begin_step.assert_called_once_with(metadata)
 
 
-def test_released_chunk_reuses_scheduler_output_and_slot_recycle_clears_state():
+@pytest.mark.parametrize("retained", [False, True])
+def test_released_chunk_reuses_scheduler_output_and_slot_recycle_clears_state(retained):
     from vllm.v1.core.sched.output import SchedulerOutput
 
     from vllm_omni.core.sched.output import OmniCachedRequestData
@@ -163,7 +166,35 @@ def test_released_chunk_reuses_scheduler_output_and_slot_recycle_clears_state():
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
     )
+    if retained:
+        from unittest.mock import Mock
+
+        runner.req_states = SimpleNamespace(
+            req_id_to_index={"req": 0},
+            max_seq_len=torch.tensor([999]),
+            draft_tokens=torch.ones(1, 2, dtype=torch.long),
+            prompt_len=SimpleNamespace(np=[999]),
+            prefill_len=SimpleNamespace(np=[999]),
+            total_len=Mock(),
+            all_token_ids=Mock(),
+            num_computed_tokens=Mock(),
+            num_computed_prefill_tokens=[999],
+            apply_staged_writes=Mock(),
+        )
+    writes = []
+    if retained:
+        runner.req_states.apply_staged_writes.side_effect = lambda: writes.append(("req", runner._staged_writes.depth))
+        runner.model_state.apply_staged_writes.side_effect = lambda: writes.append(
+            ("model", runner._staged_writes.depth)
+        )
     runner._handle_async_chunk_updates(scheduler_output)
+    if retained:
+        assert writes == [("req", 1), ("model", 1)]
+        assert runner.req_states.req_id_to_index == {"req": 0}
+        assert runner.req_states.max_seq_len.tolist() == [2]
+        assert not runner.req_states.draft_tokens.any()
+        runner._remove_request.assert_not_called()
+        runner.model_state.remove_request.assert_called_once_with(0)
     added = runner.model_state.add_request.call_args.args[1]
     assert (added.req_id, added.prompt_token_ids) == ("req", [1])
 
