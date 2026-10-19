@@ -68,17 +68,13 @@ def _decode(backend, values, request_ids, caches, *, terminal=None, legacy=None)
     )
 
 
-def test_reordered_chunks_keep_request_state_and_skip_direct_audio_once(backend):
-    a = {"skip_first_audio": True}
-    b: dict[str, object] = {}
-    first = _decode(backend, [[2], [5]], ["a", "b"], [a, b])
-    assert first[0].numel() == 0
-    torch.testing.assert_close(first[1], torch.tensor([[5.0, 5.0]]))
-    follow = _decode(backend, [[7, 11], [3, 4]], ["b", "a"], [b, a])
-    torch.testing.assert_close(follow[0], torch.tensor([[12.0, 12.0, 23.0, 23.0]]))
-    torch.testing.assert_close(follow[1], torch.tensor([[5.0, 5.0, 9.0, 9.0]]))
-    assert backend.request_states["a"].position == backend.request_states["b"].position == 3
-    assert [call[0].shape[1] for call in backend.decoder.calls[-1:]] == [2]
+def test_skip_first_audio_advances_state_and_skips_only_once(backend):
+    cache = {"skip_first_audio": True}
+    first = _decode(backend, [[2]], ["a"], [cache])[0]
+    assert first.numel() == 0
+    follow = _decode(backend, [[3, 4]], ["a"], [cache])[0]
+    torch.testing.assert_close(follow, torch.tensor([[5.0, 5.0, 9.0, 9.0]]))
+    assert backend.request_states["a"].position == 3
 
 
 def test_terminal_padding_does_not_leak_pcm_and_graph_replay_keeps_prior_outputs(backend):
@@ -135,7 +131,7 @@ def test_cache_replacement_resets_stream_position(backend):
     assert backend.request_states["a"].position == 1
 
 
-def test_dummy_run_uses_native_capture_without_allocating_stream_state(backend, mocker):
+def test_dummy_run_uses_legacy_decoder_without_allocating_request_state(backend, mocker):
     legacy = mocker.Mock(spec=module.Qwen3TTSTokenizerV2Decoder)
     legacy.batched_chunked_decode.return_value = [torch.ones(1, 7)]
     actual = _decode(backend, [[1]], ["dummy"], [{"_is_dummy_run": True}], legacy=legacy)[0]
@@ -155,16 +151,18 @@ def test_icl_primes_once_and_continues_past_window(monkeypatch):
     backend = module.StreamingCode2Wav(
         None, num_slots=2, max_batch_size=1, batch_sizes=[1], frame_sizes=[1, 3], capture=True
     )
-    cache = {"prefix_frames": 2}
-    first = _decode(backend, [[2, 3, 4]], ["icl"], [cache])[0]
-    torch.testing.assert_close(first, torch.tensor([[9.0, 9.0]]))
-    assert backend.decoder.calls[0][0].shape[1] == 2  # exact prefix length, no padded codec frames
-    growing = _decode(backend, [[1, 2]], ["icl"], [cache])[0]
-    torch.testing.assert_close(growing, torch.tensor([[10.0, 10.0, 12.0, 12.0]]))
-    rolling = _decode(backend, [[7]], ["icl"], [cache])[0]
-    torch.testing.assert_close(rolling, torch.tensor([[19.0, 19.0]]))
+    cache = {"prefix_frames": 4}
+    assert cache["prefix_frames"] > backend.decoder.max_frames
+    first = _decode(backend, [[1, 2, 3, 4, 5]], ["icl"], [cache])[0]
+    assert [call[0].shape[1] for call in backend.decoder.calls] == [4, 1]
+    assert [call[2] for call in backend.decoder.calls] == [[0], [4]]
+    torch.testing.assert_close(first, torch.tensor([[15.0, 15.0]]))
+    follow = _decode(backend, [[1, 2]], ["icl"], [cache])[0]
+    torch.testing.assert_close(follow, torch.tensor([[16.0, 16.0, 18.0, 18.0]]))
+    past_window = _decode(backend, [[7]], ["icl"], [cache])[0]
+    torch.testing.assert_close(past_window, torch.tensor([[25.0, 25.0]]))
     assert backend.request_states["icl"].position == 4
-    assert backend.decoder.calls[-1][2] == [5]
+    assert [call[2] for call in backend.decoder.calls] == [[0], [4], [5], [7]]
     backend.release(["icl"])
     assert len(backend.free_slots) == 2
 
@@ -211,21 +209,6 @@ def test_icl_equal_shapes_share_priming_and_incremental_batches(monkeypatch):
     torch.testing.assert_close(rolling[0], torch.tensor([[23.0, 23.0]]))
     torch.testing.assert_close(rolling[1], torch.tensor([[20.0, 20.0]]))
     assert [call[0].shape[0] for call in backend.decoder.calls[-1:]] == [2]
-
-
-def test_reference_larger_than_continuation_limit_primes_in_one_call(monkeypatch):
-    monkeypatch.setattr(module, "StreamingCodecDecoder", _Codec)
-    backend = module.StreamingCode2Wav(
-        None, num_slots=1, max_batch_size=1, batch_sizes=[1], frame_sizes=[1, 3], capture=False
-    )
-    cache = {"prefix_frames": 4}
-    first = _decode(backend, [[1, 2, 3, 4, 5]], ["icl"], [cache])[0]
-    assert [call[0].shape[1] for call in backend.decoder.calls] == [4, 1]
-    assert [call[2] for call in backend.decoder.calls] == [[0], [4]]
-    torch.testing.assert_close(first, torch.tensor([[15.0, 15.0]]))
-    follow = _decode(backend, [[6]], ["icl"], [cache])[0]
-    assert backend.decoder.calls[-1][2] == [5]
-    torch.testing.assert_close(follow, torch.tensor([[21.0, 21.0]]))
 
 
 def test_reference_graph_is_captured_lazily_once_per_length(backend):

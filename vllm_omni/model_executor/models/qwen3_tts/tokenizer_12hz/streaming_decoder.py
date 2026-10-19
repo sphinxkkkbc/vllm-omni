@@ -894,7 +894,7 @@ def _graph_inputs_kernel(
         tl.store(s_slots_ptr + b, tl.load(slots_ptr + b).to(tl.int32))
         tl.store(s_pos_ptr + b, tl.load(pos_ptr + b).to(tl.int32))
     else:
-        tl.store(s_slots_ptr + b, scratch.to(tl.int32))
+        tl.store(s_slots_ptr + b, scratch)
         tl.store(s_pos_ptr + b, tl.full([], 0, tl.int32))
 
 
