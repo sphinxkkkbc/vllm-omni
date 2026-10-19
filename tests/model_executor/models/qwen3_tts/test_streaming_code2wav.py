@@ -124,13 +124,6 @@ def test_icl_and_overflow_keep_legacy_decoder_for_entire_request(backend, mocker
     assert not backend.fallback_ids
 
 
-def test_cache_replacement_resets_stream_position(backend):
-    _decode(backend, [[5]], ["a"], [{}])
-    out = _decode(backend, [[7]], ["a"], [{}])[0]
-    torch.testing.assert_close(out, torch.tensor([[7.0, 7.0]]))
-    assert backend.request_states["a"].position == 1
-
-
 def test_dummy_run_uses_legacy_decoder_without_allocating_request_state(backend, mocker):
     legacy = mocker.Mock(spec=module.Qwen3TTSTokenizerV2Decoder)
     legacy.batched_chunked_decode.return_value = [torch.ones(1, 7)]
@@ -161,7 +154,7 @@ def test_icl_primes_once_and_continues_past_window(monkeypatch):
     torch.testing.assert_close(follow, torch.tensor([[16.0, 16.0, 18.0, 18.0]]))
     past_window = _decode(backend, [[7]], ["icl"], [cache])[0]
     torch.testing.assert_close(past_window, torch.tensor([[25.0, 25.0]]))
-    assert backend.request_states["icl"].position == 4
+    assert backend.request_states["icl"].position == 8
     assert [call[2] for call in backend.decoder.calls] == [[0], [4], [5], [7]]
     backend.release(["icl"])
     assert len(backend.free_slots) == 2
@@ -183,7 +176,7 @@ def test_icl_reordered_requests_keep_prefix_and_suffix_isolated(monkeypatch):
     torch.testing.assert_close(reordered[1], torch.tensor([[7.0, 7.0, 9.0, 9.0]]))
     rolling = _decode(backend, [[3]], ["a"], [a])[0]
     torch.testing.assert_close(rolling, torch.tensor([[12.0, 12.0]]))
-    assert backend.request_states["b"].position == 2
+    assert backend.request_states["b"].position == 4
 
 
 def test_icl_equal_shapes_share_priming_and_incremental_batches(monkeypatch):
@@ -231,7 +224,26 @@ def test_icl_terminal_padding_trims_pcm_and_preserves_owned_output(backend):
     terminal = _decode(backend, [[6, 7]], ["icl"], [cache], terminal=[True])[0]
     assert backend.decoder.calls[-1][0].shape[1] == 3
     torch.testing.assert_close(terminal, torch.tensor([[21.0, 21.0, 28.0, 28.0]]))
-    assert backend.request_states["icl"].position == 5
+    assert backend.request_states["icl"].position == 7
     backend.release(["icl"])
     _decode(backend, [[8, 9, 10]], ["other"], [{}])
     torch.testing.assert_close(terminal, torch.tensor([[21.0, 21.0, 28.0, 28.0]]))
+
+
+def test_icl_and_xvec_share_suffix_batches(monkeypatch):
+    monkeypatch.setattr(module, "StreamingCodecDecoder", _Codec)
+    monkeypatch.setattr(module, "StreamingDecodeGraphs", _Graphs)
+    backend = module.StreamingCode2Wav(
+        None, num_slots=2, max_batch_size=2, batch_sizes=[1, 2], frame_sizes=[1, 3], capture=True
+    )
+    caches = [{"prefix_frames": 2, "skip_first_audio": True}, {}]
+    first = _decode(backend, [[1, 2, 3], [4]], ["icl", "xvec"], caches)
+    assert first[0].numel() == 0
+    torch.testing.assert_close(first[1], torch.tensor([[4.0, 4.0]]))
+    assert [call[0].shape[:2] for call in backend.decoder.calls] == [(1, 2), (2, 1)]
+    assert backend.decoder.calls[-1][2] == [2, 0]
+    follow = _decode(backend, [[5], [6]], ["xvec", "icl"], caches[::-1])
+    torch.testing.assert_close(follow[0], torch.tensor([[9.0, 9.0]]))
+    torch.testing.assert_close(follow[1], torch.tensor([[12.0, 12.0]]))
+    assert backend.decoder.calls[-1][0].shape[:2] == (2, 1)
+    assert backend.decoder.calls[-1][2] == [1, 3]

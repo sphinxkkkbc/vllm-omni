@@ -19,20 +19,9 @@ from .tokenizer_12hz.streaming_decoder import StreamingCodecDecoder, StreamingDe
 
 @dataclass
 class _RequestDecodeState:
-    cache: dict[str, Any]
     slot: int
     position: int = 0
     prefix_frames: int = 0
-
-
-@dataclass
-class _IclWork:
-    row: int
-    state: _RequestDecodeState
-    cache: dict[str, Any]
-    generated: torch.Tensor
-    prefix_codes: torch.Tensor | None = None
-    terminal: bool = False
 
 
 class StreamingCode2Wav:
@@ -126,54 +115,6 @@ class StreamingCode2Wav:
             offset += frames
         return pcm
 
-    def _decode_icl_batch(self, work: list[_IclWork], outputs: list[torch.Tensor]) -> None:
-        """Batch prefix initialization and equal-length suffix work separately."""
-        sd = self.decoder
-        prefix_groups: dict[int, list[_IclWork]] = defaultdict(list)
-        for item in work:
-            if item.prefix_codes is not None:
-                prefix_groups[item.state.prefix_frames].append(item)
-        for frames, items in prefix_groups.items():
-            for start in range(0, len(items), self.max_batch_size):
-                part = items[start : start + self.max_batch_size]
-                self._run_batch(
-                    [item.prefix_codes for item in part if item.prefix_codes is not None],
-                    [item.state.slot for item in part],
-                    [0] * len(part),
-                    prefix=True,
-                )
-
-        suffix_groups: dict[int, list[tuple[_IclWork, torch.Tensor, int]]] = defaultdict(list)
-        for item in work:
-            state = item.state
-            to_decode = item.generated
-            if item.terminal:
-                frames = next(
-                    (size for size in sorted(self.graphs) if size >= to_decode.shape[-1]), to_decode.shape[-1]
-                )
-                if frames > to_decode.shape[-1]:
-                    to_decode = torch.nn.functional.pad(to_decode, (0, frames - to_decode.shape[-1]))
-            position = state.prefix_frames + state.position
-            suffix_groups[to_decode.shape[-1]].append((item, to_decode, position))
-
-        for frames, items in suffix_groups.items():
-            for start in range(0, len(items), self.max_batch_size):
-                part = items[start : start + self.max_batch_size]
-                pcm = self._run_batch(
-                    [codes for _, codes, _ in part],
-                    [item.state.slot for item, _, _ in part],
-                    [position for _, _, position in part],
-                )
-                assert pcm is not None
-                for index, (item, _, _) in enumerate(part):
-                    state = item.state
-                    new_frames = item.generated.shape[-1]
-                    result = pcm[index : index + 1, : new_frames * sd.spf]
-                    if state.position == 0 and item.cache.get("skip_first_audio", False):
-                        result = result[:, sd.spf :]
-                    outputs[item.row] = result
-                    state.position += new_frames
-
     @torch.no_grad()
     def decode(
         self,
@@ -188,62 +129,34 @@ class StreamingCode2Wav:
         left_context_size: int,
     ) -> list[torch.Tensor]:
         groups: dict[int, list[int]] = defaultdict(list)
-        icl_work: list[_IclWork] = []
+        prefix_groups: dict[int, list[int]] = defaultdict(list)
+        suffix_starts: dict[int, int] = {}
         fallback_rows: list[int] = []
         outputs = [codes.new_empty((1, 0), dtype=torch.float32) for _ in lengths]
         for row, (request_id, cache, length) in enumerate(zip(request_ids, caches, lengths, strict=True)):
             state = self.request_states.get(request_id)
-            if state is not None and state.cache is not cache:
-                self.release([request_id])
-                state = None
             mode = "icl" if int(cache.get("prefix_frames", 0)) > 0 else "xvec"
             if mode not in self.decode_modes:
                 fallback_rows.append(row)
                 continue
-            # Prime reference codes once, then append generated frames to the same state.
-            if (
-                int(cache.get("prefix_frames", 0)) > 0
-                and not cache.get("_is_dummy_run", False)
-                and request_id not in self.fallback_ids
-            ):
-                row_codes = codes[row : row + 1, :, :length]
-                if state is None:
-                    if not self.free_slots:
-                        self.fallback_ids.add(request_id)
-                        fallback_rows.append(row)
-                        continue
-                    prefix_frames = int(cache["prefix_frames"])
-                    if not 0 < prefix_frames < length:
-                        raise ValueError("ICL first chunk must contain reference and generated frames")
-                    state = _RequestDecodeState(cache, self.free_slots.popleft(), prefix_frames=prefix_frames)
-                    self.request_states[request_id] = state
-                    icl_work.append(
-                        _IclWork(
-                            row,
-                            state,
-                            cache,
-                            row_codes[:, :, prefix_frames:],
-                            row_codes[:, :, :prefix_frames],
-                            terminal=terminal[row],
-                        )
-                    )
-                else:
-                    icl_work.append(_IclWork(row, state, cache, row_codes, terminal=terminal[row]))
-                continue
-            if (
-                cache.get("_is_dummy_run", False)
-                or int(cache.get("prefix_frames", 0)) > 0
-                or request_id in self.fallback_ids
-            ):
+            if cache.get("_is_dummy_run", False) or request_id in self.fallback_ids:
                 fallback_rows.append(row)
                 continue
+            prefix = 0
             if state is None:
                 if not self.free_slots:
                     self.fallback_ids.add(request_id)
                     fallback_rows.append(row)
                     continue
-                state = _RequestDecodeState(cache, self.free_slots.popleft())
+                prefix = int(cache.get("prefix_frames", 0))
+                if prefix and not 0 < prefix < length:
+                    raise ValueError("ICL first chunk must contain reference and generated frames")
+                state = _RequestDecodeState(self.free_slots.popleft(), prefix_frames=prefix)
                 self.request_states[request_id] = state
+                if prefix:
+                    prefix_groups[prefix].append(row)
+            suffix_starts[row] = prefix
+            length -= prefix
             frames = length
             # Padding is safe only on terminal chunks: no later call may
             # consume the resulting state. Trim PCM back to the real length.
@@ -251,8 +164,18 @@ class StreamingCode2Wav:
                 frames = next((size for size in sorted(self.graphs) if size >= length), length)
             groups[frames].append(row)
 
-        if icl_work:
-            self._decode_icl_batch(icl_work, outputs)
+        for frames, rows in prefix_groups.items():
+            for offset in range(0, len(rows), self.max_batch_size):
+                part = rows[offset : offset + self.max_batch_size]
+                records = [self.request_states[request_ids[row]] for row in part]
+                self._run_batch(
+                    [codes[row : row + 1, :, :frames] for row in part],
+                    [record.slot for record in records],
+                    [0] * len(part),
+                    prefix=True,
+                )
+                for record in records:
+                    record.position += frames
 
         if fallback_rows:
             selected = index_to_device(fallback_rows, codes.device)
@@ -272,18 +195,27 @@ class StreamingCode2Wav:
             for offset in range(0, len(rows), self.max_batch_size):
                 part = rows[offset : offset + self.max_batch_size]
                 records = [self.request_states[request_ids[row]] for row in part]
-                selected = index_to_device(part, codes.device)
-                value = codes.index_select(0, selected)[:, :, :frames]
-                if value.shape[-1] < frames:
-                    value = torch.nn.functional.pad(value, (0, frames - value.shape[-1]))
+                values = []
+                for row in part:
+                    start = suffix_starts[row]
+                    # Reuse the caller's zero padding; only extend for a larger terminal bucket.
+                    value = codes[row : row + 1, :, start : start + frames]
+                    if value.shape[-1] < frames:
+                        value = torch.nn.functional.pad(value, (0, frames - value.shape[-1]))
+                    values.append(value)
                 pcm = self._run_batch(
-                    [value[index : index + 1] for index in range(len(part))],
+                    values,
                     [record.slot for record in records],
                     [record.position for record in records],
                 )
                 assert pcm is not None
                 for index, (row, record) in enumerate(zip(part, records, strict=True)):
-                    skip = int(bool(caches[row].get("skip_first_audio", False))) if record.position == 0 else 0
-                    outputs[row] = pcm[index : index + 1, skip * sd.spf : lengths[row] * sd.spf]
-                    record.position += lengths[row]
+                    new_frames = lengths[row] - suffix_starts[row]
+                    skip = (
+                        int(bool(caches[row].get("skip_first_audio", False)))
+                        if record.position == record.prefix_frames
+                        else 0
+                    )
+                    outputs[row] = pcm[index : index + 1, skip * sd.spf : new_frames * sd.spf]
+                    record.position += new_frames
         return outputs
