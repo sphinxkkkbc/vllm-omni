@@ -79,6 +79,7 @@ from vllm_omni.engine.duplex.plugin import (
 )
 from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
+    clear_input_buffer,
     discard_pending_input_audio,
     note_input_append,
     resolve_cancel_response,
@@ -101,6 +102,7 @@ from vllm_omni.engine.duplex.session.context import (
 from vllm_omni.engine.duplex.session.control import SessionControl
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibration
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
 from vllm_omni.engine.duplex.session.tool_calls import (
@@ -253,6 +255,16 @@ class DuplexSessionRunner:
             tool_calls=self.tool_calls,
         )
         self.out = SessionEmitter(self.ctx, promote_deferred_overlap=self._promote_deferred_overlap_later)
+        calibration = plugin.history_calibrator(manager.runtime_config)
+        if calibration is not None:
+            self.ctx.history_calibration = HistoryCalibration(
+                session,
+                calibration.calibrate,
+                max_bytes=manager.runtime_config.history_audio_max_bytes_per_session,
+                timeout_s=manager.runtime_config.history_calibration_timeout_ms / 1000,
+                requires_audio=calibration.requires_audio,
+                on_applied=self._settle_stored_answer,
+            )
         self.model = ModelChannel(
             self.ctx,
             self.out,
@@ -404,8 +416,13 @@ class DuplexSessionRunner:
         response_id = draining_response_id or session.active_response_id
         if response_id is None:
             return
+        playback = session.playback_for_response(response_id).as_dict()
         if draining_response_id is not None:
             session.clear_draining_for_response(draining_response_id)
+            if session.finalize_response_playback(
+                draining_response_id, require_audio_complete=self.ctx.history_calibration is not None
+            ):
+                self._settle_stored_answer(draining_response_id)
             if isinstance(request_id, str):
                 session.request_resources.pop((stage_id, request_id), None)
         elif response_id == session.active_response_id:
@@ -420,7 +437,7 @@ class DuplexSessionRunner:
                 "committed": False,
                 "status": "failed",
                 "status_details": {"type": "failed", "reason": "runtime_data_plane_stream_failed"},
-                "playback": session.playback.as_dict(),
+                "playback": playback,
             }
         )
 
@@ -551,6 +568,8 @@ class DuplexSessionRunner:
                         self.spawn(self._rearm_deferred_silence(), name="duplex-continue")
 
     async def _stop_worker(self) -> None:
+        if self.ctx.history_calibration is not None:
+            self.ctx.history_calibration.close()
         worker = self._worker
         self._worker = None
         # Set even when the worker itself is stopping (a wire ``session.close``
@@ -630,9 +649,6 @@ class DuplexSessionRunner:
                 retained_committed_payload=payload,
             )
             return
-        if item.kind == "commit":
-            await self._on_commit(dict(item.payload))
-            return
         if item.kind == "tool_call_expiry":
             self._on_tool_call_expiry(item.payload)
             return
@@ -640,6 +656,22 @@ class DuplexSessionRunner:
             await self._on_tool_call_settlement(item.payload)
             return
         logger.warning("Unknown duplex runner internal item: %s", item.kind)
+
+    def _settle_stored_answer(self, response_id: str | None) -> None:
+        """Settle only a nonempty stored answer; close on unsafe tool state."""
+        if response_id is None:
+            return
+        message = self.session.history_item_ids.get(f"item_{response_id}")
+        content = message.get("content") if message is not None else None
+        if not isinstance(content, str) or not content:
+            return
+        try:
+            settle_response_runtime(self.plugin, self.session, committed=True, response_id=response_id)
+        except Exception:
+            logger.exception("Failed to settle runtime for a stored assistant answer")
+            self._emit_error("tool_call_settlement_failed", "the session could not settle a stored assistant answer")
+            self._begin_close("tool_call_settlement_failed")
+            self.manager.close_from_runner(self, "tool_call_settlement_failed")
 
     def _settle_playback_committed_answer(self, events) -> None:
         """Drop a tool pair only when this ACK stored that response's answer."""
@@ -653,7 +685,7 @@ class DuplexSessionRunner:
             response_id = (
                 item_id.removeprefix("item_") if isinstance(item_id, str) and item_id.startswith("item_") else None
             )
-            settle_response_runtime(self.plugin, self.session, committed=True, response_id=response_id)
+            self._settle_stored_answer(response_id)
 
     async def _run_internal_payload(self, payload: dict[str, object]) -> None:
         """Run one internal event dictionary through the matching handler."""
@@ -663,7 +695,11 @@ class DuplexSessionRunner:
         elif event_type in {"input_audio_buffer.commit", "input.commit", "response.create"}:
             await self._on_commit(payload)
         elif event_type == "playback.ack":
-            events = playback_ledger.apply_playback_ack(self.session, payload)
+            events = playback_ledger.apply_playback_ack(
+                self.session,
+                payload,
+                require_audio_complete=self.ctx.history_calibration is not None,
+            )
             self._emit_events(events)
             self._settle_playback_committed_answer(events)
         elif event_type in _CANCEL_EVENTS:
@@ -742,7 +778,11 @@ class DuplexSessionRunner:
         elif isinstance(command, UpdateSession):
             await self.control.on_session_update(dict(command.patch), realtime_event_id=command.event_id)
         elif isinstance(command, AckPlayback):
-            events = playback_ledger.apply_playback_ack(self.session, command.payload())
+            events = playback_ledger.apply_playback_ack(
+                self.session,
+                command.payload(),
+                require_audio_complete=self.ctx.history_calibration is not None,
+            )
             self._emit_events(events)
             self._settle_playback_committed_answer(events)
             # A camera commit can arrive after response.done while its audio
@@ -773,7 +813,9 @@ class DuplexSessionRunner:
             for payload in control.payloads:
                 await self.control.on_turn_signal(payload)
         elif isinstance(command, TruncateItem):
-            control = resolve_truncate_item(projector, command)
+            control = resolve_truncate_item(
+                projector, command, has_audio=self.session.history_item_has_audio(command.item_id)
+            )
             self._emit_events(control.events)
             for payload in control.payloads:
                 await self._run_internal_payload(payload)
@@ -781,6 +823,17 @@ class DuplexSessionRunner:
             await self._on_close_command(command.reason)
         else:
             self._emit_error("unknown_event", f"Unknown duplex command: {type(command).__name__}")
+        if self.ctx.history_calibration is not None:
+            if isinstance(command, AckPlayback):
+                self.ctx.history_calibration.release_confirmed()
+                # A final ACK may arrive after cancel/clear. Start while the
+                # user speaks, without running ASR on periodic playback ACKs.
+                if not helpers.assistant_playback_active(self.session):
+                    self.ctx.history_calibration.request_ready()
+            elif isinstance(command, DeleteItem):
+                self.ctx.history_calibration.discard(command.item_id.removeprefix("item_"))
+            elif isinstance(command, TruncateItem | CancelResponse | ClearOutputAudio | CancelInput | BargeIn):
+                self.ctx.history_calibration.request_ready()
 
     async def _on_close_command(self, reason: str) -> None:
         # A close requested through the ordered command stream (the client's
@@ -810,10 +863,11 @@ class DuplexSessionRunner:
         model_state.speech_since_commit = False
         model_state.clear_committed_audio()
         session.cancel_pending_input()
+        # A clear starts a new turn: drop the detector's speech (and semantic
+        # pause) state too, or a later stop would commit the cleared turn.
+        self.control.reset_vad()
         projector = self.out.projector
         if projector is not None:
-            from vllm_omni.engine.duplex.realtime_events import clear_input_buffer
-
             clear_input_buffer(projector)
         self._emit_events([InputCleared()])
 
@@ -1015,6 +1069,8 @@ class DuplexSessionRunner:
 
     def _begin_close(self, reason: str) -> None:
         first_close = not self.run.closing
+        if self.ctx.history_calibration is not None:
+            self.ctx.history_calibration.close()
         self.run.closing = True
         self.run.close_reason = self.run.close_reason or reason
         self.session.mark_closing()
@@ -1124,7 +1180,6 @@ class DuplexSessionRunner:
 
     async def _on_append_audio(self, event: dict[str, object]) -> None:
         session = self.session
-        model_state = self.model_state
         session.mark_user_input_activity()
         audio = event.get("audio") or event.get("data")
         video_frames_raw = event.get("video_frames")
@@ -1152,6 +1207,7 @@ class DuplexSessionRunner:
         sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
         sample_rate_hz = sr_raw if isinstance(sr_raw, int | float) else 16000
         client_force_listen = bool(event.get("force_listen", False))
+        detected: list[tuple[dict[str, object], TurnDetectionResult | None]]
         if video_only:
             # No PCM to decode; frames alone are the turn content.
             fmt = "pcm_f32le"
@@ -1162,7 +1218,7 @@ class DuplexSessionRunner:
             event["sample_rate_hz"] = sample_rate_hz
             event["is_speech"] = False
             event["video_frames"] = video_frames
-            vad_result = None
+            detected = [(event, None)]
         else:
             try:
                 converted: tuple[object, object, int | float | None] = await self.offload(
@@ -1183,7 +1239,8 @@ class DuplexSessionRunner:
             event["audio"] = audio
             event["format"] = fmt
             event["sample_rate_hz"] = sample_rate_hz
-            vad_result = await self.control.run_turn_detection(event)
+            detected = await self.control.run_turn_detection(event)
+        for segment, vad_result in detected:
             if (
                 vad_result is not None
                 and not session.capabilities.supports_core_resumable_request
@@ -1191,7 +1248,18 @@ class DuplexSessionRunner:
             ):
                 # VAD's force_listen hint controls native model decoding. Committed
                 # turn models already buffer speech; it must not suppress barge-in.
-                event.pop("force_listen", None)
+                segment.pop("force_listen", None)
+            await self._append_detected_audio(segment, vad_result)
+
+    async def _append_detected_audio(self, event: dict[str, object], vad_result: TurnDetectionResult | None) -> None:
+        """Buffer one segment and apply its commit before accepting the next one."""
+        session = self.session
+        model_state = self.model_state
+        audio = event.get("audio")
+        fmt = event.get("format")
+        sample_rate_hz = event.get("sample_rate_hz")
+        video_frames = event.get("video_frames")
+        video_only = bool(video_frames) and not audio
         projector = self._require_projector()
         self._emit_events(
             note_input_append(
@@ -1243,7 +1311,7 @@ class DuplexSessionRunner:
             if action == "drop":
                 duration_ms = overlap_policy.input_audio_duration_ms(event, payload)
                 self._emit_events(discard_pending_input_audio(projector, duration_ms))
-                self._maybe_schedule_vad_commit(vad_result)
+                await self._maybe_commit_vad_turn(vad_result)
                 return
             if action == "listen":
                 buffer_overlap_audio = bool(decision.get("buffer_audio", True))
@@ -1274,12 +1342,12 @@ class DuplexSessionRunner:
                         "reason": "silence_or_noise",
                     }
                 )
-                self._maybe_schedule_vad_commit(vad_result)
+                await self._maybe_commit_vad_turn(vad_result)
                 return
         if overlap_policy.should_force_listen_for_auto_response_overlap(event, payload, auto_responds=auto_responds):
             payload["force_listen"] = True
         if not buffer_overlap_audio:
-            self._maybe_schedule_vad_commit(vad_result)
+            await self._maybe_commit_vad_turn(vad_result)
             return
         session.mark_user_input_activity()
         model_state.input_since_commit = True
@@ -1331,16 +1399,16 @@ class DuplexSessionRunner:
             # when the buffer waits until commit to start the append.
             if not session.capabilities.supports_core_resumable_request:
                 self._reset_failed_append_tail()
-            self._maybe_schedule_vad_commit(vad_result)
+            await self._maybe_commit_vad_turn(vad_result)
             return
         if pcm_reservation.byte_count == 0:
             session.release_input_bytes(raw_audio_bytes)
         append_payload = pcm_reservation.payload
         await self._start_append(append_payload, final=False, pcm_reservation=pcm_reservation)
-        self._maybe_schedule_vad_commit(vad_result)
+        await self._maybe_commit_vad_turn(vad_result)
 
-    def _maybe_schedule_vad_commit(self, vad_result: TurnDetectionResult | None) -> None:
-        """Server VAD ended the user turn: run the same commit the old translator synthesized."""
+    async def _maybe_commit_vad_turn(self, vad_result: TurnDetectionResult | None) -> None:
+        """Commit at the detected boundary, before later audio can enter the buffer."""
         if vad_result is None or not vad_result.should_commit:
             return
         if self._session_auto_responds():
@@ -1355,10 +1423,10 @@ class DuplexSessionRunner:
         command = Commit(final=True, create_response=vad_result.create_response)
         resolved = resolve_commit(self._require_projector(), command)
         self._emit_events(resolved.events)
-        if resolved.reset_vad:
-            self.control.reset_vad()
+        # Detection already reset at this boundary and may have scored later
+        # segments of the same append. Resetting here would erase their state.
         if resolved.payload is not None:
-            self._mailbox.put_nowait(_Internal("commit", resolved.payload))
+            await self._on_commit(resolved.payload)
 
     def _clear_completed_pending_silence(self) -> None:
         task = self.model_state.pending_silence_task
@@ -1792,6 +1860,9 @@ class DuplexSessionRunner:
             model_state.input_since_commit = False
             model_state.speech_since_commit = False
             model_state.clear_committed_audio()
+            self.control.reset_vad()
+            if self.out.projector is not None:
+                clear_input_buffer(self.out.projector)
         had_append = await self.tasks.cancel_append_tasks(
             response_bound_only=event_type in {"response.cancel", "output_audio_buffer.clear"},
         )
@@ -1911,6 +1982,8 @@ class DuplexSessionRunner:
         if not await self.model.signal_cancel_fence(cancelled_fence):
             return
         self.tasks.active_response_task = None
+        if self.ctx.history_calibration is not None:
+            self.ctx.history_calibration.request_ready()
 
     async def _cancel_active_response(
         self,
@@ -1934,25 +2007,35 @@ class DuplexSessionRunner:
         audio_started = session.playback.generated_ms > 0 or session.playback.sent_ms > 0
         # Barge-in / cancel aborts prior TTS; clear the concurrent-turn release.
         self.run.concurrent_turn_requests_released = False
+        should_commit = self.model.should_commit_response_to_history(session, old_response_id)
         committed_message = session.end_response(
-            commit_text=self.model.should_commit_response_to_history(session, old_response_id),
+            commit_text=should_commit,
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
         )
-        # Playback clear keeps the id. A cancel before any audio was sent does
-        # not, so the retry can own the tool pair.
-        settle_response_runtime(
-            self.plugin,
-            session,
-            committed=committed_message is not None,
-            response_id=old_response_id,
-            release_owner=committed_message is None and committed_ms == 0 and not audio_started,
-        )
+        committed = committed_message is not None
         if old_response_id is not None:
             item_id = f"item_{old_response_id}"
             if committed_message is not None:
                 session.register_history_item(item_id, committed_message)
-            elif committed_ms > 0 and not session.playback_ack_is_too_late(old_response_id, item_id):
-                session.truncate_history_item(item_id, audio_end_ms=committed_ms)
+            elif should_commit and committed_ms > 0 and not session.playback_ack_is_too_late(old_response_id, item_id):
+                committed = session.truncate_history_item(item_id, audio_end_ms=committed_ms)
+            if should_commit:
+                committed = (
+                    session.finalize_response_playback(
+                        old_response_id, require_audio_complete=self.ctx.history_calibration is not None
+                    )
+                    or committed
+                )
+        # Settle once, after every history write. A new user input may prevent
+        # end_response from committing while the reserved older item still can.
+        # Cancelling before audio starts releases the tool pair for a retry.
+        settle_response_runtime(
+            self.plugin,
+            session,
+            committed=committed,
+            response_id=old_response_id,
+            release_owner=not committed and committed_ms == 0 and not audio_started,
+        )
         draining_cancels: list[tuple[str, int, dict[str, int]]] = []
         seen_responses: set[str] = set()
         if isinstance(old_response_id, str) and old_response_id:
@@ -1987,6 +2070,11 @@ class DuplexSessionRunner:
         for request_id in draining_ids:
             self.plugin.data_plane.close_stream(request_id)
         session.clear_draining_requests()
+        for response_id, _, _ in draining_cancels:
+            if session.finalize_response_playback(
+                response_id, require_audio_complete=self.ctx.history_calibration is not None
+            ):
+                self._settle_stored_answer(response_id)
         if abort_ids:
             await self._abort_request_background(abort_ids, notify=notify)
         if has_running_task and active_task is not None:
