@@ -20,7 +20,6 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
-from vllm_omni.platforms import current_omni_platform
 
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2Config,
@@ -958,6 +957,8 @@ class Qwen3TTSCode2Wav(nn.Module):
             decode_time_major_conv = False
 
         if decode_streaming:
+            from vllm_omni.platforms import current_omni_platform
+
             if not self._async_chunk or device.type != "cuda" or not current_omni_platform.is_cuda():
                 raise ValueError("Qwen3-TTS decode_streaming requires async_chunk and a CUDA Code2Wav stage")
             # The streaming backend supplies graphs for both xvec and ICL.
