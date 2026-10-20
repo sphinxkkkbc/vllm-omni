@@ -56,16 +56,19 @@ class StreamingCode2Wav:
         self.fallback_ids: set[str] = set()
         self.graphs: dict[int, StreamingDecodeGraphs] = {}
         self.prefix_graphs: dict[int, StreamingDecodeGraphs] = {}
+        self.graph_pool = torch.cuda.graph_pool_handle() if capture else None
         self.capture_batch_sizes: list[int] = []
         if capture:
             sizes = sorted({size for size in batch_sizes if 0 < size <= min(num_slots, self.max_batch_size)})
             self.capture_batch_sizes = sizes
             captured_frames = {min(size, self.decoder.max_frames) for size in frame_sizes if size > 0}
             for frames in sorted(captured_frames):
-                self.graphs[frames] = StreamingDecodeGraphs(self.decoder, sizes, frames=frames)
+                self.graphs[frames] = StreamingDecodeGraphs(self.decoder, sizes, frames=frames, pool=self.graph_pool)
             if "icl" in self.decode_modes:
                 frames = min(self.decoder.window, self.decoder.RING)
-                self.prefix_graphs[frames] = StreamingDecodeGraphs(self.decoder, sizes, frames=frames, initial=True)
+                self.prefix_graphs[frames] = StreamingDecodeGraphs(
+                    self.decoder, sizes, frames=frames, pool=self.graph_pool, initial=True
+                )
 
     def release(self, request_ids: set[str] | list[str]) -> None:
         for request_id in request_ids:
@@ -76,7 +79,7 @@ class StreamingCode2Wav:
 
     def _run_batch(
         self,
-        codes: list[torch.Tensor],
+        codes: torch.Tensor,
         slots: list[int],
         positions: list[int],
         *,
@@ -84,14 +87,12 @@ class StreamingCode2Wav:
     ) -> torch.Tensor | None:
         """Run requests with the same frame count together, without prefix padding."""
         sd = self.decoder
-        frames_total = codes[0].shape[-1]
-        if any(value.shape[-1] != frames_total for value in codes):
-            raise ValueError("Streaming batch requires equal frame counts")
-        device = codes[0].device
+        frames_total = codes.shape[-1]
+        device = codes.device
         slot_tensor = index_to_device(slots, device, dtype=torch.int32)
         position_tensor = index_to_device(positions, device, dtype=torch.int32)
         pcm = None if prefix else torch.empty(len(codes), frames_total * sd.spf, device=device, dtype=torch.float32)
-        values = torch.cat(codes, dim=0)
+        values = codes
         offset = 0
         while offset < frames_total:
             remaining = frames_total - offset
@@ -101,7 +102,7 @@ class StreamingCode2Wav:
             graphs = self.prefix_graphs if initial else self.graphs
             if initial and frames not in self.prefix_graphs and self.capture_batch_sizes:
                 self.prefix_graphs[frames] = StreamingDecodeGraphs(
-                    sd, self.capture_batch_sizes, frames=frames, initial=True
+                    sd, self.capture_batch_sizes, frames=frames, pool=self.graph_pool, initial=True
                 )
             fn = graphs.get(frames)
             if fn is not None:
@@ -169,7 +170,7 @@ class StreamingCode2Wav:
                 part = rows[offset : offset + self.max_batch_size]
                 records = [self.request_states[request_ids[row]] for row in part]
                 self._run_batch(
-                    [codes[row : row + 1, :, :frames] for row in part],
+                    torch.cat([codes[row : row + 1, :, :frames] for row in part], dim=0),
                     [record.slot for record in records],
                     [0] * len(part),
                     prefix=True,
@@ -195,14 +196,21 @@ class StreamingCode2Wav:
             for offset in range(0, len(rows), self.max_batch_size):
                 part = rows[offset : offset + self.max_batch_size]
                 records = [self.request_states[request_ids[row]] for row in part]
-                values = []
-                for row in part:
-                    start = suffix_starts[row]
-                    # Reuse the caller's zero padding; only extend for a larger terminal bucket.
-                    value = codes[row : row + 1, :, start : start + frames]
-                    if value.shape[-1] < frames:
-                        value = torch.nn.functional.pad(value, (0, frames - value.shape[-1]))
-                    values.append(value)
+                has_prefix = any(suffix_starts[row] > 0 for row in part)
+                if has_prefix:
+                    pieces = []
+                    for row in part:
+                        start = suffix_starts[row]
+                        value = codes[row : row + 1, :, start : start + frames]
+                        if value.shape[-1] < frames:
+                            value = torch.nn.functional.pad(value, (0, frames - value.shape[-1]))
+                        pieces.append(value)
+                    values = torch.cat(pieces, dim=0)
+                else:
+                    selected = index_to_device(part, codes.device)
+                    values = codes.index_select(0, selected)[:, :, :frames]
+                    if values.shape[-1] < frames:
+                        values = torch.nn.functional.pad(values, (0, frames - values.shape[-1]))
                 pcm = self._run_batch(
                     values,
                     [record.slot for record in records],

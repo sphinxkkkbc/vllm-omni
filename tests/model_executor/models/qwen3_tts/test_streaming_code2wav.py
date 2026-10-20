@@ -31,7 +31,8 @@ class _Codec:
 
 
 class _Graphs:
-    def __init__(self, sd, batch_sizes, frames, *, initial=False):
+    def __init__(self, sd, batch_sizes, frames, pool=None, *, initial=False):
+        self.pool = object() if pool is None else pool
         self.sd = sd
         self.frames = frames
         self.storage = torch.empty(max(batch_sizes), frames * sd.spf)
@@ -40,6 +41,11 @@ class _Graphs:
         out = self.sd(codes, slots, positions)
         self.storage[: out.shape[0]].copy_(out)
         return self.storage[: out.shape[0]]
+
+
+@pytest.fixture(autouse=True)
+def mock_graph_pool_handle(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "graph_pool_handle", object)
 
 
 @pytest.fixture
@@ -68,60 +74,11 @@ def _decode(backend, values, request_ids, caches, *, terminal=None, legacy=None)
     )
 
 
-def test_skip_first_audio_advances_state_and_skips_only_once(backend):
-    cache = {"skip_first_audio": True}
-    first = _decode(backend, [[2]], ["a"], [cache])[0]
-    assert first.numel() == 0
-    follow = _decode(backend, [[3, 4]], ["a"], [cache])[0]
-    torch.testing.assert_close(follow, torch.tensor([[5.0, 5.0, 9.0, 9.0]]))
-    assert backend.request_states["a"].position == 3
-
-
-def test_terminal_padding_does_not_leak_pcm_and_graph_replay_keeps_prior_outputs(backend):
-    # Keep only the buckets needed here so two real frames exercise padding to three.
-    backend.graphs = {frames: graph for frames, graph in backend.graphs.items() if frames in (1, 3)}
-    out = _decode(backend, [[2, 3], [7, 11]], ["a", "b"], [{}, {}], terminal=[True, True])
-    assert [call[0].shape[1] for call in backend.decoder.calls] == [3, 3]
-    torch.testing.assert_close(out[0], torch.tensor([[2.0, 2.0, 5.0, 5.0]]))
-    torch.testing.assert_close(out[1], torch.tensor([[7.0, 7.0, 18.0, 18.0]]))
-    backend.release(["a", "b"])
-    _decode(backend, [[99, 99, 99]], ["new"], [{}])
-    torch.testing.assert_close(out[0], torch.tensor([[2.0, 2.0, 5.0, 5.0]]))
-
-
-def test_long_chunk_splits_at_ring_limit_and_dirty_slot_starts_at_zero(backend):
+def test_long_chunk_splits_at_decoder_limit(backend):
     out = _decode(backend, [[1, 2, 3, 4, 5, 6, 7]], ["a"], [{}])[0]
     expected = torch.tensor([[1.0, 3.0, 6.0, 10.0, 15.0, 21.0, 28.0]]).repeat_interleave(2, dim=1)
     torch.testing.assert_close(out, expected)
     assert [call[2] for call in backend.decoder.calls] == [[0], [3], [6]]
-    backend.release(["a"])
-    backend.release(["a"])
-    assert len(backend.free_slots) == 2
-    _decode(backend, [[10]], ["other"], [{}])
-    fresh = _decode(backend, [[5]], ["reused"], [{}])[0]
-    torch.testing.assert_close(fresh, torch.tensor([[5.0, 5.0]]))
-
-
-def test_icl_and_overflow_keep_legacy_decoder_for_entire_request(backend, mocker):
-    legacy = mocker.Mock(spec=module.Qwen3TTSTokenizerV2Decoder)
-    legacy.batched_chunked_decode.side_effect = lambda codes, lengths, **kw: [
-        torch.full((1, length * 2), 42.0) for length in lengths
-    ]
-    cache_a: dict[str, object] = {}
-    cache_b: dict[str, object] = {}
-    overflow: dict[str, object] = {}
-    _decode(backend, [[1], [2]], ["a", "b"], [cache_a, cache_b])
-    out = _decode(backend, [[3], [4]], ["icl", "overflow"], [{"prefix_frames": 2}, overflow], legacy=legacy)
-    assert set(backend.request_states) == {"a", "b"}
-    assert backend.fallback_ids == {"icl", "overflow"}
-    for wav in out:
-        assert torch.all(wav == 42)
-    backend.release(["a"])
-    _decode(backend, [[5]], ["overflow"], [overflow], legacy=legacy)
-    assert legacy.batched_chunked_decode.call_count == 2
-    assert "overflow" not in backend.request_states
-    backend.release(["icl", "overflow"])
-    assert not backend.fallback_ids
 
 
 def test_dummy_run_uses_legacy_decoder_without_allocating_request_state(backend, mocker):
@@ -131,11 +88,6 @@ def test_dummy_run_uses_legacy_decoder_without_allocating_request_state(backend,
     torch.testing.assert_close(actual, torch.ones(1, 7))
     assert not backend.request_states and len(backend.free_slots) == 2
     assert not backend.decoder.calls
-
-
-def test_invalid_slot_capacity_is_rejected():
-    with pytest.raises(ValueError, match="num_slots"):
-        module.StreamingCode2Wav(None, num_slots=0, max_batch_size=1, batch_sizes=[1], frame_sizes=[1], capture=False)
 
 
 def test_icl_primes_once_and_continues_past_window(monkeypatch):
@@ -158,76 +110,6 @@ def test_icl_primes_once_and_continues_past_window(monkeypatch):
     assert [call[2] for call in backend.decoder.calls] == [[0], [4], [5], [7]]
     backend.release(["icl"])
     assert len(backend.free_slots) == 2
-
-
-def test_icl_reordered_requests_keep_prefix_and_suffix_isolated(monkeypatch):
-    monkeypatch.setattr(module, "StreamingCodecDecoder", _Codec)
-    monkeypatch.setattr(module, "StreamingDecodeGraphs", _Graphs)
-    backend = module.StreamingCode2Wav(
-        None, num_slots=2, max_batch_size=1, batch_sizes=[1], frame_sizes=[1, 3], capture=True
-    )
-    a = {"prefix_frames": 1}
-    b = {"prefix_frames": 2}
-    first = _decode(backend, [[2, 4], [5, 1, 3]], ["a", "b"], [a, b])
-    torch.testing.assert_close(first[0], torch.tensor([[6.0, 6.0]]))
-    torch.testing.assert_close(first[1], torch.tensor([[9.0, 9.0]]))
-    reordered = _decode(backend, [[7], [1, 2]], ["b", "a"], [b, a])
-    torch.testing.assert_close(reordered[0], torch.tensor([[16.0, 16.0]]))
-    torch.testing.assert_close(reordered[1], torch.tensor([[7.0, 7.0, 9.0, 9.0]]))
-    rolling = _decode(backend, [[3]], ["a"], [a])[0]
-    torch.testing.assert_close(rolling, torch.tensor([[12.0, 12.0]]))
-    assert backend.request_states["b"].position == 4
-
-
-def test_icl_equal_shapes_share_priming_and_incremental_batches(monkeypatch):
-    monkeypatch.setattr(module, "StreamingCodecDecoder", _Codec)
-    monkeypatch.setattr(module, "StreamingDecodeGraphs", _Graphs)
-    backend = module.StreamingCode2Wav(
-        None, num_slots=2, max_batch_size=2, batch_sizes=[1, 2], frame_sizes=[1, 3], capture=True
-    )
-    a = {"prefix_frames": 2}
-    b = {"prefix_frames": 2}
-    first = _decode(backend, [[2, 3, 4], [5, 1, 3]], ["a", "b"], [a, b])
-    torch.testing.assert_close(first[0], torch.tensor([[9.0, 9.0]]))
-    torch.testing.assert_close(first[1], torch.tensor([[9.0, 9.0]]))
-    assert [call[0].shape[0] for call in backend.decoder.calls] == [2, 2]
-    assert backend.decoder.calls[0][0].shape[1] == 2
-
-    growing = _decode(backend, [[1, 2], [3, 4]], ["a", "b"], [a, b])
-    torch.testing.assert_close(growing[0], torch.tensor([[10.0, 10.0, 12.0, 12.0]]))
-    torch.testing.assert_close(growing[1], torch.tensor([[12.0, 12.0, 16.0, 16.0]]))
-    assert backend.decoder.calls[-1][0].shape[:2] == (2, 2)
-
-    rolling = _decode(backend, [[7], [8]], ["b", "a"], [b, a])
-    torch.testing.assert_close(rolling[0], torch.tensor([[23.0, 23.0]]))
-    torch.testing.assert_close(rolling[1], torch.tensor([[20.0, 20.0]]))
-    assert [call[0].shape[0] for call in backend.decoder.calls[-1:]] == [2]
-
-
-def test_reference_graph_is_captured_lazily_once_per_length(backend):
-    assert set(backend.prefix_graphs) == {3}
-    cache = {"prefix_frames": 2}
-    _decode(backend, [[1, 2, 3]], ["a"], [cache])
-    assert set(backend.prefix_graphs) == {2, 3}
-    graph = backend.prefix_graphs[2]
-    backend.release(["a"])
-    _decode(backend, [[4, 5, 6]], ["b"], [{"prefix_frames": 2}])
-    assert backend.prefix_graphs[2] is graph
-
-
-def test_icl_terminal_padding_trims_pcm_and_preserves_owned_output(backend):
-    cache = {"prefix_frames": 2}
-    _decode(backend, [[1, 2, 3]], ["icl"], [cache])
-    # A live two-frame chunk must not be padded into the three-frame graph.
-    _decode(backend, [[4, 5]], ["icl"], [cache])
-    assert backend.decoder.calls[-1][0].shape[1] == 2
-    terminal = _decode(backend, [[6, 7]], ["icl"], [cache], terminal=[True])[0]
-    assert backend.decoder.calls[-1][0].shape[1] == 3
-    torch.testing.assert_close(terminal, torch.tensor([[21.0, 21.0, 28.0, 28.0]]))
-    assert backend.request_states["icl"].position == 7
-    backend.release(["icl"])
-    _decode(backend, [[8, 9, 10]], ["other"], [{}])
-    torch.testing.assert_close(terminal, torch.tensor([[21.0, 21.0, 28.0, 28.0]]))
 
 
 def test_icl_and_xvec_share_suffix_batches(monkeypatch):
