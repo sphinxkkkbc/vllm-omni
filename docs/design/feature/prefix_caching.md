@@ -41,7 +41,7 @@ The main focus of vLLM-Omni's approach to prefix caching stage outputs is to bui
 
 With this in mind, consider the set of blocks in a 2D layout, where the row represents the index of blocks being considered, and the columns represent the slots corresponding to tokens within each block. Since we know the `num_blocks` and `block_size` from our kv cache config, if we want to cache a tensor with feature size `D`, we can preallocate a CPU tensor of size `(num_blocks, block_size, D)`, and use the same block index and slot mapping to retrieve the corresponding feature vector.
 
-Host footprint: each cached key costs `num_blocks × block_size × D × dtype_bytes` of **pinned** CPU memory (pinned so device→host can overlap compute), allocated on the first `save_outputs` that sees the key — the first real request pays the `cudaHostAlloc`. Measured on a Qwen3-Omni deployment: thinker `__hidden_states__` `[15092, 16, 2048]` bf16 ≈ 0.92 GiB (plus the same again for each `hidden_states.layer_*` key a model exposes), Qwen3-TTS talker `codes.audio` `[16180, 16, 16]` ≈ 33 MiB. Budget host RAM for the stage accordingly.
+Host footprint: each cached key costs `num_blocks × block_size × D × dtype_bytes` of pageable CPU memory, allocated without zero-filling on the first `save_outputs` that sees the key. Device→host copies use separate pinned staging buffers. Measured on a Qwen3-Omni deployment: thinker `__hidden_states__` `[15092, 16, 2048]` bf16 ≈ 0.92 GiB (plus the same again for each `hidden_states.layer_*` key a model exposes), Qwen3-TTS talker `codes.audio` `[16180, 16, 16]` ≈ 33 MiB. Budget host RAM for the stage accordingly.
 
 ### Example
 
@@ -329,7 +329,8 @@ resume delivery watermarks are follow-up contracts, not inferred here.
 Two write paths, split by `ModelCachePolicy.deferred_keys`:
 
 - Immediate (`JOIN_NEXT_STEP`): save launches a whole-step device→host into
-  a staging slot; the committer waits that event and writes the CPU pool.
+  a staging slot; one WriteTask covers every request of the step, and the
+  committer waits that event and writes the CPU pool.
   The next save waits `done` (the pool write): a reused slot must never
   leave a pending pool write behind, or a delayed hit read of the old rows
   would find nothing recoverable.

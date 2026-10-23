@@ -59,16 +59,19 @@ def _minimax_h3_keyframe_encode_context(
 
     # Deterministic cuDNN algorithms can still use reduced-precision TF32.
     # On Hopper, TF32 can shift the keyframe latent enough to push I2VA below
-    # the reference accuracy thresholds. Use FP32 convolutions for this
-    # sensitive encode only; preserve the existing math mode elsewhere.
+    # the reference accuracy thresholds. Use FP32 deterministic convolutions
+    # for this sensitive CUDA encode only. MIOpen has no deterministic
+    # algorithm for the MI325 timeline-guide convolution, so applying the
+    # cuDNN policy on ROCm raises ``miopenStatusUnknownError``.
+    deterministic = current_omni_platform.is_cuda()
     allow_tf32 = True
-    if current_omni_platform.is_cuda():
+    if deterministic:
         capability = current_omni_platform.get_device_capability(device.index or 0)
         allow_tf32 = capability is None or capability.major != 9
     with torch.backends.cudnn.flags(
         enabled=True,
         benchmark=False,
-        deterministic=True,
+        deterministic=deterministic,
         allow_tf32=allow_tf32,
     ):
         yield
