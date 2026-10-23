@@ -684,6 +684,7 @@ class FlowGraphRunner:
         self.estimator = estimator
         self.graphs: dict[tuple, _FlowGraph] = {}
         self.pool = None
+        self.capture_stream: torch.cuda.Stream | None = None
         attn = estimator.dit.transformer_blocks[0].attn
         self.heads, self.head_dim = attn.heads, attn.inner_dim // attn.heads
 
@@ -820,12 +821,16 @@ class FlowGraphRunner:
         if fresh:
             # Warm up (and compile new dynamic shapes) off the capture, then
             # record the solve into the shared pool.
-            stream = torch.cuda.Stream()
+            if self.capture_stream is None:
+                self.capture_stream = torch.cuda.Stream(device=noise.device)
+            stream = self.capture_stream
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 self._solve(state, cfg_rate, graph_key)
             torch.cuda.current_stream().wait_stream(stream)
-            with torch.cuda.graph(state.graph, pool=self.pool):
+            from .graph_capture import capture_codec_graph
+
+            with capture_codec_graph(state.graph, pool=self.pool, stream=self.capture_stream):
                 state.output = self._solve(state, cfg_rate, graph_key)
             if self.pool is None:
                 self.pool = state.graph.pool()

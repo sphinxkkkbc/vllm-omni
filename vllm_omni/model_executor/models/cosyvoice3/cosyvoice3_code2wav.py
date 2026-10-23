@@ -344,14 +344,14 @@ class CosyVoice3Code2Wav(nn.Module):
         new_state = {
             "mel": (
                 f0_input_mel.detach().clone()
-                if cosyvoice3_packed_streaming_enabled()
+                if cosyvoice3_packed_streaming_enabled() or getattr(self, "_keep_stream_cache_on_device", False)
                 else f0_input_mel.detach().cpu().contiguous()
             ),
             "mel_offset": window_offset - f0_margin,
             "phase_acc": (
                 (
                     new_phase_acc.detach().clone()
-                    if cosyvoice3_packed_streaming_enabled()
+                    if cosyvoice3_packed_streaming_enabled() or getattr(self, "_keep_stream_cache_on_device", False)
                     else new_phase_acc.detach().cpu().contiguous()
                 )
                 if new_phase_acc is not None

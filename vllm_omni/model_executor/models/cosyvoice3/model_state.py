@@ -11,9 +11,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import numpy as np
-import torch
 
-from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import decode_streaming_batch
+from vllm_omni.model_executor.models.cosyvoice3.async_codec import AsyncCodec, SampleEntry
 from vllm_omni.model_executor.models.cosyvoice3.pipeline_adapter import InnerStageAdapter
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
@@ -29,6 +28,24 @@ class CosyVoice3ModelState(OmniModelState):
             int(model.config.flow["pre_lookahead_len"]),
         )
         self._max_model_len = int(vllm_config.model_config.max_model_len)
+        self._codec = None
+        self._device = device
+        self._codec_capacity = max(2, int(vllm_config.max_concurrent_batches) * 2)
+
+    def bind_async_audio(self, scheduler):
+        from .async_scheduler import CosyVoice3AsyncScheduler
+
+        if not isinstance(scheduler, CosyVoice3AsyncScheduler):
+            raise ValueError("CosyVoice3 single-stage requires CosyVoice3AsyncScheduler")
+        self.model._maybe_enable_code2wav_trt()
+        self.model.code2wav._keep_stream_cache_on_device = True
+        self._codec = AsyncCodec(self.model, self.adapter, self._device, self._max_model_len, self._codec_capacity)
+        scheduler.codec = self._codec
+        scheduler.audio_sample_rate = int(self.model.config.sample_rate)
+
+    def close_first_audio_sender(self):
+        if self._codec is not None:
+            self._codec.close()
 
     def prepare_inputs(self, input_batch, req_states):
         # Borrow runner-owned state; do not copy limits into request/batch buffers.
@@ -59,11 +76,7 @@ class CosyVoice3ModelState(OmniModelState):
         tokens = sampled_token_ids[:count, 0]
         speech_mask = (tokens >= 0) & (tokens < self.adapter.vocab_size)
         step_embed = multimodal_outputs.get("embed", {})
-        items, bindings = [], []
-        # Only speech/EOS classification is read back; validity and lengths
-        # come from CPU scheduling metadata. No per-step tail candidates.
-        speech = speech_mask.cpu().tolist()
-        capacity = self._max_model_len
+        entries, rows = [], []
         for row, payload in enumerate(payloads):
             req_id = input_batch.req_ids[row]
             # Retain live conditioning even on an intermediate prefill step.
@@ -75,34 +88,30 @@ class CosyVoice3ModelState(OmniModelState):
                         embed[key] = values[row]
             if not kept[row] or str(req_id).startswith("_warmup_"):
                 continue
-            self.adapter.append(
-                req_id,
-                sampled_token_ids[row, :1],
-                embed,
-                capacity=capacity,
-                position=int(positions[row]),
-                speech_mask=speech_mask[row],
+            if self._codec is None:
+                raise RuntimeError("CosyVoice3 codec worker is not bound to the engine")
+            generation = self._codec.generations.get(req_id)
+            if generation is None:
+                # An already retired generation can have an in-flight AR row.
+                continue
+            entries.append(
+                SampleEntry(
+                    req_id,
+                    int(positions[row]),
+                    bool(length_finished[row]),
+                    dict(embed),
+                    generation,
+                )
             )
-            is_speech = speech[row]
-            length = int(positions[row]) + int(is_speech)
-            final = not is_speech or bool(length_finished[row])
-            item = self.adapter.prepare(req_id, length, final)
-            if item is not None:
-                items.append(item)
-                bindings.append((row, req_id))
-        empty = text_hidden.new_empty(0, dtype=torch.float32)
-        audio = [empty] * count
-        if items:
-            self.model._maybe_enable_code2wav_trt()
-            results = decode_streaming_batch(self.model.code2wav, items)
-            for (row, req_id), (wav, cache) in zip(bindings, results):
-                audio[row] = wav.reshape(-1).float()
-                self.adapter.apply_result(req_id, cache)
+            rows.append(row)
+        if entries:
+            # Copy basic row slices into owned buffers on this stream before
+            # graph replay. A Python index list on CUDA tensors would upload
+            # indices synchronously, twice per step.
+            self._codec.submit(entries, tokens, speech_mask, rows)
+        # PCM is published separately, never through this step's AR future.
         multimodal_outputs.clear()
-        multimodal_outputs.update(
-            audio=audio, sr=[torch.tensor(int(self.model.config.sample_rate), dtype=torch.int32)] * count
-        )
 
     def on_requests_finished(self, req_ids: set[str]) -> None:
-        self.adapter.finish_requests(req_ids)
+        # Normal EOS tails are owned by the codec until final PCM delivery.
         super().on_requests_finished(req_ids)
