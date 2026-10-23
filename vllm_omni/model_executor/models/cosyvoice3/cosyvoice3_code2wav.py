@@ -34,6 +34,7 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
     cosyvoice3_batch_flow_debug,
+    cosyvoice3_batch_flow_enabled,
     cosyvoice3_batch_flow_profile,
     cosyvoice3_full_response_enabled,
     cosyvoice3_packed_inference_enabled,
@@ -72,9 +73,6 @@ class StreamingHiFTState(TypedDict, total=False):
 class StreamingFlowItem(TypedDict, total=False):
     """One entry of the batched-streaming item list passed to forward_streaming_batch."""
 
-    index: int
-    req_id: str | None
-    stream_finished: bool
     token: torch.Tensor
     prompt_token: torch.Tensor
     prompt_feat: torch.Tensor
@@ -782,3 +780,27 @@ class CosyVoice3Code2Wav(nn.Module):
                 self.hift.enable_decode_graphs()
                 logger.info("CosyVoice3 streaming HiFT: decode CUDA graphs enabled")
         logger.info(f"Loaded hift weights from {hift_path}")
+
+
+def decode_streaming_batch(
+    decoder: CosyVoice3Code2Wav,
+    items: list[StreamingFlowItem],
+    *,
+    n_timesteps: int = 10,
+) -> list[tuple[torch.Tensor, StreamingHiFTState | None]]:
+    """Select the same execution backend for both pipeline adapters."""
+    if (len(items) > 1 or cosyvoice3_packed_inference_enabled()) and cosyvoice3_batch_flow_enabled():
+        return decoder.forward_streaming_batch(items, n_timesteps=n_timesteps)
+    return [
+        decoder.forward_streaming(
+            token=item["token"],
+            prompt_token=item["prompt_token"],
+            prompt_feat=item["prompt_feat"],
+            embedding=item["embedding"],
+            cache_state=item.get("cache_state"),
+            token_offset_tokens=item.get("token_offset_tokens", 0),
+            finalize=item.get("finalize", False),
+            n_timesteps=n_timesteps,
+        )
+        for item in items
+    ]

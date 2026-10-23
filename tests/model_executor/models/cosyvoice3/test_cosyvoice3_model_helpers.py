@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from threading import Lock
 from types import SimpleNamespace
 
 import pytest
@@ -23,7 +22,11 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.data_entry_keys import to_struct
 from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3, cosyvoice3_talker
-from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model, _normalize_request_conditioning
+from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
+from vllm_omni.model_executor.models.cosyvoice3.pipeline_adapter import (
+    CrossStageAdapter,
+    _normalize_request_conditioning,
+)
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.worker import gpu_ar_model_runner
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
@@ -93,6 +96,7 @@ def _make_code2wav_model(
 ) -> CosyVoice3Model:
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
+    model.local_code2wav = False
     model.model_stage = "cosyvoice3_code2wav"
     hift_cfg = {} if not with_stride_cfg else {"upsample_rates": [8, 5, 3], "istft_params": {"hop_len": 4}}
     model.config = SimpleNamespace(
@@ -107,11 +111,7 @@ def _make_code2wav_model(
     # otherwise run and dereference ``self.model_dir`` (only set in __init__,
     # which this fixture bypasses via object.__new__).
     model._code2wav_trt_done = True
-    model.source_cache_len = 4
-    model.speech_window = torch.hamming_window(8, periodic=False)
-    model._stream_audio_cache_by_req = {}
-    model._stream_audio_cache_lock = Lock()
-    model._stream_vocoder_cache_by_req = {}
+    model._cross_stage_adapter = CrossStageAdapter(24000, 4)
     return model
 
 
@@ -120,6 +120,7 @@ def _make_talker_model() -> CosyVoice3Model:
     nn.Module.__init__(model)
     model._pending_rejection_rng = None
     model._sampled_token_feedback = None
+    model.local_code2wav = False
     model.model_stage = "cosyvoice3_talker"
     model.config = SimpleNamespace(
         llm={
@@ -499,7 +500,7 @@ def test_forward_reuses_streaming_cache_state_between_chunks():
     cache_state = model.code2wav.forward_streaming_calls[1]["cache_state"]
     assert cache_state is not None
     assert cache_state["speech_offset"] == 4
-    assert "rid-stream" in model._stream_vocoder_cache_by_req
+    assert "rid-stream" in model._cross_stage_adapter._stream_vocoder_cache_by_req
 
 
 def test_forward_clears_streaming_cache_on_terminal_chunk():
@@ -536,7 +537,7 @@ def test_forward_clears_streaming_cache_on_terminal_chunk():
         model_intermediate_buffer=runtime_info,
         seq_token_counts=[3],
     )
-    assert "rid-stream" in model._stream_vocoder_cache_by_req
+    assert "rid-stream" in model._cross_stage_adapter._stream_vocoder_cache_by_req
 
     runtime_info[0]["meta"]["stream_finished"] = torch.tensor(True)
     out = model.forward(
@@ -546,7 +547,7 @@ def test_forward_clears_streaming_cache_on_terminal_chunk():
         seq_token_counts=[3],
     )
     assert out.multimodal_outputs["audio"][0].tolist() == [7.0]
-    assert "rid-stream" not in model._stream_vocoder_cache_by_req
+    assert "rid-stream" not in model._cross_stage_adapter._stream_vocoder_cache_by_req
 
 
 def test_forward_batches_streaming_flow_items(monkeypatch):
@@ -589,11 +590,10 @@ def test_forward_batches_streaming_flow_items(monkeypatch):
     assert len(out.multimodal_outputs["audio"]) == 2
     assert len(model.code2wav.forward_streaming_batch_calls) == 1
     batch_items = model.code2wav.forward_streaming_batch_calls[0]
-    assert [item["index"] for item in batch_items] == [0, 1]
     assert torch.equal(batch_items[0]["token"], torch.tensor([[0, 1, 2]]))
     assert batch_items[1]["token_offset_tokens"] == 1
-    assert "rid-a" in model._stream_vocoder_cache_by_req
-    assert "rid-b" in model._stream_vocoder_cache_by_req
+    assert "rid-a" in model._cross_stage_adapter._stream_vocoder_cache_by_req
+    assert "rid-b" in model._cross_stage_adapter._stream_vocoder_cache_by_req
 
 
 def test_sample_uses_ras_rejection_for_recent_repetition():
@@ -1104,8 +1104,10 @@ def test_embed_input_ids_rejects_cross_request_placeholder_block():
 
 
 def test_full_response_singleton_uses_the_optimized_batch_path(monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3_code2wav
+
     monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", "1")
-    monkeypatch.setattr(cosyvoice3, "cosyvoice3_packed_inference_enabled", lambda: True)
+    monkeypatch.setattr(cosyvoice3_code2wav, "cosyvoice3_packed_inference_enabled", lambda: True)
     model = _make_code2wav_model()
     model.forward(
         input_ids=torch.tensor([0, 1, 2]),
@@ -1209,13 +1211,12 @@ def test_sampling_mode_preserves_or_merges_control_logits(mode):
 
 
 def test_cancelled_stream_releases_only_its_vocoder_state():
-    model = SimpleNamespace(
-        _stream_audio_cache_lock=Lock(),
-        _stream_vocoder_cache_by_req={"cancelled": {"mel": torch.ones(2)}, "live": {"mel": torch.zeros(2)}},
-    )
+    adapter = CrossStageAdapter(24000, 4)
+    adapter._stream_vocoder_cache_by_req = {"cancelled": {"mel": torch.ones(2)}, "live": {"mel": torch.zeros(2)}}
+    model = SimpleNamespace(_cross_stage_adapter=adapter)
     CosyVoice3Model.on_requests_finished(model, {"cancelled", "unknown"})
     CosyVoice3Model.on_requests_finished(model, {"cancelled"})
-    assert set(model._stream_vocoder_cache_by_req) == {"live"}
+    assert set(model._cross_stage_adapter._stream_vocoder_cache_by_req) == {"live"}
 
 
 @pytest.mark.parametrize("mrv2,packed", [(False, False), (False, True), (True, False)])
@@ -1280,6 +1281,7 @@ def test_request_conditioning_reaches_code2wav_with_true_prompt_length():
 def test_generation_output_ownership_is_exposed_only_for_owned_codec(stage, owned):
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
+    model.local_code2wav = False
     model.model_stage = stage
     if stage == "cosyvoice3_code2wav":
         model.code2wav = SimpleNamespace(owns_generation_output_storage=owned)

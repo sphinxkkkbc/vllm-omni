@@ -118,3 +118,28 @@ def resolve_cosyvoice3_pipeline(hf_config: PretrainedConfig | None = None) -> Pi
                 default_deploy_config_name="cosyvoice3_packed_streaming_optimized_standard.yaml",
             )
     return COSYVOICE3_PIPELINE
+
+
+COSYVOICE3_SINGLE_STAGE_PIPELINE = PipelineConfig(
+    model_type="cosyvoice3_single_stage",
+    single_stage_async_chunk=True,
+    default_deploy_config_name="cosyvoice3_single_stage.yaml",
+    model_arch="CosyVoice3Model",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="cosyvoice3_talker",
+            supports_running_prefix_cache_reset=False,
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            final_output=True,
+            final_output_type="audio",
+            engine_output_type="audio",
+            sampling_constraints={
+                "detokenize": False,
+                "stop_token_ids": list(range(6561, 6761)),
+            },
+        ),
+    ),
+)
