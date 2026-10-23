@@ -387,3 +387,30 @@ def test_submit_copies_noncontiguous_source_rows_before_input_reuse(monkeypatch)
     assert codec._buffers[("decode", 2)].tokens[:, :1].tolist() == [[22]]
     assert codec._buffers[("prefill", 1)].speech[:1].tolist() == [True]
     assert codec._buffers[("decode", 2)].speech[:1].tolist() == [False]
+
+
+@pytest.mark.parametrize("lengths", [(5, 2, 4), (0, 3, 0), (1,)])
+def test_packed_row_metadata_preserves_cpu_layout(monkeypatch, lengths):
+    # Packing metadata is ordinary torch code. Isolate the optional CUDA FA
+    # extension import on CPU hosts; no attention implementation is exercised.
+    if not torch.cuda.is_available():
+        import sys
+        from types import ModuleType
+
+        fa = ModuleType("vllm.vllm_flash_attn")
+
+        def unused(*args, **kwargs):
+            pytest.fail("Metadata packing must not invoke attention")
+
+        fa.__dict__["flash_attn_varlen_func"] = unused
+        monkeypatch.setitem(sys.modules, fa.__name__, fa)
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import pack_rows
+
+    rows = pack_rows(lengths, torch.device("cpu"))
+    starts = [0]
+    for length in lengths:
+        starts.append(starts[-1] + length)
+    assert rows.starts_host.tolist() == starts
+    assert rows.row_ids.tolist() == [row for row, length in enumerate(lengths) for _ in range(length)]
+    assert rows.positions.tolist() == [position for length in lengths for position in range(length)]
+    assert rows.total == sum(lengths)

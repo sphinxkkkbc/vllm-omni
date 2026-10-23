@@ -614,11 +614,6 @@ class CosyVoice3Code2Wav(nn.Module):
         width = max(lengths)
         mu = torch.cat([torch.nn.functional.pad(x, (0, width - x.shape[-1])) for x in mus])
         cond = torch.cat([torch.nn.functional.pad(x, (0, width - x.shape[-1])) for x in conds])
-        mask = (
-            (torch.arange(width, device=weight.device)[None, :] < torch.tensor(lengths, device=weight.device)[:, None])
-            .unsqueeze(1)
-            .to(mu)
-        )
         if cosyvoice3_packed_inference_enabled():
             from .code2wav_core.packed_dit import (
                 PackedDiT,
@@ -655,6 +650,12 @@ class CosyVoice3Code2Wav(nn.Module):
             feat = scatter_rows(packed, rows, width).transpose(1, 2)
 
         else:
+            # Packed Flow uses row metadata and never consumes a padded mask.
+            lengths_host = torch.tensor(
+                lengths, dtype=torch.int64, device="cpu", pin_memory=weight.device.type == "cuda"
+            )
+            lengths_device = lengths_host.to(weight.device, non_blocking=True)
+            mask = (torch.arange(width, device=weight.device)[None, :] < lengths_device[:, None]).unsqueeze(1).to(mu)
             feat, _ = flow.decoder(
                 mu=mu, mask=mask, spks=torch.cat(speakers), cond=cond, n_timesteps=n_timesteps, streaming=False
             )
