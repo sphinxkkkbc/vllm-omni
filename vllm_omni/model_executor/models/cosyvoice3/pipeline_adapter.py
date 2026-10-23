@@ -8,7 +8,7 @@ contents belong to Code2Wav. Neither pipeline changes the decoder algorithm.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from threading import Lock
 from typing import TYPE_CHECKING
@@ -263,6 +263,9 @@ class InnerDecodeState:
     finished: bool = False
 
 
+InnerRequestKey = str | tuple[str, int]
+
+
 class InnerStageAdapter:
     """Translate accepted samples into the same cumulative windows as the connector.
 
@@ -276,11 +279,31 @@ class InnerStageAdapter:
         self.vocab_size = vocab_size
         self.chunk_size = chunk_size
         self.lookahead = lookahead
-        self.states: dict[str, InnerDecodeState] = {}
+        self.states: dict[InnerRequestKey, InnerDecodeState] = {}
+
+    def initialize(self, req_id: InnerRequestKey, conditioning: Mapping, token_buffer: torch.Tensor) -> None:
+        """Bind an append-only producer buffer; chunk/cache state stays consumer-owned."""
+        if req_id in self.states:
+            return
+        payload = to_struct(_normalize_request_conditioning({"embed": dict(conditioning)}))
+        embed = payload.embed
+        if embed is None or any(getattr(embed, key) is None for key in ("speech_token", "speech_feat", "embedding")):
+            raise ValueError(f"CosyVoice3 single-stage request {req_id} has no prompt conditioning")
+        prompt_token, prompt_feat = unpad_prompt_conditioning(
+            embed.speech_token, embed.speech_feat, embed.speech_token_len
+        )
+        state = InnerDecodeState(
+            token=token_buffer,
+            prompt_token=prompt_token[:1],
+            prompt_feat=prompt_feat[:1],
+            embedding=embed.embedding[:1],
+            hop=self.chunk_size,
+        )
+        self.states[req_id] = state
 
     def append(
         self,
-        req_id: str,
+        req_id: InnerRequestKey,
         sampled_token: torch.Tensor,
         conditioning: Mapping,
         *,
@@ -288,25 +311,13 @@ class InnerStageAdapter:
         position: int,
         speech_mask: torch.Tensor,
     ) -> None:
-        state = self.states.get(req_id)
-        if state is None:
-            payload = to_struct(_normalize_request_conditioning({"embed": dict(conditioning)}))
-            embed = payload.embed
-            if embed is None or any(
-                getattr(embed, key) is None for key in ("speech_token", "speech_feat", "embedding")
-            ):
-                raise ValueError(f"CosyVoice3 single-stage request {req_id} has no prompt conditioning")
-            prompt_token, prompt_feat = unpad_prompt_conditioning(
-                embed.speech_token, embed.speech_feat, embed.speech_token_len
+        if req_id not in self.states:
+            self.initialize(
+                req_id,
+                conditioning,
+                torch.empty((1, capacity), dtype=torch.long, device=sampled_token.device),
             )
-            state = InnerDecodeState(
-                token=torch.empty((1, capacity), dtype=torch.long, device=sampled_token.device),
-                prompt_token=prompt_token[:1],
-                prompt_feat=prompt_feat[:1],
-                embedding=embed.embedding[:1],
-                hop=self.chunk_size,
-            )
-            self.states[req_id] = state
+        state = self.states[req_id]
         if state.finished:
             return
         # The CPU-derived position counts prior accepted speech tokens. EOS
@@ -314,7 +325,7 @@ class InnerStageAdapter:
         target = state.token[:, position : position + 1]
         target.copy_(torch.where(speech_mask, sampled_token.reshape(1, 1), 0))
 
-    def prepare(self, req_id: str, length: int, final: bool) -> StreamingFlowItem | None:
+    def prepare(self, req_id: InnerRequestKey, length: int, final: bool) -> StreamingFlowItem | None:
         """Plan the existing chunk/tail path using runner-derived lengths."""
         state = self.states[req_id]
         if state.finished:
@@ -342,10 +353,10 @@ class InnerStageAdapter:
         state.finished = final
         return item
 
-    def apply_result(self, req_id: str, cache: StreamingHiFTState | None) -> None:
+    def apply_result(self, req_id: InnerRequestKey, cache: StreamingHiFTState | None) -> None:
         state = self.states[req_id]
         state.cache = None if state.finished else cache
 
-    def finish_requests(self, request_ids: set[str]) -> None:
+    def finish_requests(self, request_ids: Iterable[InnerRequestKey]) -> None:
         for req_id in request_ids:
             self.states.pop(req_id, None)

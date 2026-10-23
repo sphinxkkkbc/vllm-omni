@@ -106,7 +106,7 @@ materialization on top of CUDA Graph and async chunk produced the following
 results at concurrency 64:
 
 | Configuration | Request throughput | Mean audio TTFP | Mean audio RTF |
-|---|---:|---:|---:|
+| --- | ---: | ---: | ---: |
 | CUDA Graph + async chunk | 9.3 req/s | 655 ms | 0.63 |
 | + async output materialization | 11.3 req/s | 631 ms | 0.47 |
 | Change | **+22%** | **-4%** | **-25%** |
@@ -223,7 +223,7 @@ outputs are not deferred because they affect scheduler-visible request state.
 ### Qwen3-Omni Stage Behavior
 
 | Stage | Async output behavior | Reason |
-|---|---|---|
+| --- | --- | --- |
 | Thinker | Snapshots hidden states and multimodal outputs; builds the downstream payload in the background | The Talker needs the payload, but the next Thinker decode step only needs sampled-token feedback |
 | Talker | Runs lightweight postprocess eagerly; snapshots codec outputs; omits hidden states from the downstream payload | `hidden_states.last` is needed by the next Talker step, while Code2Wav only needs codec codes |
 | Code2Wav | Uses the normal generation-stage output path | Code2Wav is not executed by `GPUARModelRunner` |
@@ -337,7 +337,7 @@ because they use the same Talker implementation.
 runtime conditions hold:
 
 | Requirement | Reason |
-|---|---|
+| --- | --- |
 | AR async scheduling is enabled | The optimization relies on the scheduler advancing while the prior output is materialized |
 | `async_chunk` is enabled | The feature targets incremental downstream Omni payloads |
 | The model stage opts in with `use_async_omni_output` | Models must declare that their output lifecycle is safe to defer |
@@ -403,3 +403,63 @@ without pinned memory, copies remain blocking. These guards prevent accumulation
 or serialization from observing unfinished CPU tensors. This changes where the
 host waits, not the amount of NPU model computation or the D2H dependency on it.
 A shorter `sample_tokens()` interval alone is not an end-to-end speedup.
+
+## CosyVoice3 single-stage codec output
+
+The `cosyvoice3_single_stage` pipeline uses a model-local asynchronous scheduler
+and an in-process codec worker (UniProc, TP=1, PP=1). The runner appends samples
+and speech/EOS validity bits to per-request GPU buffers sized by
+`max_model_len`. It publishes only the latest written-prefix event and length
+in a per-request mailbox. There is no per-step notification FIFO or producer
+wait for codec consumption. Published prefixes are immutable; the producer can
+write later suffix positions while the codec reads an earlier chunk.
+The producer passes CPU row numbers as metadata and copies basic row slices into
+the owned buffers before graph output reuse. It does not advanced-index CUDA
+tensors with Python lists, which would upload indices and synchronize the AR
+stream for each selection.
+
+The codec worker snapshots mailbox progress and copies previously unread
+validity bits to a request-owned pinned host buffer on a control stream. It
+checks that copy's event before reading the bits on the CPU. Keeping the whole
+validity prefix preserves EOS even when many progress notifications coalesce.
+Length-limit termination also preserves its original token position. Cancellation
+and release use a separate coalesced control mailbox, without waiting for space
+in a token queue. Decoder state stays owned by the codec thread.
+
+The worker catches up through the existing chunk ramp and lookahead before
+finalizing the tail, rather than merging a backlog into one large final decode.
+Decoder caches stay on the GPU. PCM is cloned before another decoder graph
+replay can overwrite it, then copied to pinned memory on an audio copy stream.
+Only completed host PCM enters the scheduler's audio inbox. Codec and D2H work
+have a separate in-flight limit; reaching it does not prevent the runner from
+appending tokens. Input memory is bounded by request admission and
+`max_model_len`, rather than by an unbounded queue of step snapshots.
+
+Codec Flow/HiFT graph construction uses an owner-private non-default stream
+and thread-local capture error checking. Warmup and static-buffer writes are ordered
+before capture with stream dependencies. The capture helper calls
+`CUDAGraph.capture_begin/end` directly, avoiding the device-wide synchronization,
+cache flush and shared default capture stream in `torch.cuda.graph`. AR graph
+construction must finish before the codec owner starts; this does not permit
+multiple concurrent graph captures. The single codec owner serializes graph
+capture/replay and keeps the captured buffers and graph pool alive. Independent
+AR allocations are not included in the codec graph, and captured-thread unsafe
+operations remain errors. This changes codec capture only, not the global
+PyTorch capture policy or Inductor's separate cudagraph option.
+
+AR resources are released normally at EOS. The scheduler retains the terminal
+output until the final audio notification arrives, and reserves admission
+capacity for these tails. Generation numbers reject late messages from retired
+requests. In-flight control reads retain their GPU sources and pinned destinations
+through cancellation. KV preemption fails a request rather than restarting an
+already emitted waveform. Worker failures propagate to the engine, and shutdown
+drains submitted work before decoder resources disappear. Final client delivery
+still follows engine-loop consumption; this path does not promise that CPU/GIL
+or GPU resource contention disappears.
+
+CPU tests hold a decoder call open while a producer appends many more steps than
+the former FIFO capacity, then verify ordered chunk catch-up and sticky EOS.
+Additional tests cover length stops, cancellation during control D2H, deferred
+termination, stale generations and admission. CUDA stream tests require a CUDA
+host; CPU tests do not establish stream correctness, audio equivalence or a
+performance gain.

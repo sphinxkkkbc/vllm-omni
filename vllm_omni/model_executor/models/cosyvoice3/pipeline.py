@@ -94,6 +94,7 @@ COSYVOICE3_SINGLE_STAGE_PIPELINE = PipelineConfig(
     stages=(
         StagePipelineConfig(
             stage_id=0,
+            scheduler_cls="vllm_omni.model_executor.models.cosyvoice3.async_scheduler.CosyVoice3AsyncScheduler",
             model_stage="cosyvoice3_talker",
             supports_running_prefix_cache_reset=False,
             execution_type=StageExecutionType.LLM_AR,
