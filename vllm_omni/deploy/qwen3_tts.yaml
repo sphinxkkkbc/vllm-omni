@@ -24,7 +24,8 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      decode_streaming: true
+      # Opt in to the stateful streaming decoder on CUDA.
+      decode_streaming: false
       talker_first_audio: true
       codec_streaming: true
       connector_get_sleep_s: 0.01
@@ -62,8 +63,11 @@ connectors:
       #     decode_chunk_frames + decode_left_context_frames (325 by default).
       #     Extra stateless shapes may be added (union, not intersection) with:
       #       decode_cudagraph_capture_sizes: [97, 400]
-      # Graph batch size defaults to 1. Add larger buckets only when needed:
-      #   decode_cudagraph_batch_sizes: [1, 2, 4]
+      # Capture CUDA Graphs for these batch-size buckets. The [1, 2, 4]
+      # buckets match decode_batch_max_size below so batched decode requests
+      # can use graphs instead of falling back to eager execution. Each extra
+      # bucket increases CUDA Graph warmup time and memory usage.
+      decode_cudagraph_batch_sizes: [1, 2, 4]
       # Limit eager batches to reduce temporary stateful cache allocations; CUDA Graph batching uses the buckets above.
       decode_batch_max_size: 4
 
