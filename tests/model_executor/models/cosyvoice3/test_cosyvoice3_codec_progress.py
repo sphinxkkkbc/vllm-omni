@@ -36,7 +36,7 @@ def _decoder(monkeypatch):
         model.calls.append(("hift", tag))
         return feat, None if finalize else {"tag": tag}
 
-    model._flow_batch_mels = flow
+    model.flow_batch_mels = flow
     model._stream_hift_from_feat = hift
     return model
 

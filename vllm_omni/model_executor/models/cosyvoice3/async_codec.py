@@ -19,13 +19,13 @@ import torch
 from vllm_omni.platforms import current_omni_platform
 
 from .cosyvoice3_code2wav import iter_decode_streaming_batch
-from .pipeline_adapter import InnerStageAdapter
-
-RequestKey = tuple[str, int]
+from .pipeline_adapter import CodecRequestKey, SingleStageAdapter
 
 
 @dataclass
 class SampleEntry:
+    """CPU sampling metadata; token values remain in the supplied GPU tensor."""
+
     request_id: str
     position: int
     length_finished: bool
@@ -35,6 +35,8 @@ class SampleEntry:
 
 @dataclass
 class TokenBuffer:
+    """Append-only storage: AR writes suffixes, codec confirms copied validity bits."""
+
     tokens: torch.Tensor
     speech: torch.Tensor
     host_speech: torch.Tensor
@@ -46,6 +48,8 @@ class TokenBuffer:
 
 @dataclass
 class TokenProgress:
+    """Latest AR prefix and the GPU event that makes that prefix readable."""
+
     buffer: TokenBuffer
     end: int
     limit_position: int | None
@@ -54,6 +58,8 @@ class TokenProgress:
 
 @dataclass
 class ControlRead:
+    """Retain the source and pinned destination until the validity D2H completes."""
+
     progress: TokenProgress
     start: int
     ready: torch.cuda.Event
@@ -61,6 +67,8 @@ class ControlRead:
 
 @dataclass
 class DecodeProgress:
+    """Confirmed prefix; nonfinal_length reserves the stop position for the tail."""
+
     buffer: TokenBuffer
     length: int
     nonfinal_length: int
@@ -77,48 +85,66 @@ class ReadyAudio:
 
 @dataclass
 class PendingAudio:
+    """Retain GPU PCM until its pinned-host copy completes."""
+
     output: ReadyAudio
     ready: torch.cuda.Event
     source: torch.Tensor | None
 
 
 class AsyncCodec:
-    def __init__(self, model, adapter: InnerStageAdapter, device, max_model_len: int, capacity: int):
+    """AR submits prefixes; one codec thread consumes them and publishes CPU PCM.
+
+    register/submit/cancel/release run on the engine thread. Token updates and
+    retirements cross a short mailbox lock; reads, decoding and audio copies
+    stay on the codec thread. Only completed D2H results enter outputs.
+    """
+
+    def __init__(self, model, adapter: SingleStageAdapter, device, max_model_len: int, capacity: int):
         self.model = model
         self.adapter = adapter
         self.device = device
         self.max_model_len = max_model_len
         self.outputs: queue.SimpleQueue[ReadyAudio] = queue.SimpleQueue()
+        # Engine-owned request generations and append-only input buffers.
         self.generations: dict[str, int] = {}
-        self._next_generation = 0
-        self._capacity = capacity  # Original batch-admission threshold; never producer notifications.
-        self._buffers: dict[RequestKey, TokenBuffer] = {}
-        self._mailbox: dict[RequestKey, TokenProgress] = {}
-        self._retirements: dict[RequestKey, tuple[bool, bool]] = {}
-        self._lock = threading.Lock()
-        self._cancelled: set[RequestKey] = set()
-        self._ended: set[RequestKey] = set()
-        self._released: set[RequestKey] = set()
-        self._reads: dict[RequestKey, ControlRead] = {}
-        self._progress: dict[RequestKey, DecodeProgress] = {}
-        self._pending: deque[PendingAudio] = deque()
-        self._error: BaseException | None = None
-        self._started = threading.Event()
-        self._tick = threading.Event()
-        self._closed = False
-        self.thread = threading.Thread(target=self._run, name="cosyvoice3-codec", daemon=True)
+        self.next_generation = 0
+        self.capacity = capacity  # Pending-audio threshold checked only when admitting a codec batch.
+        self.buffers: dict[CodecRequestKey, TokenBuffer] = {}
+        # Cross-thread mailboxes coalesce updates instead of retaining steps.
+        self.mailbox: dict[CodecRequestKey, TokenProgress] = {}
+        self.retirements: dict[CodecRequestKey, tuple[bool, bool]] = {}
+        self.lock = threading.Lock()
+        # Codec-owned state; tombstones survive pending control/audio copies.
+        self.cancelled: set[CodecRequestKey] = set()
+        self.ended: set[CodecRequestKey] = set()
+        self.released: set[CodecRequestKey] = set()
+        self.reads: dict[CodecRequestKey, ControlRead] = {}
+        self.progress: dict[CodecRequestKey, DecodeProgress] = {}
+        self.pending: deque[PendingAudio] = deque()
+        self.error: BaseException | None = None
+        self.started = threading.Event()
+        self.tick = threading.Event()
+        self.closed = False
+        self.thread = threading.Thread(target=self.run, name="cosyvoice3-codec", daemon=True)
         self.thread.start()
-        if not self._started.wait(10):
+        if not self.started.wait(10):
             raise TimeoutError("CosyVoice3 codec thread did not initialize")
         self.check_error()
 
-    def check_error(self):
-        if self._error is not None:
-            raise RuntimeError("CosyVoice3 asynchronous codec failed") from self._error
+    def check_error(self) -> None:
+        if self.error is not None:
+            raise RuntimeError("CosyVoice3 asynchronous codec failed") from self.error
 
-    def submit(self, entries, tokens, speech, rows: Sequence[int] | None = None):
+    def submit(
+        self,
+        entries: Sequence[SampleEntry],
+        tokens: torch.Tensor,
+        speech: torch.Tensor,
+        rows: Sequence[int] | None = None,
+    ) -> None:
         self.check_error()
-        if self._closed:
+        if self.closed:
             raise RuntimeError("CosyVoice3 codec is closed")
         updates = []
         source_rows = range(len(entries)) if rows is None else rows
@@ -126,7 +152,7 @@ class AsyncCodec:
             key = (entry.request_id, entry.generation)
             if self.generations.get(entry.request_id) != entry.generation:
                 continue
-            buffer = self._buffers.get(key)
+            buffer = self.buffers.get(key)
             if buffer is None:
                 if entry.position != 0:
                     raise ValueError("CosyVoice3 token buffer must start at position zero")
@@ -136,7 +162,7 @@ class AsyncCodec:
                     torch.empty(self.max_model_len, dtype=torch.bool, pin_memory=True),
                     dict(entry.conditioning),
                 )
-                self._buffers[key] = buffer
+                self.buffers[key] = buffer
             position = entry.position
             if buffer.limit_position is not None and position > buffer.limit_position:
                 # The runner may already have scheduled a step beyond its CPU
@@ -156,77 +182,78 @@ class AsyncCodec:
             return
         ready = torch.cuda.Event()
         ready.record()
-        with self._lock:
+        with self.lock:
             for key, buffer, end, limit in updates:
-                self._mailbox[key] = TokenProgress(buffer, end, limit, ready)
-        self._tick.set()
+                self.mailbox[key] = TokenProgress(buffer, end, limit, ready)
+        self.tick.set()
 
-    def register(self, request_id: str):
-        self._next_generation += 1
-        self.generations[request_id] = self._next_generation
-        return self._next_generation
+    def register(self, request_id: str) -> int:
+        self.next_generation += 1
+        self.generations[request_id] = self.next_generation
+        return self.next_generation
 
-    def _retire(self, request_id: str, *, cancel: bool, release: bool):
+    def retire(self, request_id: str, *, cancel: bool, release: bool) -> None:
         self.check_error()
         key = (request_id, self.generations[request_id])
-        with self._lock:
-            cancelled, released = self._retirements.get(key, (False, False))
-            self._retirements[key] = (cancelled or cancel, released or release)
+        with self.lock:
+            cancelled, released = self.retirements.get(key, (False, False))
+            self.retirements[key] = (cancelled or cancel, released or release)
         if release:
             self.generations.pop(request_id)
-            self._buffers.pop(key, None)
-        self._tick.set()
+            self.buffers.pop(key, None)
+        self.tick.set()
 
-    def cancel(self, request_id: str):
-        self._retire(request_id, cancel=True, release=False)
+    def cancel(self, request_id: str) -> None:
+        self.retire(request_id, cancel=True, release=False)
 
-    def release(self, request_id: str):
-        self._retire(request_id, cancel=False, release=True)
+    def release(self, request_id: str) -> None:
+        self.retire(request_id, cancel=False, release=True)
 
-    def close(self):
-        if self._closed:
+    def close(self) -> None:
+        if self.closed:
             return
-        self._closed = True
-        self._tick.set()
+        self.closed = True
+        self.tick.set()
         self.thread.join(timeout=30)
         if self.thread.is_alive():
             raise TimeoutError("CosyVoice3 codec did not drain during shutdown")
         self.check_error()
 
-    def _consume_retirements(self):
-        with self._lock:
-            controls, self._retirements = self._retirements, {}
+    def consume_retirements(self) -> None:
+        with self.lock:
+            controls, self.retirements = self.retirements, {}
             for key in controls:
-                self._mailbox.pop(key, None)
+                self.mailbox.pop(key, None)
         for key, (cancelled, released) in controls.items():
             if cancelled:
-                self._cancelled.add(key)
+                self.cancelled.add(key)
             if released:
-                self._released.add(key)
-            self._progress.pop(key, None)
+                self.released.add(key)
+            self.progress.pop(key, None)
             self.adapter.finish_requests({key})
         # ControlRead keeps source flags and pinned destination alive until its
         # event completes, even if the request was cancelled in the meantime.
 
-    def _publish(self):
-        while self._pending and self._pending[0].ready.query():
-            audio = self._pending.popleft().output
-            if (audio.request_id, audio.generation) not in self._cancelled:
+    def publish(self) -> None:
+        while self.pending and self.pending[0].ready.query():
+            audio = self.pending.popleft().output
+            if (audio.request_id, audio.generation) not in self.cancelled:
                 self.outputs.put(audio)
-        pending = {(x.output.request_id, x.output.generation) for x in self._pending}
-        for key in self._released - pending - self._reads.keys():
-            self._cancelled.discard(key)
-            self._ended.discard(key)
-            self._released.discard(key)
+        pending = {(x.output.request_id, x.output.generation) for x in self.pending}
+        for key in self.released - pending - self.reads.keys():
+            self.cancelled.discard(key)
+            self.ended.discard(key)
+            self.released.discard(key)
 
-    def _start_reads(self):
-        with self._lock:
-            snapshots = [(key, value) for key, value in self._mailbox.items() if key not in self._reads]
+    def start_reads(self) -> None:
+        """Copy only unread validity suffixes, ordered after AR prefix writes."""
+        with self.lock:
+            snapshots = [(key, value) for key, value in self.mailbox.items() if key not in self.reads]
             for key, _ in snapshots:
-                self._mailbox.pop(key)
+                self.mailbox.pop(key)
         with torch.cuda.stream(self.control_stream):
             for key, progress in snapshots:
-                if key in self._ended or key in self._cancelled:
+                if key in self.ended or key in self.cancelled:
                     continue
                 buffer = progress.buffer
                 start = buffer.confirmed
@@ -235,34 +262,38 @@ class AsyncCodec:
                 buffer.host_speech[start : progress.end].copy_(buffer.speech[start : progress.end], non_blocking=True)
                 copied = torch.cuda.Event()
                 copied.record(self.control_stream)
-                self._reads[key] = ControlRead(progress, start, copied)
+                self.reads[key] = ControlRead(progress, start, copied)
 
-    def _poll_reads(self):
-        for key, read in list(self._reads.items()):
+    def poll_reads(self) -> None:
+        """Confirm EOS on the CPU only after its validity copy is complete."""
+        for key, read in list(self.reads.items()):
             if not read.ready.query():
                 continue
-            del self._reads[key]
-            if key in self._cancelled or key in self._released or key in self._ended:
+            del self.reads[key]
+            if key in self.cancelled or key in self.released or key in self.ended:
                 continue
             progress = read.progress
             buffer = progress.buffer
             values = buffer.host_speech[read.start : progress.end].tolist()
             eos = next((read.start + i for i, value in enumerate(values) if not value), None)
             limit = progress.limit_position
-            terminal = min(p for p in (eos, limit) if p is not None) if eos is not None or limit is not None else None
+            terminal = limit
+            if eos is not None:
+                terminal = eos if limit is None else min(eos, limit)
             length = progress.end
             nonfinal_length = length
             if terminal is not None:
                 length = terminal + int(values[terminal - read.start])
                 nonfinal_length = terminal
-                self._ended.add(key)
+                self.ended.add(key)
             buffer.confirmed = progress.end
-            self._progress[key] = DecodeProgress(buffer, length, nonfinal_length, terminal is not None)
+            self.progress[key] = DecodeProgress(buffer, length, nonfinal_length, terminal is not None)
 
-    def _decode_ready(self) -> bool:
+    def decode_ready(self) -> bool:
+        """Submit ready chunks and their D2H without waiting for GPU completion."""
         items, bindings, empty_finals = [], [], []
-        for key, progress in self._progress.items():
-            if key in self._cancelled or key in self._released:
+        for key, progress in self.progress.items():
+            if key in self.cancelled or key in self.released:
                 continue
             buffer = progress.buffer
             buffer.tokens.record_stream(self.stream)
@@ -297,45 +328,45 @@ class AsyncCodec:
                     host.copy_(wav, non_blocking=True)
                     copied = torch.cuda.Event()
                     copied.record(self.copy_stream)
-                    self._pending.append(PendingAudio(ReadyAudio(key[0], host, final, key[1]), copied, wav))
+                    self.pending.append(PendingAudio(ReadyAudio(key[0], host, final, key[1]), copied, wav))
                 # Publish any completed copies between submissions, without
                 # waiting for either HiFT or D2H before queuing the next row.
-                self._publish()
+                self.publish()
         for key in empty_finals:
             copied = torch.cuda.Event()
             copied.record(self.copy_stream)
-            self._pending.append(PendingAudio(ReadyAudio(key[0], None, True, key[1]), copied, None))
+            self.pending.append(PendingAudio(ReadyAudio(key[0], None, True, key[1]), copied, None))
         return bool(items or empty_finals)
 
     @torch.inference_mode()
-    def _run(self):
+    def run(self) -> None:
         try:
             current_omni_platform.set_device(self.device)
             self.stream = torch.cuda.Stream(device=self.device)
             self.copy_stream = torch.cuda.Stream(device=self.device)
             self.control_stream = torch.cuda.Stream(device=self.device)
-            self._started.set()
+            self.started.set()
             with torch.cuda.stream(self.stream):
                 while True:
-                    self._tick.clear()
-                    self._consume_retirements()
-                    self._publish()
-                    self._start_reads()
-                    self._poll_reads()
-                    decoded = self._decode_ready() if len(self._pending) < self._capacity else False
-                    with self._lock:
-                        incoming = bool(self._mailbox or self._retirements)
-                    if self._closed and not incoming and not self._reads and not self._pending and not decoded:
+                    self.tick.clear()
+                    self.consume_retirements()
+                    self.publish()
+                    self.start_reads()
+                    self.poll_reads()
+                    decoded = self.decode_ready() if len(self.pending) < self.capacity else False
+                    with self.lock:
+                        incoming = bool(self.mailbox or self.retirements)
+                    if self.closed and not incoming and not self.reads and not self.pending and not decoded:
                         break
                     if not decoded:
-                        self._tick.wait(0.0005)
+                        self.tick.wait(0.0005)
                 self.stream.synchronize()
                 self.copy_stream.synchronize()
                 self.control_stream.synchronize()
                 self.adapter.finish_requests(set(self.adapter.states))
-                self._buffers.clear()
-                self._progress.clear()
+                self.buffers.clear()
+                self.progress.clear()
         except BaseException as error:
-            self._error = error
+            self.error = error
         finally:
-            self._started.set()
+            self.started.set()

@@ -250,7 +250,7 @@ class CrossStageAdapter:
 
 
 @dataclass
-class InnerDecodeState:
+class StreamingDecodeState:
     """Pipeline-owned accumulation; the decoder cache is opaque to this layer."""
 
     token: torch.Tensor
@@ -263,14 +263,15 @@ class InnerDecodeState:
     finished: bool = False
 
 
-InnerRequestKey = str | tuple[str, int]
+CodecRequestKey = tuple[str, int]
 
 
-class InnerStageAdapter:
-    """Translate accepted samples into the same cumulative windows as the connector.
+class SingleStageAdapter:
+    """Plan codec chunks over a request's immutable, validated token prefix.
 
-    The first implementation supports ordinary one-token AR sampling. Request
-    state is keyed by request ID so scheduler slot changes preserve continuity.
+    The AR producer owns token writes; the codec thread owns this planner and
+    its vocoder caches. Generation keys isolate request-ID reuse. Chunk ramp,
+    prompt padding and lookahead match the two-stage connector.
     """
 
     def __init__(self, vocab_size: int, chunk_size: int = 25, lookahead: int = 3):
@@ -279,9 +280,9 @@ class InnerStageAdapter:
         self.vocab_size = vocab_size
         self.chunk_size = chunk_size
         self.lookahead = lookahead
-        self.states: dict[InnerRequestKey, InnerDecodeState] = {}
+        self.states: dict[CodecRequestKey, StreamingDecodeState] = {}
 
-    def initialize(self, req_id: InnerRequestKey, conditioning: Mapping, token_buffer: torch.Tensor) -> None:
+    def initialize(self, req_id: CodecRequestKey, conditioning: Mapping, token_buffer: torch.Tensor) -> None:
         """Bind an append-only producer buffer; chunk/cache state stays consumer-owned."""
         if req_id in self.states:
             return
@@ -292,7 +293,7 @@ class InnerStageAdapter:
         prompt_token, prompt_feat = unpad_prompt_conditioning(
             embed.speech_token, embed.speech_feat, embed.speech_token_len
         )
-        state = InnerDecodeState(
+        state = StreamingDecodeState(
             token=token_buffer,
             prompt_token=prompt_token[:1],
             prompt_feat=prompt_feat[:1],
@@ -301,31 +302,7 @@ class InnerStageAdapter:
         )
         self.states[req_id] = state
 
-    def append(
-        self,
-        req_id: InnerRequestKey,
-        sampled_token: torch.Tensor,
-        conditioning: Mapping,
-        *,
-        capacity: int,
-        position: int,
-        speech_mask: torch.Tensor,
-    ) -> None:
-        if req_id not in self.states:
-            self.initialize(
-                req_id,
-                conditioning,
-                torch.empty((1, capacity), dtype=torch.long, device=sampled_token.device),
-            )
-        state = self.states[req_id]
-        if state.finished:
-            return
-        # The CPU-derived position counts prior accepted speech tokens. EOS
-        # leaves this location outside the valid prefix; it is never appended.
-        target = state.token[:, position : position + 1]
-        target.copy_(torch.where(speech_mask, sampled_token.reshape(1, 1), 0))
-
-    def prepare(self, req_id: InnerRequestKey, length: int, final: bool) -> StreamingFlowItem | None:
+    def prepare(self, req_id: CodecRequestKey, length: int, final: bool) -> StreamingFlowItem | None:
         """Plan the existing chunk/tail path using runner-derived lengths."""
         state = self.states[req_id]
         if state.finished:
@@ -353,10 +330,10 @@ class InnerStageAdapter:
         state.finished = final
         return item
 
-    def apply_result(self, req_id: InnerRequestKey, cache: StreamingHiFTState | None) -> None:
+    def apply_result(self, req_id: CodecRequestKey, cache: StreamingHiFTState | None) -> None:
         state = self.states[req_id]
         state.cache = None if state.finished else cache
 
-    def finish_requests(self, request_ids: Iterable[InnerRequestKey]) -> None:
+    def finish_requests(self, request_ids: Iterable[CodecRequestKey]) -> None:
         for req_id in request_ids:
             self.states.pop(req_id, None)
