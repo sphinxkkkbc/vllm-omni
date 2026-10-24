@@ -59,6 +59,11 @@ class OmniPlatform(Platform):
         return self._omni_enum == OmniPlatformEnum.OOT
 
     @classmethod
+    def prepare_stage_engine(cls) -> None:
+        """Install platform runtime compatibility before constructing a stage engine."""
+        return None
+
+    @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
         raise NotImplementedError
 
