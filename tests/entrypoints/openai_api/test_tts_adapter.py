@@ -1338,7 +1338,7 @@ async def test_omnivoice_diffusion_adapter_request_preparation():
         input="Hello",
         voice="alice",
         language="English",
-        instructions="calm",
+        instructions="男, american accent",
     )
 
     adapter.normalize(request)
@@ -1351,7 +1351,7 @@ async def test_omnivoice_diffusion_adapter_request_preparation():
         "voice_name": "alice",
         "voice_created_at": 123,
         "lang": "English",
-        "instruct": "calm",
+        "instruct": "male, american accent",
     }
 
 
