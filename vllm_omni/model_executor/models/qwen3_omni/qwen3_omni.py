@@ -304,7 +304,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             # since the residual codebooks depend only on CB0 and that step's
             # last hidden, and the next input is their embedding sum plus the
             # next text step (see ``talker_mtp``).
-            self.mtp_eager_frames = True
+            self.has_talker_mtp = True
             self._codec_codebook_size = int(talker_config.code_predictor_config.vocab_size)
             self._apply_subtalker_sampling_params(getattr(vllm_config.model_config, "subtalker_sampling_params", None))
 
@@ -846,7 +846,7 @@ class Qwen3OmniMoeForConditionalGeneration(
     def _make_eager_talker_output(self, hidden: torch.Tensor, spans: list[tuple[int, int]]) -> OmniOutput:
         """Async-chunk output when the MRv2 runner completes frames after sampling.
 
-        ``run_eager_mtp`` writes each sampled row's frame and validity into the
+        ``post_sample`` writes each sampled row's frame and validity into the
         last token row of its request span; every other row carries no frame.
         """
         num_tokens = spans[-1][1] if spans else 0
