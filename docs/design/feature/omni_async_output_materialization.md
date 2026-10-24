@@ -428,11 +428,23 @@ in a token queue. Decoder state stays owned by the codec thread.
 
 The worker catches up through the existing chunk ramp and lookahead before
 finalizing the tail, rather than merging a backlog into one large final decode.
-Decoder caches stay on the GPU. PCM is cloned before another decoder graph
-replay can overwrite it, then copied to pinned memory on an audio copy stream.
-Only completed host PCM enters the scheduler's audio inbox. Codec and D2H work
-have a separate in-flight limit; reaching it does not prevent the runner from
-appending tokens. Input memory is bounded by request admission and
+Decoder caches stay on the GPU. Flow is still batched, but the codec worker
+receives one HiFT result at a time. It snapshots that request's PCM and
+immediately schedules D2H on the audio copy stream using a per-request GPU event,
+before submitting the next request's HiFT. Copy-stream waits order the transfer
+without making the codec CPU thread wait for HiFT or D2H. Completed copies can
+be published between submissions; each GPU source remains owned until its copy
+event completes.
+
+The original pending-audio threshold is checked before admitting a decode
+batch. It is not a strict per-row cap: an admitted batch can exceed the remaining
+slots, and another batch may be submitted while earlier copies are in flight
+when the pending count is below the threshold. This retains the previous
+submission depth. There is no one-batch limit or per-HiFT completion gate.
+Only completed host PCM enters the scheduler's audio inbox. Reaching the
+admission threshold does not prevent the runner from appending tokens.
+
+Input memory is bounded by request admission and
 `max_model_len`, rather than by an unbounded queue of step snapshots.
 
 Codec Flow/HiFT graph construction uses an owner-private non-default stream

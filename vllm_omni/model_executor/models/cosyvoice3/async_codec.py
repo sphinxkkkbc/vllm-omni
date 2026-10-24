@@ -18,7 +18,7 @@ import torch
 
 from vllm_omni.platforms import current_omni_platform
 
-from .cosyvoice3_code2wav import decode_streaming_batch
+from .cosyvoice3_code2wav import iter_decode_streaming_batch
 from .pipeline_adapter import InnerStageAdapter
 
 RequestKey = tuple[str, int]
@@ -91,7 +91,7 @@ class AsyncCodec:
         self.outputs: queue.SimpleQueue[ReadyAudio] = queue.SimpleQueue()
         self.generations: dict[str, int] = {}
         self._next_generation = 0
-        self._capacity = capacity  # Limit codec/D2H work, never producer notifications.
+        self._capacity = capacity  # Original batch-admission threshold; never producer notifications.
         self._buffers: dict[RequestKey, TokenBuffer] = {}
         self._mailbox: dict[RequestKey, TokenProgress] = {}
         self._retirements: dict[RequestKey, tuple[bool, bool]] = {}
@@ -259,7 +259,7 @@ class AsyncCodec:
             buffer.confirmed = progress.end
             self._progress[key] = DecodeProgress(buffer, length, nonfinal_length, terminal is not None)
 
-    def _decode_ready(self):
+    def _decode_ready(self) -> bool:
         items, bindings, empty_finals = [], [], []
         for key, progress in self._progress.items():
             if key in self._cancelled or key in self._released:
@@ -284,19 +284,23 @@ class AsyncCodec:
             elif final and progress.length == 0:
                 empty_finals.append(key)
         if items:
-            results = decode_streaming_batch(self.model.code2wav, items)
-            results = [(wav.reshape(-1).float().clone(), cache) for wav, cache in results]
-            decoded = torch.cuda.Event()
-            decoded.record(self.stream)
-            with torch.cuda.stream(self.copy_stream):
-                self.copy_stream.wait_event(decoded)
-                for (key, final), (wav, cache) in zip(bindings, results, strict=True):
-                    self.adapter.apply_result(key, cache)
+            for index, wav, cache in iter_decode_streaming_batch(self.model.code2wav, items):
+                key, final = bindings[index]
+                self.adapter.apply_result(key, cache)
+                # Snapshot before the next request can reuse graph output storage.
+                wav = wav.reshape(-1).float().clone()
+                decoded = torch.cuda.Event()
+                decoded.record(self.stream)
+                with torch.cuda.stream(self.copy_stream):
+                    self.copy_stream.wait_event(decoded)
                     host = torch.empty(wav.shape, dtype=wav.dtype, pin_memory=True)
                     host.copy_(wav, non_blocking=True)
                     copied = torch.cuda.Event()
                     copied.record(self.copy_stream)
                     self._pending.append(PendingAudio(ReadyAudio(key[0], host, final, key[1]), copied, wav))
+                # Publish any completed copies between submissions, without
+                # waiting for either HiFT or D2H before queuing the next row.
+                self._publish()
         for key in empty_finals:
             copied = torch.cuda.Event()
             copied.record(self.copy_stream)

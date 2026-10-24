@@ -89,7 +89,12 @@ def modules(monkeypatch):
     pkg = "_cosy_codec_protocol"
     _module(monkeypatch, pkg, __path__=[str(ROOT)])
     _module(monkeypatch, pkg + ".pipeline_adapter", InnerStageAdapter=object)
-    _module(monkeypatch, pkg + ".cosyvoice3_code2wav", decode_streaming_batch=lambda *a: [])
+    _module(
+        monkeypatch,
+        pkg + ".cosyvoice3_code2wav",
+        StreamingHiFTState=dict,
+        iter_decode_streaming_batch=lambda *a: iter(()),
+    )
     _module(monkeypatch, "vllm_omni.model_executor.models.cosyvoice3.pipeline_adapter", InnerStageAdapter=object)
     loaded = []
     for name in ("async_codec", "async_scheduler", "model_state"):
@@ -316,3 +321,109 @@ def test_producer_passes_cpu_row_mapping_without_tensor_advanced_indexing(module
     assert tokens.tolist() == [99, 12, 77, 100, 55]
     assert speech.tolist() == [True, True, True, False, True]
     assert outputs == {}
+
+
+@pytest.fixture
+def per_request_worker(modules, monkeypatch):
+    from collections import deque
+    from contextlib import nullcontext
+
+    class Event:
+        def __init__(self):
+            self.done = False
+
+        def query(self):
+            return self.done
+
+        def record(self, stream):
+            pass
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda *args: None)
+    empty = torch.empty
+
+    def host_empty(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", host_empty)
+    worker = object.__new__(modules.codec.AsyncCodec)
+    worker._pending = deque()
+    worker._cancelled, worker._released, worker._ended = set(), set(), set()
+    worker._reads = {}
+    worker.outputs = queue.SimpleQueue()
+    worker.stream = object()
+    worker.copy_stream = SimpleNamespace(wait_event=lambda event: None)
+    worker.applied = []
+    worker._progress, states = {}, {}
+    for index, key in enumerate([("a", 1), ("b", 2)]):
+        worker._progress[key] = modules.codec.DecodeProgress(
+            SimpleNamespace(tokens=torch.ones(1, 1, dtype=torch.long), conditioning={}), 1, int(index == 0), index == 1
+        )
+        states[key] = SimpleNamespace(
+            prompt_token=torch.empty(1, 0),
+            prompt_feat=torch.empty(1, 0, 80),
+            embedding=torch.ones(1, 192),
+            finished=False,
+            emitted=0,
+            hop=1,
+        )
+
+    def prepare(key, length, final):
+        states[key].finished = final
+        return {"key": key}
+
+    worker.adapter = SimpleNamespace(
+        states=states,
+        chunk_size=1,
+        lookahead=0,
+        initialize=lambda *args: None,
+        prepare=prepare,
+        apply_result=lambda *args: worker.applied.append(args),
+    )
+    worker.model = SimpleNamespace(code2wav=object())
+    return worker
+
+
+def test_d2h_queued_per_request_without_waiting_for_previous_hift(per_request_worker, modules, monkeypatch):
+    worker = per_request_worker
+    shared = torch.ones(1)
+
+    def decode(model, items):
+        assert [item["key"][0] for item in items] == ["a", "b"]
+        yield 0, shared, {"row": 0}
+        # A already has a D2H before B submits, even though A's copy is not done.
+        assert len(worker._pending) == 1
+        assert not worker._pending[0].ready.done
+        shared.fill_(2)
+        yield 1, shared, {"row": 1}
+
+    monkeypatch.setattr(modules.codec, "iter_decode_streaming_batch", decode)
+    assert worker._decode_ready()
+    assert worker.outputs.empty()
+    assert [entry.output.request_id for entry in worker._pending] == ["a", "b"]
+    assert [entry.source.tolist() for entry in worker._pending] == [[1], [2]]
+    for entry in worker._pending:
+        entry.ready.done = True
+    worker._publish()
+    first, last = worker.outputs.get_nowait(), worker.outputs.get_nowait()
+    assert first.pcm.tolist() == [1] and not first.final
+    assert last.pcm.tolist() == [2] and last.final
+
+
+def test_completed_audio_published_between_hift_submissions(per_request_worker, modules, monkeypatch):
+    worker = per_request_worker
+
+    def decode(model, items):
+        yield 0, torch.ones(1), None
+        worker._pending[0].ready.done = True
+        yield 1, torch.full((1,), 2.0), None
+        # Publication is polled between rows; B's unfinished D2H cannot hold A.
+        assert worker.outputs.get_nowait().request_id == "a"
+        assert len(worker._pending) == 1
+        assert not worker._pending[0].ready.done
+
+    monkeypatch.setattr(modules.codec, "iter_decode_streaming_batch", decode)
+    assert worker._decode_ready()
+    assert worker._pending[0].output.request_id == "b"
