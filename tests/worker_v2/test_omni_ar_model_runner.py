@@ -620,12 +620,16 @@ def test_stream_audio_prefill_length_end_reaches_output(mocker) -> None:
     from vllm.v1.worker.gpu.input_batch import InputBatch
     from vllm.v1.worker.gpu.states import RequestState
 
-    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
+    from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState
     from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer
 
     owner = mocker.Mock()
     owner.vllm_config.model_config.max_model_len = 4096
-    eager = EagerMTPState(owner)
+    owner._embed_dim = 0
+    owner.device = torch.device("cpu")
+    owner.model.has_talker_mtp = False
+    eager = MTPState(owner)
+    eager._raw_mtp = None
     eager.decode_event = None
     eager._audio_buffer = StreamingAudioBuffer(4, 25)
     eager._audio_buffer.add("request")
@@ -650,16 +654,21 @@ def test_stream_audio_prefill_length_end_reaches_output(mocker) -> None:
 
 
 def test_stream_audio_preemption_preserves_position_rng_and_pending_pcm(mocker) -> None:
-    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState, TalkerInputs
+    from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState, TalkerInputs
     from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer
 
     owner = mocker.Mock()
     owner.intermediate_buffer.buffers = [{} for _ in range(6)]
     generator = torch.Generator().manual_seed(42)
-    owner._mtp_generators = {"request": generator}
     saved = [torch.arange(6)]
     owner.model.stream_decoder.save_slot.return_value = saved
-    eager = EagerMTPState(owner)
+    owner._embed_dim = 0
+    owner.device = torch.device("cpu")
+    owner.model.has_talker_mtp = False
+    eager = MTPState(owner)
+    eager._raw_mtp = None
+    owner._mtp_state = eager
+    eager._mtp_generators = {"request": generator}
     eager.stream_pos = {"request": 37}
     eager.embeds = torch.arange(18).reshape(6, 3).float()
     eager.ready = {}
@@ -671,10 +680,10 @@ def test_stream_audio_preemption_preserves_position_rng_and_pending_pcm(mocker) 
     request.push(torch.ones(4), False)
     eager.suspend_audio("request", 2)
     eager.stream_pos.clear()
-    owner._mtp_generators.clear()
+    owner._mtp_state._mtp_generators.clear()
     eager.resume_audio("request", 5)
     assert eager.stream_pos["request"] == 37
-    assert owner._mtp_generators["request"] is generator
+    assert owner._mtp_state._mtp_generators["request"] is generator
     assert eager._restore_audio["request"] is saved
     assert sum(part.numel() for part in request.pending) == 4
     # A second preemption can happen before the restored slot is used.
@@ -686,12 +695,16 @@ def test_stream_audio_preemption_preserves_position_rng_and_pending_pcm(mocker) 
 
 
 def test_stream_audio_replay_uses_exact_inputs_and_consumes_last_frame_once(mocker):
-    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState, TalkerInputs
+    from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState, TalkerInputs
 
     owner = mocker.Mock()
     owner.model.preprocess.return_value = (None, None, {"mtp_inputs": (None, torch.tensor([[2.0, 3.0]]))})
     owner.intermediate_buffer.buffers = [{"req_id": "request"}]
-    eager = EagerMTPState(owner)
+    owner._embed_dim = 0
+    owner.device = torch.device("cpu")
+    owner.model.has_talker_mtp = False
+    eager = MTPState(owner)
+    eager._raw_mtp = None
     eager.embeds = torch.tensor([[20.0, 30.0]])
     eager._restore_audio["request"] = []
     history = torch.arange(8).reshape(4, 2).float()
@@ -789,11 +802,15 @@ def test_model_owned_audio_finalizer_runs_after_copy_without_hidden(monkeypatch,
 def test_stream_audio_history_replays_exact_inputs_after_batch_reordering(mocker):
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
-    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
+    from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState
 
     owner = mocker.Mock()
     owner.vllm_config.model_config.max_model_len = 12
-    eager = EagerMTPState(owner)
+    owner._embed_dim = 0
+    owner.device = torch.device("cpu")
+    owner.model.has_talker_mtp = False
+    eager = MTPState(owner)
+    eager._raw_mtp = None
     eager.embeds = torch.zeros(2, 3)
     first = torch.arange(9, dtype=torch.float32).reshape(3, 3)
     second = torch.arange(9, 18, dtype=torch.float32).reshape(3, 3)
@@ -959,7 +976,7 @@ def test_request_owned_snapshot_skips_generic_partition(monkeypatch, streaming):
 
 
 def test_stream_history_allocates_only_for_scheduled_requests():
-    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
+    from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState
 
     owner = SimpleNamespace(
         model=SimpleNamespace(stream_decoder=object()),
@@ -972,7 +989,11 @@ def test_stream_history_allocates_only_for_scheduled_requests():
         num_computed_tokens_np=np.array([0]),
         query_start_loc_np=np.array([0, 1]),
     )
-    state = EagerMTPState(owner)
+    owner._embed_dim = 0
+    owner.device = torch.device("cpu")
+    owner.model.has_talker_mtp = False
+    state = MTPState(owner)
+    state._raw_mtp = None
     embeds = torch.arange(4).reshape(1, 4).float()
     state.record_inputs(batch, embeds)
     history = state._talker_inputs["request"]

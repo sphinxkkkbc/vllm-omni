@@ -251,7 +251,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Model-local voice-clone priming boundary; each deployment selects
         # its reference context independently of the two-stage codec profile.
         self.stream_ref_context_frames = stream_ref_context_frames(vllm_config) if self.stream_decode else 0
-        self.mtp_eager_frames = talker_first_audio_enabled(vllm_config) or self.stream_decode
+        self.has_talker_mtp = True
         self.stream_decoder = None
         self.stream_graphs = None
         self.stream_prime_graphs = None
