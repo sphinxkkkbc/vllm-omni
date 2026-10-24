@@ -109,7 +109,7 @@ def _make_code2wav_model(
     # otherwise run and dereference ``self.model_dir`` (only set in __init__,
     # which this fixture bypasses via object.__new__).
     model._code2wav_trt_done = True
-    model._cross_stage_adapter = CrossStageAdapter(24000, 4)
+    model.cross_stage_adapter = CrossStageAdapter(24000, 4)
     return model
 
 
@@ -495,7 +495,7 @@ def test_forward_reuses_streaming_cache_state_between_chunks():
     cache_state = model.code2wav.forward_streaming_calls[1]["cache_state"]
     assert cache_state is not None
     assert cache_state["speech_offset"] == 4
-    assert "rid-stream" in model._cross_stage_adapter._stream_vocoder_cache_by_req
+    assert "rid-stream" in model.cross_stage_adapter._stream_vocoder_cache_by_req
 
 
 def test_forward_clears_streaming_cache_on_terminal_chunk():
@@ -532,7 +532,7 @@ def test_forward_clears_streaming_cache_on_terminal_chunk():
         model_intermediate_buffer=runtime_info,
         seq_token_counts=[3],
     )
-    assert "rid-stream" in model._cross_stage_adapter._stream_vocoder_cache_by_req
+    assert "rid-stream" in model.cross_stage_adapter._stream_vocoder_cache_by_req
 
     runtime_info[0]["meta"]["stream_finished"] = torch.tensor(True)
     out = model.forward(
@@ -542,7 +542,7 @@ def test_forward_clears_streaming_cache_on_terminal_chunk():
         seq_token_counts=[3],
     )
     assert out.multimodal_outputs["audio"][0].tolist() == [7.0]
-    assert "rid-stream" not in model._cross_stage_adapter._stream_vocoder_cache_by_req
+    assert "rid-stream" not in model.cross_stage_adapter._stream_vocoder_cache_by_req
 
 
 def test_forward_batches_streaming_flow_items(monkeypatch):
@@ -587,8 +587,8 @@ def test_forward_batches_streaming_flow_items(monkeypatch):
     batch_items = model.code2wav.forward_streaming_batch_calls[0]
     assert torch.equal(batch_items[0]["token"], torch.tensor([[0, 1, 2]]))
     assert batch_items[1]["token_offset_tokens"] == 1
-    assert "rid-a" in model._cross_stage_adapter._stream_vocoder_cache_by_req
-    assert "rid-b" in model._cross_stage_adapter._stream_vocoder_cache_by_req
+    assert "rid-a" in model.cross_stage_adapter._stream_vocoder_cache_by_req
+    assert "rid-b" in model.cross_stage_adapter._stream_vocoder_cache_by_req
 
 
 def test_sample_uses_ras_rejection_for_recent_repetition():
@@ -1049,10 +1049,10 @@ def test_sampling_mode_preserves_or_merges_control_logits(mode):
 def test_cancelled_stream_releases_only_its_vocoder_state():
     adapter = CrossStageAdapter(24000, 4)
     adapter._stream_vocoder_cache_by_req = {"cancelled": {"mel": torch.ones(2)}, "live": {"mel": torch.zeros(2)}}
-    model = SimpleNamespace(_cross_stage_adapter=adapter)
+    model = SimpleNamespace(cross_stage_adapter=adapter)
     CosyVoice3Model.on_requests_finished(model, {"cancelled", "unknown"})
     CosyVoice3Model.on_requests_finished(model, {"cancelled"})
-    assert set(model._cross_stage_adapter._stream_vocoder_cache_by_req) == {"live"}
+    assert set(model.cross_stage_adapter._stream_vocoder_cache_by_req) == {"live"}
 
 
 @pytest.mark.parametrize("mrv2,packed", [(False, False), (False, True), (True, False)])

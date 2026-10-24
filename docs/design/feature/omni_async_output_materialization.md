@@ -424,7 +424,8 @@ checks that copy's event before reading the bits on the CPU. Keeping the whole
 validity prefix preserves EOS even when many progress notifications coalesce.
 Length-limit termination also preserves its original token position. Cancellation
 and release use a separate coalesced control mailbox, without waiting for space
-in a token queue. Decoder state stays owned by the codec thread.
+in a token queue. Decoder state stays owned by the codec thread. `SingleStageAdapter` plans
+chunk windows over validated token prefixes; only the AR producer writes tokens.
 
 The worker catches up through the existing chunk ramp and lookahead before
 finalizing the tail, rather than merging a backlog into one large final decode.

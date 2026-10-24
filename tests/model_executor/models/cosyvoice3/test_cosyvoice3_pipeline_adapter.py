@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.cosyvoice3.pipeline_adapter import InnerStageAdapter
+from vllm_omni.model_executor.models.cosyvoice3.pipeline_adapter import SingleStageAdapter
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -18,39 +18,17 @@ def _conditioning(prompt_len=3):
     }
 
 
-def _decode_step(
-    adapter,
-    req_id,
-    sampled_token,
-    token_id,
-    conditioning,
-    *,
-    capacity,
-    max_tokens,
-    length_finished=False,
-    position=0,
-):
-    speech = (sampled_token >= 0) & (sampled_token < adapter.vocab_size)
-    adapter.append(req_id, sampled_token, conditioning, capacity=capacity, position=position, speech_mask=speech)
-    is_speech = bool(speech.item())
-    return adapter.prepare(req_id, position + int(is_speech), not is_speech or length_finished or max_tokens == 1)
-
-
-def _prepare(adapter, req_id, value, **kwargs):
-    return _decode_step(
-        adapter, req_id, torch.tensor([value]), value, _conditioning(), capacity=128, max_tokens=100, **kwargs
-    )
-
-
-def test_inner_windows_match_connector_hop_padding_and_lookahead():
-    adapter = InnerStageAdapter(6561, chunk_size=4, lookahead=3)
+def test_chunk_windows_match_connector_hop_padding_and_lookahead():
+    adapter = SingleStageAdapter(6561, chunk_size=4, lookahead=3)
+    key = ("a", 1)
+    adapter.initialize(key, _conditioning(), torch.arange(40).reshape(1, -1))
     items = []
-    for value in range(40):
-        item = _prepare(adapter, "a", value, position=value)
+    for length in range(1, 41):
+        item = adapter.prepare(key, length, final=False)
         if item is not None:
             # Input storage may be reused for subsequent appends; take a test snapshot.
             items.append((item["token"].tolist(), item["token_offset_tokens"], item["finalize"]))
-    final = _prepare(adapter, "a", 6562, position=40)
+    final = adapter.prepare(key, 40, final=True)
     assert [(len(tokens[0]), offset, end) for tokens, offset, end in items] == [
         (8, 0, False),
         (16, 5, False),
@@ -63,31 +41,34 @@ def test_inner_windows_match_connector_hop_padding_and_lookahead():
 
 
 def test_request_state_and_decoder_cache_are_isolated_and_released():
-    adapter = InnerStageAdapter(6561, chunk_size=1, lookahead=0)
-    a = _prepare(adapter, "a", 7)
-    b = _prepare(adapter, "b", 9)
+    adapter = SingleStageAdapter(6561, chunk_size=1, lookahead=0)
+    a_key, b_key = ("a", 1), ("b", 2)
+    adapter.initialize(a_key, _conditioning(), torch.tensor([[7]]))
+    adapter.initialize(b_key, _conditioning(), torch.tensor([[9]]))
+    a = adapter.prepare(a_key, 1, final=False)
+    b = adapter.prepare(b_key, 1, final=False)
     cache = {"mel": torch.ones(1, 80, 2)}
-    adapter.apply_result("a", cache)
-    assert adapter.states["a"].cache is cache
-    assert adapter.states["b"].cache is None
+    adapter.apply_result(a_key, cache)
+    assert adapter.states[a_key].cache is cache
+    assert adapter.states[b_key].cache is None
     assert a["token"].tolist() == [[7]]
     assert b["token"].tolist() == [[9]]
-    adapter.finish_requests({"a"})
-    assert set(adapter.states) == {"b"}
-    # A reused request ID starts with fresh tokens and no vocoder state.
-    a = _prepare(adapter, "a", 11)
+    adapter.finish_requests({a_key})
+    assert set(adapter.states) == {b_key}
+    reused = ("a", 3)
+    adapter.initialize(reused, _conditioning(), torch.tensor([[11]]))
+    a = adapter.prepare(reused, 1, final=False)
     assert a["token"].tolist() == [[11]]
     assert a["cache_state"] is None
 
 
 def test_prompt_padding_is_removed_before_window_alignment():
-    adapter = InnerStageAdapter(6561, chunk_size=4, lookahead=0)
+    adapter = SingleStageAdapter(6561, chunk_size=4, lookahead=0)
     conditioning = _conditioning(8)
     conditioning["speech_token_len"] = torch.tensor([[3]])
-    for value in range(5):
-        item = _decode_step(
-            adapter, "a", torch.tensor([value]), value, conditioning, capacity=16, max_tokens=16, position=value
-        )
+    key = ("a", 1)
+    adapter.initialize(key, conditioning, torch.arange(5).reshape(1, -1))
+    item = adapter.prepare(key, 5, final=False)
     assert item is not None
     assert item["prompt_token"].shape == (1, 3)
     assert item["prompt_feat"].shape == (1, 6, 80)

@@ -834,7 +834,7 @@ class CosyVoice3Model(
             # Keep additional information synchronized for async_chunk updates.
             self.enable_update_additional_information = True
 
-            self._cross_stage_adapter = CrossStageAdapter(
+            self.cross_stage_adapter = CrossStageAdapter(
                 int(self.config.sample_rate), int(self.code2wav.input_embedding.num_embeddings)
             )
         else:
@@ -871,7 +871,7 @@ class CosyVoice3Model(
 
     def on_requests_finished(self, request_ids: set[str]) -> None:
         """Release per-request vocoder state on completion, cancellation or error."""
-        adapter = getattr(self, "_cross_stage_adapter", None)
+        adapter = getattr(self, "cross_stage_adapter", None)
         if adapter is not None:
             adapter.finish_requests(request_ids)
 
@@ -1546,7 +1546,7 @@ class CosyVoice3Model(
                 runtime_info = kwargs.get("runtime_additional_information", [])
             if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
                 logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
-            adapter = self._cross_stage_adapter
+            adapter = self.cross_stage_adapter
             return adapter.forward(self.code2wav, input_ids, runtime_info, kwargs.get("seq_token_counts"))
 
         else:

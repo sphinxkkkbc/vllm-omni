@@ -9,7 +9,7 @@ import torch
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.cosyvoice3.async_codec import AsyncCodec, SampleEntry
-from vllm_omni.model_executor.models.cosyvoice3.pipeline_adapter import InnerStageAdapter
+from vllm_omni.model_executor.models.cosyvoice3.pipeline_adapter import SingleStageAdapter
 
 pytestmark = [
     pytest.mark.core_model,
@@ -26,7 +26,7 @@ class Decoder:
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_codec_progresses_and_flushes_eos_without_another_ar_step(monkeypatch):
     monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", "0")
-    adapter = InnerStageAdapter(100, chunk_size=2, lookahead=0)
+    adapter = SingleStageAdapter(100, chunk_size=2, lookahead=0)
     worker = AsyncCodec(SimpleNamespace(code2wav=Decoder()), adapter, torch.device("cuda", 0), 32, 4)
     generation = worker.register("r")
     conditioning = {
@@ -69,7 +69,7 @@ def test_ar_can_append_on_another_stream_while_codec_is_busy(monkeypatch):
             return super().forward_streaming(token, finalize, **kwargs)
 
     worker = AsyncCodec(
-        SimpleNamespace(code2wav=SlowDecoder()), InnerStageAdapter(100, 2, 0), torch.device("cuda", 0), 64, 1
+        SimpleNamespace(code2wav=SlowDecoder()), SingleStageAdapter(100, 2, 0), torch.device("cuda", 0), 64, 1
     )
     generation = worker.register("r")
     conditioning = {
@@ -113,8 +113,8 @@ def test_ar_can_append_on_another_stream_while_codec_is_busy(monkeypatch):
         producer.start()
         assert produced.wait(5), "AR waited for codec to drain step notifications"
         assert not errors
-        with worker._lock:
-            assert len(worker._mailbox) == 1
+        with worker.lock:
+            assert len(worker.mailbox) == 1
         resume.set()
         chunks = []
         while not chunks or not chunks[-1].final:
@@ -133,7 +133,7 @@ def test_ar_can_append_on_another_stream_while_codec_is_busy(monkeypatch):
 def test_source_row_selection_does_not_upload_indices_or_synchronize():
     """Check CUDA API events inside producer submission, not profiler teardown."""
     worker = AsyncCodec(
-        SimpleNamespace(code2wav=Decoder()), InnerStageAdapter(100, 64, 0), torch.device("cuda", 0), 32, 1
+        SimpleNamespace(code2wav=Decoder()), SingleStageAdapter(100, 64, 0), torch.device("cuda", 0), 32, 1
     )
     generations = [worker.register(req_id) for req_id in ("a", "b")]
     conditioning = {
@@ -170,7 +170,7 @@ def test_source_row_selection_does_not_upload_indices_or_synchronize():
         assert "cudaStreamSynchronize" not in names
         assert "cudaDeviceSynchronize" not in names
         tokens.fill_(999)  # Reusing graph output storage must not overwrite owned tokens.
-        assert worker._buffers[("a", generations[0])].tokens[:, :2].cpu().tolist() == [[29, 29]]
-        assert worker._buffers[("b", generations[1])].tokens[:, :2].cpu().tolist() == [[13, 13]]
+        assert worker.buffers[("a", generations[0])].tokens[:, :2].cpu().tolist() == [[29, 29]]
+        assert worker.buffers[("b", generations[1])].tokens[:, :2].cpu().tolist() == [[13, 13]]
     finally:
         worker.close()

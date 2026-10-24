@@ -344,14 +344,14 @@ class CosyVoice3Code2Wav(nn.Module):
         new_state = {
             "mel": (
                 f0_input_mel.detach().clone()
-                if cosyvoice3_packed_streaming_enabled() or getattr(self, "_keep_stream_cache_on_device", False)
+                if cosyvoice3_packed_streaming_enabled() or getattr(self, "keep_stream_cache_on_device", False)
                 else f0_input_mel.detach().cpu().contiguous()
             ),
             "mel_offset": window_offset - f0_margin,
             "phase_acc": (
                 (
                     new_phase_acc.detach().clone()
-                    if cosyvoice3_packed_streaming_enabled() or getattr(self, "_keep_stream_cache_on_device", False)
+                    if cosyvoice3_packed_streaming_enabled() or getattr(self, "keep_stream_cache_on_device", False)
                     else new_phase_acc.detach().cpu().contiguous()
                 )
                 if new_phase_acc is not None
@@ -396,7 +396,7 @@ class CosyVoice3Code2Wav(nn.Module):
                     group.sort(key=lambda pair: pair[1]["token"].shape[1] + pair[1]["prompt_token"].shape[1])
                 for start in range(0, len(group), 8):
                     chunk = group[start : start + 8]
-                    for row, speech, cache in self._iter_packed_streaming_batch(
+                    for row, speech, cache in self.iter_packed_streaming_batch(
                         [item for _, item in chunk], n_timesteps=n_timesteps
                     ):
                         yield chunk[row][0], speech, cache
@@ -606,10 +606,10 @@ class CosyVoice3Code2Wav(nn.Module):
                 ):
                     outputs[index] = speech
             return cast(list[torch.Tensor] | list[tuple[torch.Tensor, StreamingHiFTState | None]], outputs)
-        feat, lengths, prompt_lengths = self._flow_batch_mels(items, n_timesteps, stream_items=stream_items)
+        feat, lengths, prompt_lengths = self.flow_batch_mels(items, n_timesteps, stream_items=stream_items)
         if stream_items:
             return [
-                (speech, cache) for _, speech, cache in self._iter_streaming_hift(items, feat, lengths, prompt_lengths)
+                (speech, cache) for _, speech, cache in self.iter_streaming_hift(items, feat, lengths, prompt_lengths)
             ]
         hift_weight = self.hift.m_source.l_linear.weight
         if cosyvoice3_full_response_enabled():
@@ -640,7 +640,7 @@ class CosyVoice3Code2Wav(nn.Module):
             results.append(speech)
         return results
 
-    def _flow_batch_mels(
+    def flow_batch_mels(
         self, items: list[StreamingFlowItem], n_timesteps: int, *, stream_items: bool
     ) -> tuple[torch.Tensor, list[int], list[int]]:
         flow = self.flow_model
@@ -716,13 +716,14 @@ class CosyVoice3Code2Wav(nn.Module):
             )
         return feat, lengths, prompt_lengths
 
-    def _iter_packed_streaming_batch(
+    def iter_packed_streaming_batch(
         self, items: list[StreamingFlowItem], *, n_timesteps: int
     ) -> Iterator[tuple[int, torch.Tensor, StreamingHiFTState | None]]:
-        feat, lengths, prompt_lengths = self._flow_batch_mels(items, n_timesteps, stream_items=True)
-        yield from self._iter_streaming_hift(items, feat, lengths, prompt_lengths)
+        """Keep Flow features alive until every request has consumed its slice."""
+        feat, lengths, prompt_lengths = self.flow_batch_mels(items, n_timesteps, stream_items=True)
+        yield from self.iter_streaming_hift(items, feat, lengths, prompt_lengths)
 
-    def _iter_streaming_hift(
+    def iter_streaming_hift(
         self, items: list[StreamingFlowItem], feat: torch.Tensor, lengths: list[int], prompt_lengths: list[int]
     ) -> Iterator[tuple[int, torch.Tensor, StreamingHiFTState | None]]:
         for row, item in enumerate(items):
