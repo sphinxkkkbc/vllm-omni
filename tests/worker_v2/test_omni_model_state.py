@@ -19,7 +19,6 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
-from vllm_omni.utils.device_copy import DeviceStager
 from vllm_omni.worker_v2.model_states.mtp_model_state import FrameBatch
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState, _make_safe_get_rope
 
@@ -92,14 +91,8 @@ def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, hav
     state.device = torch.device("cpu")
     state.model.has_talker_mtp = False
     state._mtp_state = MTPState(state)
+    # Individual tests install their model hook after constructing the fixture.
     state._mtp_state._raw_mtp = None
-    state._mtp_state._mtp_generators = {}
-    state._mtp_state._mtp_seeded = set()
-    state._mtp_state._mtp_replays = {}
-    state._mtp_state._stage_offsets = DeviceStager()
-    state._mtp_state._mtp_runner = None
-    for name in ("_mtp_input_ids", "_mtp_input_embeds", "_mtp_hidden", "_mtp_text_step", "_mtp_offsets"):
-        setattr(state._mtp_state, name, None)
     return state
 
 
@@ -267,7 +260,7 @@ def test_decode_cohort_uses_batch_hook(hook_name):
         seen_text_steps.append(text_steps)
 
     state._has_mtp = True
-    state._mtp_state._apply_eager_frames = capture
+    state._mtp_state.apply_frame_embeddings = capture
     model_inputs = {
         "input_ids": torch.tensor([101, 202], dtype=torch.long),
         "inputs_embeds": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
@@ -722,14 +715,11 @@ def test_eager_mtp_publishes_frames_in_the_step_that_sampled_cb0():
     text_hidden = torch.arange(5 * _EAGER_DIM, dtype=torch.float32).reshape(5, _EAGER_DIM)
     sampled = torch.tensor([[7], [_EOS], [9]])
     outputs = _eager_outputs(5)
+    original_hidden = text_hidden.clone()
 
-    state.post_sample(
-        batch,
-        text_hidden,
-        sampled,
-        outputs,
-    )
+    state.post_sample(batch, text_hidden, sampled, outputs)
 
+    torch.testing.assert_close(text_hidden, original_hidden)
     ids, hidden, text_step = state.model.mtp_calls[0]
     assert ids.tolist() == [7, _EOS, 9]
     # The frame's hidden is this step's last-token hidden of each span.
@@ -753,12 +743,7 @@ def test_eager_mtp_ignores_rows_recorded_for_another_batch():
     _fill_buffers(state, "r0")
     state._mtp_state.recorded = (_EagerBatch([1]), FrameBatch([(0, 0, "r0", False)]), torch.tensor([5]))
     outputs = _eager_outputs(1)
-    state.post_sample(
-        _EagerBatch([1]),
-        torch.zeros(1, _EAGER_DIM),
-        torch.tensor([[3]]),
-        outputs,
-    )
+    state.post_sample(_EagerBatch([1]), torch.zeros(1, _EAGER_DIM), torch.tensor([[3]]), outputs)
     assert state.model.mtp_calls == []
     assert not outputs["codes"]["audio"].any()
 
@@ -769,12 +754,7 @@ def test_eager_mtp_requires_retained_frame_outputs():
     batch = _EagerBatch([1])
     state._mtp_state.recorded = (batch, FrameBatch([(0, 0, "r0", False)]), torch.tensor([5]))
     with pytest.raises(RuntimeError, match="requires retained codes.audio"):
-        state.post_sample(
-            batch,
-            torch.zeros(1, _EAGER_DIM),
-            torch.tensor([[3]]),
-            {"codes": {"audio": None}},
-        )
+        state.post_sample(batch, torch.zeros(1, _EAGER_DIM), torch.tensor([[3]]), {"codes": {"audio": None}})
 
 
 def test_eager_decode_input_is_previous_frame_plus_text_step():
@@ -786,7 +766,7 @@ def test_eager_decode_input_is_previous_frame_plus_text_step():
     embeds = torch.zeros((2, _EAGER_DIM))
     batches = [(0, 0), (1, 1)]
     text_steps = torch.stack([torch.full((_EAGER_DIM,), 2.0), torch.ones(_EAGER_DIM)])
-    state._mtp_state._apply_eager_frames(batches, embeds, _EagerBatch([1, 1]), text_steps)
+    state._mtp_state.apply_frame_embeddings(batches, embeds, _EagerBatch([1, 1]), text_steps)
     assert embeds.tolist() == [[7.0] * _EAGER_DIM, [8.0] * _EAGER_DIM]
     # The deferred MTP must not run for an eager decode row.
     assert state.model.mtp_calls == []
@@ -797,7 +777,7 @@ def test_eager_decode_without_a_frame_fails_loudly():
     _fill_buffers(state, "r0")
     batches = [(0, 0)]
     with pytest.raises(RuntimeError, match="frame missing"):
-        state._mtp_state._apply_eager_frames(
+        state._mtp_state.apply_frame_embeddings(
             batches, torch.zeros((1, _EAGER_DIM)), _EagerBatch([1]), torch.zeros(1, _EAGER_DIM)
         )
 
@@ -884,12 +864,7 @@ def test_first_audio_requirement_survives_eos_only_if_audio_was_queued(first_was
     state._mtp_state.recorded = (batch, FrameBatch([(0, 0, "r0", False)]), torch.tensor([5]))
     outputs = _eager_outputs(1)
     outputs["meta"]["first_audio"] = torch.zeros(1, dtype=torch.bool)
-    state.post_sample(
-        batch,
-        torch.zeros(1, _EAGER_DIM),
-        torch.tensor([[_EOS]]),
-        outputs,
-    )
+    state.post_sample(batch, torch.zeros(1, _EAGER_DIM), torch.tensor([[_EOS]]), outputs)
     assert outputs["meta"]["first_audio"].tolist() == [first_was_valid]
 
 
@@ -916,12 +891,7 @@ def test_first_audio_marker_requires_accepted_delivery(monkeypatch, accepted):
     outputs = _eager_outputs(2)
     outputs["meta"]["first_audio"] = torch.zeros(2, dtype=torch.bool)
 
-    state.post_sample(
-        batch,
-        torch.zeros(2, _EAGER_DIM),
-        torch.tensor([[7], [8]]),
-        outputs,
-    )
+    state.post_sample(batch, torch.zeros(2, _EAGER_DIM), torch.tensor([[7], [8]]), outputs)
 
     assert state._mtp_state.first_audio_requests == set(accepted)
     # A missing route must leave the normal codec path responsible for frame 0;
@@ -1074,21 +1044,6 @@ def test_mm_embeddings_exclude_zero_length_graph_padding_rows():
 
 
 @pytest.mark.cpu
-def test_post_sample_preserves_hidden_and_publishes_valid_frame():
-    state = _make_mtp_state()
-    _fill_buffers(state, "decode")
-    batch = _EagerBatch([1])
-    state._mtp_state.recorded = (batch, FrameBatch([(0, 0, "decode", False)]), torch.tensor([7]))
-    hidden = torch.arange(_EAGER_DIM, dtype=torch.float32).reshape(1, -1)
-    original_hidden = hidden.clone()
-    outputs = _eager_outputs(1)
-    state.post_sample(batch, hidden, torch.tensor([[8]]), outputs)
-    assert outputs["meta"]["codec_frame_valid"].tolist() == [1]
-    torch.testing.assert_close(hidden, original_hidden)
-    assert state._mtp_state.ready == {0: "decode"}
-
-
-@pytest.mark.cpu
 def test_post_sample_rejects_multi_token_sampling():
     state = _make_mtp_state()
     _fill_buffers(state, "decode")
@@ -1131,7 +1086,6 @@ def test_declared_mtp_defaults_to_current_step_without_first_audio(monkeypatch, 
     assert state._mtp_state._mtp_hidden.shape == (2, 4)
     assert state._mtp_state.embeds.shape == (2, 4)
     assert state._mtp_state.first_audio_sender is None
-    assert not hasattr(state, "_mtp_generators")
 
 
 @pytest.mark.cpu

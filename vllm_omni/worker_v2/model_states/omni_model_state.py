@@ -613,7 +613,7 @@ class OmniModelState(DefaultModelState):
             embeds[:num_active_tokens].copy_(token_embeds)
 
         gpu_keys: set[str] = getattr(self.model, "gpu_resident_buffer_keys", set())
-        mtp_batches: list[tuple[int, int]] = []
+        decode_mtp_rows: list[tuple[int, int]] = []
         text_step_batches: list[torch.Tensor] = []
 
         req_indices = np.asarray(input_batch.idx_mapping_np[: input_batch.num_reqs]).tolist()
@@ -795,12 +795,10 @@ class OmniModelState(DefaultModelState):
                 updates_by_req,
                 gpu_keys,
             )
-            for entry in decode_entries:
-                i, _req_idx, start, _n_tok, _info, _is_prefill = entry
-                mtp_batches.append((i, start))
+            for entry, updates in zip(decode_entries, updates_by_req, strict=True):
+                i, req_idx, start, _, _, _ = entry
+                decode_mtp_rows.append((i, start))
                 batched_indices.add(i)
-            state_updates = [(entry[1], updates) for entry, updates in zip(decode_entries, updates_by_req, strict=True)]
-            for req_idx, updates in state_updates:
                 self.intermediate_buffer.update(req_idx, updates, gpu_keys)
             text_step_batches.append(batch_text_step.reshape(batch_size, -1))
 
@@ -819,10 +817,11 @@ class OmniModelState(DefaultModelState):
             if self._preprocess_result_needs_writeback(emb_slice, new_emb):
                 embeds[start : start + seg] = new_emb[:seg]
 
-            # Collect MTP inputs for decode steps (n_tok == 1 with mtp_inputs)
+            # Existing model hooks return (past hidden, text contribution).
+            # Current-step MTP only needs the text contribution here.
             mtp_inputs = updates.pop("mtp_inputs", None)
             if mtp_inputs is not None and n_tok == 1:
-                mtp_batches.append((i, start))
+                decode_mtp_rows.append((i, start))
                 text_step_batches.append(mtp_inputs[1].reshape(1, -1))
 
             # A model declaring fresh prefill outputs skips the per-request snapshot copies.
@@ -837,10 +836,10 @@ class OmniModelState(DefaultModelState):
                         self._mtp_state.mark_settled(req_idx, buf["req_id"])
             if settled_rows:
                 self._mtp_state._apply_settled_frames(settled_rows, embeds)
-        if mtp_batches and self._has_mtp:
+        if decode_mtp_rows and self._has_mtp:
             text_steps = text_step_batches[0] if len(text_step_batches) == 1 else torch.cat(text_step_batches, dim=0)
-            self._mtp_state._apply_eager_frames(mtp_batches, embeds, input_batch, text_steps)
-        elif mtp_batches:
+            self._mtp_state.apply_frame_embeddings(decode_mtp_rows, embeds, input_batch, text_steps)
+        elif decode_mtp_rows:
             raise RuntimeError(
                 "Deferred MTP is not supported by OmniModelState; declare has_talker_mtp "
                 "for current-step MTP or implement model-specific input preparation."

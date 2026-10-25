@@ -134,7 +134,7 @@ def test_first_prefill_through_runner_preserves_parent_eager_contract(monkeypatc
 
     def initialize_parent(state, *args):
         state.__dict__.update(template.__dict__)
-        state._has_mtp, state._eager_rows = False, None
+        state._has_mtp = False
         state._mtp_state.owner = state
 
     monkeypatch.setattr(OmniModelState, "__init__", initialize_parent)
@@ -186,5 +186,5 @@ def test_first_prefill_through_runner_preserves_parent_eager_contract(monkeypatc
 
     assert runner.sample_tokens(None) is mock_out
     hook.assert_called_once()
-    assert state._has_mtp is False and state._eager_rows is None
+    assert state._has_mtp is False
     assert state._local_eager_mtp is True

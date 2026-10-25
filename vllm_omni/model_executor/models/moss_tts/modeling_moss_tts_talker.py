@@ -1720,8 +1720,8 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
     get_mtp_seed = staticmethod(get_tts_local_seed)
 
     def create_mrv2_model_state(self, vllm_config, encoder_cache, device):
-        # Continuation controls primary-token sampling, so Local owns its
-        # pre-sampling MTP schedule rather than the generic post-sample path.
+        # MRV2 always uses Local's dedicated request-slot state. Continuation
+        # controls primary-token sampling, so Local owns its MTP schedule.
         from .local_model_state import MossLocalModelState
 
         return MossLocalModelState(vllm_config, self, encoder_cache, device)
@@ -1883,7 +1883,6 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         if (
             model_config.use_v2_model_runner
             and model_config.async_chunk
-            and getattr(self.config, "mrv2_gpu_slot_state", False)
             and supports_in_process_first_audio(self.vllm_config)
         ):
             from .first_frame_decoder import MossFirstFrameDecoder

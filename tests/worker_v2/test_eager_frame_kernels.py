@@ -167,7 +167,6 @@ def test_codec_direct_inputs_wait_for_slow_side_stream():
     owner.device = torch.device("cpu")
     owner.model.has_talker_mtp = False
     state = MTPState(owner)
-    state._raw_mtp = None
     for name in ("_mtp_input_ids", "_mtp_input_embeds", "_mtp_hidden", "_mtp_text_step"):
         shape = (n,) if name == "_mtp_input_ids" else (n, hidden)
         setattr(state, name, torch.zeros(shape, device=device, dtype=torch.long if len(shape) == 1 else torch.float32))
@@ -219,7 +218,6 @@ def test_batched_history_recording_preserves_ragged_reordered_requests():
     owner.device = torch.device("cpu")
     owner.model.has_talker_mtp = False
     state = MTPState(owner)
-    state._raw_mtp = None
     counts = np.ones(n, dtype=np.int64)
     counts[:2] = [3, 0]
     starts = np.concatenate(([0], counts.cumsum()))

@@ -629,7 +629,6 @@ def test_stream_audio_prefill_length_end_reaches_output(mocker) -> None:
     owner.device = torch.device("cpu")
     owner.model.has_talker_mtp = False
     eager = MTPState(owner)
-    eager._raw_mtp = None
     eager.decode_event = None
     eager._audio_buffer = StreamingAudioBuffer(4, 25)
     eager._audio_buffer.add("request")
@@ -666,7 +665,6 @@ def test_stream_audio_preemption_preserves_position_rng_and_pending_pcm(mocker) 
     owner.device = torch.device("cpu")
     owner.model.has_talker_mtp = False
     eager = MTPState(owner)
-    eager._raw_mtp = None
     owner._mtp_state = eager
     eager._mtp_generators = {"request": generator}
     eager.stream_pos = {"request": 37}
@@ -704,7 +702,6 @@ def test_stream_audio_replay_uses_exact_inputs_and_consumes_last_frame_once(mock
     owner.device = torch.device("cpu")
     owner.model.has_talker_mtp = False
     eager = MTPState(owner)
-    eager._raw_mtp = None
     eager.embeds = torch.tensor([[20.0, 30.0]])
     eager._restore_audio["request"] = []
     history = torch.arange(8).reshape(4, 2).float()
@@ -810,7 +807,6 @@ def test_stream_audio_history_replays_exact_inputs_after_batch_reordering(mocker
     owner.device = torch.device("cpu")
     owner.model.has_talker_mtp = False
     eager = MTPState(owner)
-    eager._raw_mtp = None
     eager.embeds = torch.zeros(2, 3)
     first = torch.arange(9, dtype=torch.float32).reshape(3, 3)
     second = torch.arange(9, 18, dtype=torch.float32).reshape(3, 3)
@@ -993,7 +989,6 @@ def test_stream_history_allocates_only_for_scheduled_requests():
     owner.device = torch.device("cpu")
     owner.model.has_talker_mtp = False
     state = MTPState(owner)
-    state._raw_mtp = None
     embeds = torch.arange(4).reshape(1, 4).float()
     state.record_inputs(batch, embeds)
     history = state._talker_inputs["request"]

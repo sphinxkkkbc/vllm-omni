@@ -15,7 +15,6 @@ from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import MossTTSLocalTalkerForGeneration
 from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot
-from vllm_omni.utils.device_copy import DeviceStager
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState
@@ -112,22 +111,13 @@ def _state(cls, device):
     state.vllm_config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=4096, logits_processors=None))
     state.intermediate_buffer = OmniIntermediateBuffer(5)
     state._embed_dim = 0
-    state.device = torch.device("cpu")
     state.model.has_talker_mtp = False
     state._mtp_state = MTPState(state)
-    state._mtp_state._raw_mtp = None
     state._static_inputs_embeds = torch.zeros(16, 4, device=device, dtype=state.dtype)
     state._mtp_state._mtp_input_ids = torch.zeros(5, device=device, dtype=torch.long)
     state._mtp_state._mtp_offsets = torch.zeros(5, device=device, dtype=torch.long)
     for name in ("_mtp_input_embeds", "_mtp_hidden", "_mtp_text_step"):
         setattr(state._mtp_state, name, torch.zeros(5, 4, device=device, dtype=state.dtype))
-    state._mtp_state._mtp_runner = state._mtp_state._mtp_sample_uniforms = None
-    state._mtp_state._mtp_generators = {}
-    state._mtp_state._mtp_seeded = set()
-    state._mtp_state._mtp_replays = {}
-    state._mtp_state._stage_offsets = DeviceStager()
-    state._stream_pos = {}
-    state._stream_decode_event = None
     if cls is MossLocalModelState:
         state._init_slot_buffers(5, 4, device, state.dtype)
         state._uva, state._pending_resets, state._partitioned_rows = None, [], False
@@ -252,9 +242,8 @@ def test_slot_honors_external_stopping_control(device):
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("state_cls", [OmniModelState, MossLocalModelState])
-def test_local_seeded_mtp_keeps_per_row_generators_in_one_batch(state_cls):
-    state = _state(state_cls, torch.device("cpu"))
+def test_local_seeded_mtp_keeps_per_row_generators_in_one_batch():
+    state = _state(MossLocalModelState, torch.device("cpu"))
     generators = [torch.Generator().manual_seed(seed) for seed in (17, 29)]
     inputs = [torch.zeros(2, dtype=torch.long), *[torch.ones(2, 4) for _ in range(3)]]
     frame = MagicMock(wraps=state.model.local_transformer.generate_frame)
@@ -285,10 +274,10 @@ def test_slot_mtp_graph_padding_reorder_and_owned_output():
             _admit(state, slot, f"req{slot}", None)
     candidate = states[1]
     buffers = [
-        candidate._mtp_input_ids[:4],
-        candidate._mtp_input_embeds[:4],
-        candidate._mtp_hidden[:4],
-        candidate._mtp_text_step[:4],
+        candidate._mtp_state._mtp_input_ids[:4],
+        candidate._mtp_state._mtp_input_embeds[:4],
+        candidate._mtp_state._mtp_hidden[:4],
+        candidate._mtp_state._mtp_text_step[:4],
     ]
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -306,8 +295,8 @@ def test_slot_mtp_graph_padding_reorder_and_owned_output():
         graph.replay()
         return graph_output
 
-    candidate._mtp_runner = replay
-    candidate._is_mtp_graph_runner = lambda: True
+    candidate._mtp_state._mtp_runner = replay
+    candidate._mtp_state._is_mtp_graph_runner = lambda: True
     from vllm.config import CUDAGraphMode
 
     def dispatcher(bsz):
@@ -356,11 +345,10 @@ def test_factory_requires_explicit_class_capability_and_valid_state(monkeypatch)
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("enabled", [False, True])
-def test_local_factory_default_and_option(monkeypatch, enabled):
+def test_local_factory_uses_dedicated_state(monkeypatch):
     monkeypatch.setattr(OmniModelState, "__init__", lambda *args: None)
     monkeypatch.setattr(MossLocalModelState, "__init__", lambda *args: None)
     model = _model(torch.device("cpu"))
-    model.config = SimpleNamespace(mrv2_gpu_slot_state=enabled)
+    model.config = SimpleNamespace()
     state = init_omni_model_state(None, model, None, torch.device("cpu"))
     assert type(state) is MossLocalModelState

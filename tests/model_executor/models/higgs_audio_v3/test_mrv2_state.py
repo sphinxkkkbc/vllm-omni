@@ -35,12 +35,10 @@ def make_state():
         _audio_continuation_id=99,
         update_decode_step_metadata=Mock(),
     )
-    state._stream_pos = {}
     state._embed_dim = 0
     state.device = torch.device("cpu")
     state.model.has_talker_mtp = False
     state._mtp_state = MTPState(state)
-    state._mtp_state._raw_mtp = None
     return state
 
 

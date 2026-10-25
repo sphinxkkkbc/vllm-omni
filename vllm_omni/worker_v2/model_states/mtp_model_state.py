@@ -89,7 +89,6 @@ class MTPState:
 
     def __init__(self, owner: OmniModelState) -> None:
         self.owner = owner
-        self._raw_mtp: Callable | None = None
         self._mtp_generators: dict[str, torch.Generator | None] = {}
         self._mtp_seeded: set[str] = set()
         self.embeds: torch.Tensor | None = None
@@ -133,7 +132,7 @@ class MTPState:
         # Captured whole-MTP graph entry per batch size, once a replay through
         # the wrapper has resolved it: (padded rows, entry).
         self._mtp_replays: dict[int, tuple[int, Any]] = {}
-        self._raw_mtp = getattr(model, "mtp", None)
+        self._raw_mtp: Callable | None = getattr(model, "mtp", None)
         if not callable(self._raw_mtp) and getattr(model, "has_talker_mtp", False):
             self._raw_mtp = getattr(model, "talker_mtp", None)
         if getattr(model, "has_talker_mtp", False) and (not callable(self._raw_mtp) or self.owner._embed_dim <= 0):
@@ -357,15 +356,15 @@ class MTPState:
 
         self.first_audio_sender = FirstAudioSender(sink)
 
-    def _apply_eager_frames(
+    def apply_frame_embeddings(
         self,
-        mtp_batches: list[tuple[int, int]],
+        decode_mtp_rows: list[tuple[int, int]],
         embeds: torch.Tensor,
         input_batch: InputBatch,
         text_steps: torch.Tensor,
     ) -> None:
-        """Decode input = codec embeddings of the previous (eager) frame + this step's text."""
-        req_indices = [int(input_batch.idx_mapping_np[i]) for i, _start in mtp_batches]
+        """Compose backbone decode inputs from cached frame and current text embeddings."""
+        req_indices = [int(input_batch.idx_mapping_np[i]) for i, _start in decode_mtp_rows]
         for req_idx in req_indices:
             req_id = self.owner.intermediate_buffer.buffers[req_idx].get("req_id")
             if self.ready.get(req_idx) != req_id:
@@ -373,9 +372,9 @@ class MTPState:
                 raise RuntimeError(f"Eager Talker-MTP frame missing for request {req_id!r}")
         assert self.embeds is not None
         device = embeds.device
-        text_step = text_steps.reshape(len(mtp_batches), -1)
+        text_step = text_steps.reshape(len(decode_mtp_rows), -1)
         rows = self._stage_eager(req_indices, device)
-        offsets = self._mtp_batch_offsets(mtp_batches, input_batch, device)
+        offsets = self._decode_mtp_offsets(decode_mtp_rows, input_batch, device)
         frame_embeds = self.embeds.index_select(0, rows)
         embeds.index_copy_(0, offsets, (frame_embeds + text_step.to(frame_embeds.dtype)).to(embeds.dtype))
 
@@ -417,8 +416,6 @@ class MTPState:
         for the next step's input. Issued on the main stream before the async
         output copy, so no extra synchronization is needed.
         """
-        if not self.owner._has_mtp:
-            return
         recorded, self.recorded = self.recorded, None
         if recorded is None or recorded[0] is not input_batch or not recorded[1]:
             return
@@ -863,9 +860,9 @@ class MTPState:
             reverse=True,
         )
 
-    def _mtp_batch_offsets(
+    def _decode_mtp_offsets(
         self,
-        mtp_batches: list[tuple[int, int]],
+        decode_mtp_rows: list[tuple[int, int]],
         input_batch: InputBatch,
         device: torch.device,
     ) -> torch.Tensor:
@@ -877,7 +874,7 @@ class MTPState:
         rebuilding it from a Python list creates a small synchronous H2D
         transfer on every decode step.
         """
-        bsz = len(mtp_batches)
+        bsz = len(decode_mtp_rows)
         query_start_loc = getattr(input_batch, "query_start_loc", None)
         static_offsets = self._mtp_offsets
         if (
@@ -886,13 +883,13 @@ class MTPState:
             and isinstance(static_offsets, torch.Tensor)
             and static_offsets.device == device
             and bsz <= static_offsets.shape[0]
-            and all(batch_index == expected for expected, (batch_index, _start) in enumerate(mtp_batches))
+            and all(batch_index == expected for expected, (batch_index, _start) in enumerate(decode_mtp_rows))
         ):
             offsets = static_offsets[:bsz]
             offsets.copy_(query_start_loc[:bsz], non_blocking=True)
             return offsets
 
-        return self._stage_offsets([start for _i, start in mtp_batches], device)
+        return self._stage_offsets([start for _i, start in decode_mtp_rows], device)
 
     def _mtp_forward(
         self,
