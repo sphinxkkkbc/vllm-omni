@@ -53,7 +53,7 @@ def cpu_streams(monkeypatch):
 def run_step(state, batch, hidden, tokens, outputs):
     codec = state.codec
     codec.adapter = state.adapter
-    codec.model = state.model
+    codec.decoder = state.model.code2wav
     state.run_eager_mtp(batch, hidden, tokens, outputs)
     assert outputs == {}  # Producer never attaches pending audio to AR output.
     # Coalesced progress is consumed independently of producer notifications.
@@ -210,9 +210,7 @@ def test_producer_does_not_wait_for_a_busy_codec(monkeypatch, capacity):
                 assert torch.equal(token, prefix), "Producer overwrote a prefix being decoded"
             return token.float().reshape(1, 1, -1), None
 
-    worker = AsyncCodec(
-        SimpleNamespace(code2wav=SlowDecoder()), SingleStageAdapter(100, chunk_size=2, lookahead=0), "cpu", 64, capacity
-    )
+    worker = AsyncCodec(SlowDecoder(), SingleStageAdapter(100, chunk_size=2, lookahead=0), "cpu", 64, capacity)
     generation = worker.register("r")
     conditioning = {
         "speech_token": torch.empty(1, 0, dtype=torch.long),
@@ -274,7 +272,7 @@ def test_coalesced_length_stop_preserves_final_chunk_boundary():
 
     state, _, _, decoder = _fixture()
     codec = state.codec
-    codec.model = state.model
+    codec.decoder = state.model.code2wav
     codec.adapter = SingleStageAdapter(6561, chunk_size=2, lookahead=0)
     conditioning = {
         "speech_token": torch.empty(1, 0, dtype=torch.long),
@@ -300,7 +298,7 @@ def test_cancel_does_not_wait_for_control_copy_and_reuse_is_isolated():
 
     state, _, _, _ = _fixture()
     codec = state.codec
-    codec.model = state.model
+    codec.decoder = state.model.code2wav
     codec.adapter = state.adapter
     conditioning = {
         "speech_token": torch.empty(1, 0, dtype=torch.long),
@@ -311,7 +309,7 @@ def test_cancel_does_not_wait_for_control_copy_and_reuse_is_isolated():
     codec.start_reads()
     old = codec.reads[("decode", 2)]
     done = SimpleNamespace(value=False)
-    old.ready = SimpleNamespace(query=lambda: done.value)
+    old.copy_done = SimpleNamespace(query=lambda: done.value)
     codec.cancel("decode")
     codec.release("decode")
     codec.consume_retirements()
@@ -447,7 +445,7 @@ def test_per_request_d2h_owns_pcm_and_publishes_between_submissions(monkeypatch)
     monkeypatch.setattr(torch.cuda, "Event", PendingEvent)
     state, _, _, decoder = _fixture()
     codec = state.codec
-    codec.adapter, codec.model = state.adapter, state.model
+    codec.adapter, codec.decoder = state.adapter, state.model.code2wav
     conditioning = {
         "speech_token": torch.empty(1, 0, dtype=torch.long),
         "speech_feat": torch.empty(1, 0, 80),
@@ -460,7 +458,7 @@ def test_per_request_d2h_owns_pcm_and_publishes_between_submissions(monkeypatch)
     )
     codec.start_reads()
     for read in codec.reads.values():
-        read.ready.done = True
+        read.copy_done.done = True
     codec.poll_reads()
     shared = torch.ones(1, 1, 4)
 
@@ -469,10 +467,10 @@ def test_per_request_d2h_owns_pcm_and_publishes_between_submissions(monkeypatch)
             # A's copy was already queued before B's HiFT, without a GPU wait.
             assert len(codec.pending) == 1
             first = codec.pending[0]
-            assert codec.outputs.empty() and not first.ready.done
+            assert codec.outputs.empty() and not first.copy_done.done
             shared.fill_(2)  # Simulate a replay reusing its output allocation.
             assert first.source.tolist() == [1.0] * 4
-            first.ready.done = True
+            first.copy_done.done = True
         decoder.calls.append(kwargs)
         return shared, None
 
@@ -484,9 +482,9 @@ def test_per_request_d2h_owns_pcm_and_publishes_between_submissions(monkeypatch)
     assert first.pcm.tolist() == [1.0] * 4
     assert len(codec.pending) == 1
     final = codec.pending[0]
-    assert not final.ready.done
+    assert not final.copy_done.done
     assert final.source.tolist() == [2.0] * 4
-    final.ready.done = True
+    final.copy_done.done = True
     codec.publish()
     last = codec.outputs.get_nowait()
     assert last.request_id == "decode" and last.final

@@ -13,6 +13,7 @@ import threading
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -20,6 +21,9 @@ from vllm_omni.platforms import current_omni_platform
 
 from .cosyvoice3_code2wav import iter_decode_streaming_batch
 from .pipeline_adapter import CodecRequestKey, SingleStageAdapter
+
+if TYPE_CHECKING:
+    from .cosyvoice3_code2wav import CosyVoice3Code2Wav
 
 
 @dataclass
@@ -43,7 +47,7 @@ class TokenBuffer:
     conditioning: dict
     last_position: int = -1  # Producer-owned.
     limit_position: int | None = None
-    confirmed: int = 0  # Consumer-owned.
+    confirmed_end: int = 0  # Consumer-owned, exclusive end of confirmed validity bits.
 
 
 @dataclass
@@ -51,9 +55,9 @@ class TokenProgress:
     """Latest AR prefix and the GPU event that makes that prefix readable."""
 
     buffer: TokenBuffer
-    end: int
+    end: int  # Exclusive end of the published token prefix.
     limit_position: int | None
-    ready: torch.cuda.Event
+    producer_done: torch.cuda.Event
 
 
 @dataclass
@@ -62,17 +66,16 @@ class ControlRead:
 
     progress: TokenProgress
     start: int
-    ready: torch.cuda.Event
+    copy_done: torch.cuda.Event
 
 
 @dataclass
 class DecodeProgress:
-    """Confirmed prefix; nonfinal_length reserves the stop position for the tail."""
+    """Confirmed token prefix and optional EOS/length-limit token position."""
 
     buffer: TokenBuffer
     length: int
-    nonfinal_length: int
-    final: bool
+    stop_position: int | None
 
 
 @dataclass
@@ -88,7 +91,7 @@ class PendingAudio:
     """Retain GPU PCM until its pinned-host copy completes."""
 
     output: ReadyAudio
-    ready: torch.cuda.Event
+    copy_done: torch.cuda.Event
     source: torch.Tensor | None
 
 
@@ -100,8 +103,15 @@ class AsyncCodec:
     stay on the codec thread. Only completed D2H results enter outputs.
     """
 
-    def __init__(self, model, adapter: SingleStageAdapter, device, max_model_len: int, capacity: int):
-        self.model = model
+    def __init__(
+        self,
+        decoder: CosyVoice3Code2Wav,
+        adapter: SingleStageAdapter,
+        device,
+        max_model_len: int,
+        pending_audio_threshold: int,
+    ):
+        self.decoder = decoder
         self.adapter = adapter
         self.device = device
         self.max_model_len = max_model_len
@@ -109,7 +119,8 @@ class AsyncCodec:
         # Engine-owned request generations and append-only input buffers.
         self.generations: dict[str, int] = {}
         self.next_generation = 0
-        self.capacity = capacity  # Pending-audio threshold checked only when admitting a codec batch.
+        # Checked at batch admission; not a strict per-row bound.
+        self.pending_audio_threshold = pending_audio_threshold
         self.buffers: dict[CodecRequestKey, TokenBuffer] = {}
         # Cross-thread mailboxes coalesce updates instead of retaining steps.
         self.mailbox: dict[CodecRequestKey, TokenProgress] = {}
@@ -235,7 +246,7 @@ class AsyncCodec:
         # event completes, even if the request was cancelled in the meantime.
 
     def publish(self) -> None:
-        while self.pending and self.pending[0].ready.query():
+        while self.pending and self.pending[0].copy_done.query():
             audio = self.pending.popleft().output
             if (audio.request_id, audio.generation) not in self.cancelled:
                 self.outputs.put(audio)
@@ -256,8 +267,8 @@ class AsyncCodec:
                 if key in self.ended or key in self.cancelled:
                     continue
                 buffer = progress.buffer
-                start = buffer.confirmed
-                self.control_stream.wait_event(progress.ready)
+                start = buffer.confirmed_end
+                self.control_stream.wait_event(progress.producer_done)
                 buffer.speech.record_stream(self.control_stream)
                 buffer.host_speech[start : progress.end].copy_(buffer.speech[start : progress.end], non_blocking=True)
                 copied = torch.cuda.Event()
@@ -267,7 +278,7 @@ class AsyncCodec:
     def poll_reads(self) -> None:
         """Confirm EOS on the CPU only after its validity copy is complete."""
         for key, read in list(self.reads.items()):
-            if not read.ready.query():
+            if not read.copy_done.query():
                 continue
             del self.reads[key]
             if key in self.cancelled or key in self.released or key in self.ended:
@@ -281,13 +292,11 @@ class AsyncCodec:
             if eos is not None:
                 terminal = eos if limit is None else min(eos, limit)
             length = progress.end
-            nonfinal_length = length
             if terminal is not None:
                 length = terminal + int(values[terminal - read.start])
-                nonfinal_length = terminal
                 self.ended.add(key)
-            buffer.confirmed = progress.end
-            self.progress[key] = DecodeProgress(buffer, length, nonfinal_length, terminal is not None)
+            buffer.confirmed_end = progress.end
+            self.progress[key] = DecodeProgress(buffer, length, terminal)
 
     def decode_ready(self) -> bool:
         """Submit ready chunks and their D2H without waiting for GPU completion."""
@@ -303,19 +312,14 @@ class AsyncCodec:
                 continue
             for tensor in (state.prompt_token, state.prompt_feat, state.embedding):
                 tensor.record_stream(self.stream)
-            pad = (-state.prompt_token.shape[1]) % self.adapter.chunk_size if state.emitted == 0 else 0
-            threshold = state.emitted + state.hop + pad + self.adapter.lookahead
-            # Catch up through the original chunk ramp before emitting a tail.
-            # Coalescing notifications must not merge all pending chunks into one.
-            final = progress.final and progress.nonfinal_length < threshold
-            item = self.adapter.prepare(key, progress.length, final)
+            item = self.adapter.prepare(key, progress.length, progress.stop_position)
             if item is not None:
                 items.append(item)
-                bindings.append((key, final))
-            elif final and progress.length == 0:
+                bindings.append((key, item["finalize"]))
+            elif state.finished and progress.length == 0:
                 empty_finals.append(key)
         if items:
-            for index, wav, cache in iter_decode_streaming_batch(self.model.code2wav, items):
+            for index, wav, cache in iter_decode_streaming_batch(self.decoder, items):
                 key, final = bindings[index]
                 self.adapter.apply_result(key, cache)
                 # Snapshot before the next request can reuse graph output storage.
@@ -353,7 +357,7 @@ class AsyncCodec:
                     self.publish()
                     self.start_reads()
                     self.poll_reads()
-                    decoded = self.decode_ready() if len(self.pending) < self.capacity else False
+                    decoded = self.decode_ready() if len(self.pending) < self.pending_audio_threshold else False
                     with self.lock:
                         incoming = bool(self.mailbox or self.retirements)
                     if self.closed and not incoming and not self.reads and not self.pending and not decoded:

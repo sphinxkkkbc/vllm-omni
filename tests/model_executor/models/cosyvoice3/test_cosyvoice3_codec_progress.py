@@ -80,3 +80,55 @@ def test_list_api_restores_request_order_across_incremental_groups(monkeypatch, 
     assert [int(speech[0, 0, 0]) for speech, _ in outputs] == list(range(count))
     assert [cache is None for _, cache in outputs] == [i in (0, 2) for i in range(count)]
     assert all(len(tags) <= 8 for name, tags in model.calls if name == "flow")
+
+
+@pytest.mark.parametrize(
+    "batch_flow,packed,count",
+    [(False, True, 3), (True, False, 1), (True, False, 3), (True, True, 1), (True, False, 0)],
+)
+def test_collected_and_incremental_dispatch_share_policy_and_preserve_indices(monkeypatch, batch_flow, packed, count):
+    from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3_code2wav as module
+
+    monkeypatch.setattr(module, "cosyvoice3_batch_flow_enabled", lambda: batch_flow)
+    monkeypatch.setattr(module, "cosyvoice3_packed_inference_enabled", lambda: packed)
+    items = [
+        {
+            "token": torch.tensor([[index]]),
+            "prompt_token": torch.empty(1, 0, dtype=torch.long),
+            "prompt_feat": torch.empty(1, 0, 80),
+            "embedding": torch.ones(1, 192),
+            "cache_state": {"tag": index},
+            "finalize": index == count - 1,
+        }
+        for index in range(count)
+    ]
+    calls = []
+
+    class Decoder:
+        @torch.inference_mode()
+        def forward_streaming(self, *, token, cache_state, n_timesteps, **kwargs):
+            assert torch.is_inference_mode_enabled()
+            calls.append(("single", n_timesteps))
+            return token.float(), cache_state
+
+        @torch.inference_mode()
+        def iter_streaming_batch(self, batch, *, n_timesteps):
+            assert torch.is_inference_mode_enabled()
+            calls.append(("batch", n_timesteps))
+            # A backend may group/reorder computation but indices address the
+            # original inputs. Several yields can share one batched operation.
+            for index in reversed(range(len(batch))):
+                yield index, batch[index]["token"].float(), batch[index]["cache_state"]
+
+    decoder = Decoder()
+    collected = module.decode_streaming_batch(decoder, items, n_timesteps=7)
+    expected_calls = [("batch", 7)] if batch_flow and (packed or count > 1) else [("single", 7)] * count
+    assert calls == expected_calls
+    assert [int(pcm.item()) for pcm, _ in collected] == list(range(count))
+    assert [cache for _, cache in collected] == [item["cache_state"] for item in items]
+    calls.clear()
+    incremental = list(module.iter_decode_streaming_batch(decoder, items, n_timesteps=7))
+    assert calls == expected_calls
+    assert sorted((index, int(pcm.item()), cache["tag"]) for index, pcm, cache in incremental) == [
+        (index, index, index) for index in range(count)
+    ]

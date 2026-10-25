@@ -260,7 +260,7 @@ class StreamingDecodeState:
     emitted: int = 0
     hop: int = 25
     cache: StreamingHiFTState | None = None
-    finished: bool = False
+    finished: bool = False  # Final window planned; GPU and client completion are tracked separately.
 
 
 CodecRequestKey = tuple[str, int]
@@ -302,19 +302,32 @@ class SingleStageAdapter:
         )
         self.states[req_id] = state
 
-    def prepare(self, req_id: CodecRequestKey, length: int, final: bool) -> StreamingFlowItem | None:
-        """Plan the existing chunk/tail path using runner-derived lengths."""
+    def prepare(
+        self, req_id: CodecRequestKey, length: int, stop_position: int | None = None
+    ) -> StreamingFlowItem | None:
+        """Plan one chunk from a confirmed prefix, draining full chunks before its tail.
+
+        stop_position is the terminal token's position, not the prefix length:
+        length excludes EOS but includes the last speech token at a length stop.
+
+        None means no decoder work: insufficient tokens, an already finished
+        plan, or an empty terminal prefix. Only the last case newly sets
+        state.finished; the executor sends its terminal notification without
+        invoking the decoder. A returned item's finalize flag owns tail policy.
+        """
         state = self.states[req_id]
         if state.finished:
             return None
         pad = (-state.prompt_token.shape[1]) % self.chunk_size if state.emitted == 0 else 0
         hop = state.hop + pad
-        if not final and length - state.emitted < hop + self.lookahead:
+        threshold = state.emitted + hop + self.lookahead
+        final = stop_position is not None and stop_position < threshold
+        if not final and length < threshold:
             return None
         if length == 0:
             state.finished = final
             return None
-        prefix = length if final else state.emitted + hop + self.lookahead
+        prefix = length if final else threshold
         item: StreamingFlowItem = {
             "token": state.token[:, :prefix],
             "prompt_token": state.prompt_token,

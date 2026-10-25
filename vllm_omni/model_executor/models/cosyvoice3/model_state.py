@@ -30,7 +30,7 @@ class CosyVoice3ModelState(OmniModelState):
         self.max_model_len = int(vllm_config.model_config.max_model_len)
         self.codec = None
         self.codec_device = device
-        self.codec_capacity = max(2, int(vllm_config.max_concurrent_batches) * 2)
+        self.codec_pending_audio_threshold = max(2, int(vllm_config.max_concurrent_batches) * 2)
 
     def bind_async_audio(self, scheduler):
         from .async_scheduler import CosyVoice3AsyncScheduler
@@ -39,7 +39,9 @@ class CosyVoice3ModelState(OmniModelState):
             raise ValueError("CosyVoice3 single-stage requires CosyVoice3AsyncScheduler")
         self.model._maybe_enable_code2wav_trt()
         self.model.code2wav.keep_stream_cache_on_device = True
-        self.codec = AsyncCodec(self.model, self.adapter, self.codec_device, self.max_model_len, self.codec_capacity)
+        self.codec = AsyncCodec(
+            self.model.code2wav, self.adapter, self.codec_device, self.max_model_len, self.codec_pending_audio_threshold
+        )
         scheduler.codec = self.codec
         scheduler.audio_sample_rate = int(self.model.config.sample_rate)
 

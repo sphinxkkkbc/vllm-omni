@@ -87,6 +87,10 @@ class _DummyCode2Wav:
             for item in items
         ]
 
+    def iter_streaming_batch(self, items, *, n_timesteps: int = 10):
+        for index, (speech, cache) in enumerate(self.forward_streaming_batch(items, n_timesteps=n_timesteps)):
+            yield index, speech, cache
+
 
 def _make_code2wav_model(
     *,

@@ -18,26 +18,28 @@ def _conditioning(prompt_len=3):
     }
 
 
-def test_chunk_windows_match_connector_hop_padding_and_lookahead():
+@pytest.mark.parametrize("stop_known_early", [False, True])
+def test_chunk_windows_match_connector_hop_padding_and_lookahead(stop_known_early):
     adapter = SingleStageAdapter(6561, chunk_size=4, lookahead=3)
     key = ("a", 1)
     adapter.initialize(key, _conditioning(), torch.arange(40).reshape(1, -1))
+    # A coalesced EOS prefix must take exactly the same windows as incremental
+    # token arrivals; it must not collapse the chunk ramp into one large tail.
+    updates = [(40, 40)] * 4 if stop_known_early else [(n, None) for n in range(1, 41)] + [(40, 40)]
     items = []
-    for length in range(1, 41):
-        item = adapter.prepare(key, length, final=False)
+    for length, stop_position in updates:
+        item = adapter.prepare(key, length, stop_position)
         if item is not None:
-            # Input storage may be reused for subsequent appends; take a test snapshot.
             items.append((item["token"].tolist(), item["token_offset_tokens"], item["finalize"]))
-    final = adapter.prepare(key, 40, final=True)
     assert [(len(tokens[0]), offset, end) for tokens, offset, end in items] == [
         (8, 0, False),
         (16, 5, False),
         (32, 13, False),
+        (40, 29, True),
     ]
-    assert final["token"].tolist() == [list(range(40))]
-    assert final["token_offset_tokens"] == 29
-    assert final["finalize"] is True
-    assert not any(key in final for key in ("req_id", "index", "stream_finished"))
+    assert items[-1][0] == [list(range(40))]
+    assert adapter.states[key].finished
+    assert not any(key in item for key in ("req_id", "index", "stream_finished"))
 
 
 def test_request_state_and_decoder_cache_are_isolated_and_released():
@@ -45,8 +47,8 @@ def test_request_state_and_decoder_cache_are_isolated_and_released():
     a_key, b_key = ("a", 1), ("b", 2)
     adapter.initialize(a_key, _conditioning(), torch.tensor([[7]]))
     adapter.initialize(b_key, _conditioning(), torch.tensor([[9]]))
-    a = adapter.prepare(a_key, 1, final=False)
-    b = adapter.prepare(b_key, 1, final=False)
+    a = adapter.prepare(a_key, 1)
+    b = adapter.prepare(b_key, 1)
     cache = {"mel": torch.ones(1, 80, 2)}
     adapter.apply_result(a_key, cache)
     assert adapter.states[a_key].cache is cache
@@ -57,7 +59,7 @@ def test_request_state_and_decoder_cache_are_isolated_and_released():
     assert set(adapter.states) == {b_key}
     reused = ("a", 3)
     adapter.initialize(reused, _conditioning(), torch.tensor([[11]]))
-    a = adapter.prepare(reused, 1, final=False)
+    a = adapter.prepare(reused, 1)
     assert a["token"].tolist() == [[11]]
     assert a["cache_state"] is None
 
@@ -68,7 +70,7 @@ def test_prompt_padding_is_removed_before_window_alignment():
     conditioning["speech_token_len"] = torch.tensor([[3]])
     key = ("a", 1)
     adapter.initialize(key, conditioning, torch.arange(5).reshape(1, -1))
-    item = adapter.prepare(key, 5, final=False)
+    item = adapter.prepare(key, 5)
     assert item is not None
     assert item["prompt_token"].shape == (1, 3)
     assert item["prompt_feat"].shape == (1, 6, 80)

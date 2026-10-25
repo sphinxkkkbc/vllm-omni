@@ -482,6 +482,9 @@ Length-limit termination also preserves its original token position. Cancellatio
 and release use a separate coalesced control mailbox, without waiting for space
 in a token queue. Decoder state stays owned by the codec thread. `SingleStageAdapter` plans
 chunk windows over validated token prefixes; only the AR producer writes tokens.
+The worker passes the confirmed prefix length and optional stop position to the
+adapter. Readiness, prefix boundaries, chunk-ramp advancement and tail selection
+are decided together by the adapter, including when EOS progress has coalesced.
 
 The worker catches up through the existing chunk ramp and lookahead before
 finalizing the tail, rather than merging a backlog into one large final decode.
@@ -500,6 +503,11 @@ when the pending count is below the threshold. This retains the previous
 submission depth. There is no one-batch limit or per-HiFT completion gate.
 Only completed host PCM enters the scheduler's audio inbox. Reaching the
 admission threshold does not prevent the runner from appending tokens.
+The executor holds the decoder directly; it does not depend on the Talker model.
+Both topologies select their backend through the same iterator. Its input index
+identifies the original request; a yield means submission, not GPU completion,
+and several per-request yields may come from one batched computation. The list
+interface restores input order, while the codec owner schedules per-result D2H.
 
 Input memory is bounded by request admission and
 `max_model_len`, rather than by an unbounded queue of step snapshots.

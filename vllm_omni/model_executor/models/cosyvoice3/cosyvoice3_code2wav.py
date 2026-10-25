@@ -379,11 +379,12 @@ class CosyVoice3Code2Wav(nn.Module):
         *,
         n_timesteps: int = 10,
     ) -> Iterator[tuple[int, torch.Tensor, StreamingHiFTState | None]]:
-        """Yield one request result between HiFT submissions.
+        """Yield GPU results indexed by the original input order.
 
-        The caller may pause iteration to bound queued GPU work. A suspended
+        Callers may interleave transfers or collect the results. A yield does
+        not imply GPU completion or a separate compute batch. A suspended
         iterator retains its Flow features and request cache inputs.
-        Batch the flow-matching mel path, then run HiFT per request.
+        Currently Flow is batched and HiFT runs per request.
 
         Items are grouped by prompt condition shape and finalization state.
         Codec tokens may have different lengths; those are padded within the
@@ -824,32 +825,28 @@ def decode_streaming_batch(
     *,
     n_timesteps: int = 10,
 ) -> list[tuple[torch.Tensor, StreamingHiFTState | None]]:
-    """Select the same execution backend for both pipeline adapters."""
-    if (len(items) > 1 or cosyvoice3_packed_inference_enabled()) and cosyvoice3_batch_flow_enabled():
-        return decoder.forward_streaming_batch(items, n_timesteps=n_timesteps)
-    return [
-        decoder.forward_streaming(
-            token=item["token"],
-            prompt_token=item["prompt_token"],
-            prompt_feat=item["prompt_feat"],
-            embedding=item["embedding"],
-            cache_state=item.get("cache_state"),
-            token_offset_tokens=item.get("token_offset_tokens", 0),
-            finalize=item.get("finalize", False),
-            n_timesteps=n_timesteps,
-        )
-        for item in items
-    ]
+    """Collect the common decoder iterator in the caller's original request order."""
+    results: list[tuple[torch.Tensor, StreamingHiFTState | None] | None] = [None] * len(items)
+    for index, speech, cache in iter_decode_streaming_batch(decoder, items, n_timesteps=n_timesteps):
+        results[index] = (speech, cache)
+    return cast(list[tuple[torch.Tensor, StreamingHiFTState | None]], results)
 
 
-@torch.inference_mode()
 def iter_decode_streaming_batch(
     decoder: CosyVoice3Code2Wav,
     items: list[StreamingFlowItem],
     *,
     n_timesteps: int = 10,
 ) -> Iterator[tuple[int, torch.Tensor, StreamingHiFTState | None]]:
-    """Incremental equivalent of decode_streaming_batch for the codec owner."""
+    """Select the backend once for both incremental and collected consumption.
+
+    Each result is (original input index, GPU PCM, request cache). A yield means
+    work was submitted, not that the GPU is done, and need not correspond to a
+    separate HiFT call: a batched HiFT may yield several per-request results.
+    Consumers retain/snapshot PCM and establish stream dependencies before
+    another replay can reuse storage or an asynchronous host copy reads it.
+    Decoder entrypoints, not this metadata-only dispatcher, own inference mode.
+    """
     if (len(items) > 1 or cosyvoice3_packed_inference_enabled()) and cosyvoice3_batch_flow_enabled():
         yield from decoder.iter_streaming_batch(items, n_timesteps=n_timesteps)
     else:
