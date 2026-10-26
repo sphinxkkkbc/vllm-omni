@@ -10,11 +10,14 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.utils.device_copy import index_to_device
 
 from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Decoder
 from .tokenizer_12hz.streaming_decoder import StreamingCodecDecoder, StreamingDecodeGraphs
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -56,6 +59,7 @@ class StreamingCode2Wav:
         self.fallback_ids: set[str] = set()
         self.graphs: dict[int, StreamingDecodeGraphs] = {}
         self.prefix_graphs: dict[int, StreamingDecodeGraphs] = {}
+        self.post_warmup_memory_stats: tuple[int, int] | None = None
         self.graph_pool = torch.cuda.graph_pool_handle() if capture else None
         self.capture_batch_sizes: list[int] = []
         if capture:
@@ -69,6 +73,17 @@ class StreamingCode2Wav:
                 self.prefix_graphs[frames] = StreamingDecodeGraphs(
                     self.decoder, sizes, frames=frames, pool=self.graph_pool, initial=True
                 )
+
+        if capture and self.capture_batch_sizes and (self.graphs or self.prefix_graphs):
+            # Process allocator totals after initial capture, excluding later lazy captures.
+            try:
+                device = self.decoder.device
+                self.post_warmup_memory_stats = (
+                    int(torch.accelerator.memory_allocated(device)),
+                    int(torch.accelerator.memory_reserved(device)),
+                )
+            except RuntimeError:
+                logger.warning("Unable to collect post-warmup streaming decoder memory stats", exc_info=True)
 
     def release(self, request_ids: set[str] | list[str]) -> None:
         for request_id in request_ids:

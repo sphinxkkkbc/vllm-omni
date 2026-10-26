@@ -68,7 +68,7 @@ connectors:
       #     Extra stateless shapes may be added (union, not intersection) with:
       #       decode_cudagraph_capture_sizes: [97, 400]
       # Graph batch size defaults to 1. Use [1, 2, 4] to cover batches up to
-      # decode_batch_max_size (B3 pads to B4). Extra buckets increase warmup 
+      # decode_batch_max_size (B3 pads to B4). Extra buckets increase warmup
       # time and graph memory for either backend.
       # decode_cudagraph_batch_sizes: [1, 2, 4]
       # Limit eager batches to reduce temporary stateful cache allocations; CUDA Graph batching uses the buckets above.

@@ -404,7 +404,10 @@ class Qwen3TTSCode2Wav(nn.Module):
 
     def get_stage_post_warmup_memory_stats(self) -> StagePostWarmupMemoryStats | None:
         """Return the allocator snapshot retained after decoder warmup."""
-        wrapper = getattr(self.decoder, "_cudagraph_wrapper", None)
+        if self._streaming_codec is not None:
+            wrapper = self._streaming_codec
+        else:
+            wrapper = getattr(self.decoder, "_cudagraph_wrapper", None)
         memory_stats = getattr(wrapper, "post_warmup_memory_stats", None)
         if memory_stats is None:
             return None
