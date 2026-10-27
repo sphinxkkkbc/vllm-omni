@@ -199,10 +199,10 @@ class OmniModelState(DefaultModelState):
         input_batch: InputBatch,
         text_hidden: torch.Tensor,
         sampled_token_ids: torch.Tensor,
-        multimodal_outputs: dict[str, Any],
+        multimodal_outputs: dict[str, Any] | None,
         mtp_batch_descriptor_dispatcher: Callable[[int], Any] | None = None,
     ) -> None:
-        if self._has_mtp:
+        if self._has_mtp and multimodal_outputs:
             self._mtp_state.post_sample(
                 input_batch,
                 text_hidden,

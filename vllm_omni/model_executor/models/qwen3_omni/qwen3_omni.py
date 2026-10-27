@@ -796,7 +796,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
             # MRv2 passes each request's token span.
             spans = kwargs.get("request_token_spans")
-            if spans is not None and self.eager_frames_active and self.vllm_config.model_config.async_chunk:
+            if spans is not None and self.eager_frames_active:
                 return self._make_eager_talker_output(talker_hidden, spans)
             code_predictor_codes = [info.get("codes", {}).get("audio") for info in info_dicts]
             if spans is not None:
@@ -844,7 +844,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         return aligned
 
     def _make_eager_talker_output(self, hidden: torch.Tensor, spans: list[tuple[int, int]]) -> OmniOutput:
-        """Async-chunk output when the MRv2 runner completes frames after sampling.
+        """Current-step output when the MRv2 runner completes frames after sampling.
 
         ``post_sample`` writes each sampled row's frame and validity into the
         last token row of its request span; every other row carries no frame.

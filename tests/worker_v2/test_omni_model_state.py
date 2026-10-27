@@ -1104,3 +1104,115 @@ def test_generic_preprocess_does_not_dispatch_deferred_mtp():
             SimpleNamespace(prompt_len=np.array([1])),
         )
     state.model.mtp.assert_not_called()
+
+
+@pytest.mark.parametrize("payload", [None, {}])
+def test_post_sample_skips_empty_mm_without_running_mtp(payload):
+    state = _make_mtp_state()
+    batch = _EagerBatch([1])
+    recorded = (batch, FrameBatch([(0, 0, "decode", False)]), torch.tensor([7]))
+    state._mtp_state.recorded = recorded
+    state._mtp_state.post_sample = MagicMock()
+    state.post_sample(batch, torch.zeros(1, _EAGER_DIM), torch.tensor([[8]]), payload)
+    state._mtp_state.post_sample.assert_not_called()
+    assert not state.model.mtp_calls
+    assert state._mtp_state.recorded is recorded
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+@pytest.mark.parametrize("spans", [[1, 1], [3, 1]], ids=["decode", "mixed-prefill-decode"])
+def test_qwen3_omni_current_step_output_supports_sync_and_async(async_chunk, spans):
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import Qwen3OmniMoeForConditionalGeneration
+    from vllm_omni.worker_v2.omni_ar_model_runner import _slice_pooler_value
+
+    talker = Qwen3OmniMoeForConditionalGeneration.__new__(Qwen3OmniMoeForConditionalGeneration)
+    torch.nn.Module.__init__(talker)
+    talker.model_stage = "talker"
+    talker.talker = SimpleNamespace(num_code_groups=3)
+    talker.vllm_config = SimpleNamespace(model_config=SimpleNamespace(async_chunk=async_chunk))
+    talker.eager_frames_active = True
+    state = _make_mtp_state()
+    _fill_buffers(state, "first", "second")
+    infos = state.intermediate_buffer.buffers[:2]
+    for info, count in zip(infos, [5, 4], strict=True):
+        info["codes"] = {"audio": torch.full((count, 3), 99, dtype=torch.long)}
+    batch = _EagerBatch(spans)
+    total = sum(spans)
+    bounds = list(zip(batch.query_start_loc_np, batch.query_start_loc_np[1:] + [total], strict=True))
+    hidden = torch.zeros(total, _EAGER_DIM)
+    mm = talker.make_omni_output(hidden, model_intermediate_buffer=infos, request_token_spans=bounds).multimodal_outputs
+    state._mtp_state.recorded = (
+        batch,
+        FrameBatch([(i, i, info["req_id"], n > 1) for i, (info, n) in enumerate(zip(infos, spans, strict=True))]),
+        torch.full((total,), 7),
+    )
+    state.post_sample(batch, hidden, torch.tensor([[11], [23]]), mm)
+    for i, ((start, end), token) in enumerate(zip(bounds, [11, 23], strict=True)):
+        row = _slice_pooler_value(mm, req_index=i, start=start, end=end, total_tokens=total)
+        assert row["codes"]["audio"].shape == (spans[i], 3)
+        assert row["codes"]["audio"][-1].tolist() == [token, token + 1, token + 2]
+        assert not row["codes"]["audio"][:-1].any()
+        assert row["meta"]["codec_frame_valid"].tolist() == [0] * (spans[i] - 1) + [1]
+    assert all((info["codes"]["audio"] == 99).all() for info in infos)
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+@pytest.mark.parametrize("next_spans", [[1, 1], [2, 1]], ids=["decode", "mixed-prefill-decode"])
+def test_qwen3_tts_current_step_output_uses_current_spans_and_isolates_requests(async_chunk, next_spans):
+    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
+        Qwen3TTSTalkerForConditionalGeneration,
+    )
+    from vllm_omni.worker_v2.omni_ar_model_runner import _slice_pooler_value
+
+    talker = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
+    torch.nn.Module.__init__(talker)
+    talker.vllm_config = SimpleNamespace(model_config=SimpleNamespace(async_chunk=async_chunk))
+    talker.talker_config = SimpleNamespace(num_code_groups=3)
+    talker.eager_frames_active = True
+    talker.stream_decoder = None
+    talker._ref_codes_pending = True
+    state = _make_mtp_state()
+    _fill_buffers(state, "first", "second")
+    infos = state.intermediate_buffer.buffers[:2]
+    refs = [torch.full((n, 3), value, dtype=torch.long) for n, value in [(2, 31), (5, 47)]]
+    for info, count, ref, streaming in zip(infos, [3, 4], refs, [True, False], strict=True):
+        info["codes"] = {"audio": torch.zeros(count, 3, dtype=torch.long), "ref": ref}
+        info["meta"] = {"codec_frame_valid": False, "ref_code_len": ref.shape[0], "codec_streaming": streaming}
+
+    def run_frame(spans, sampled):
+        batch = _EagerBatch(spans)
+        total = sum(spans)
+        bounds = list(zip(batch.query_start_loc_np, batch.query_start_loc_np[1:] + [total], strict=True))
+        hidden = torch.zeros(total, _EAGER_DIM)
+        mm = talker.make_omni_output(
+            hidden, model_intermediate_buffer=infos, request_token_spans=bounds
+        ).multimodal_outputs
+        assert mm["codes"]["audio"].shape == (total, 3)
+        assert mm["meta"]["codec_frame_valid"].shape == (total,)
+        assert not mm["codes"]["audio"].any()
+        assert not mm["meta"]["codec_frame_valid"].any()
+        state._mtp_state.recorded = (
+            batch,
+            FrameBatch(
+                [(i, i, info["req_id"], count > 1) for i, (info, count) in enumerate(zip(infos, spans, strict=True))]
+            ),
+            torch.full((total,), 7),
+        )
+        state.post_sample(batch, hidden, sampled, mm)
+        return mm, bounds
+
+    prefill, _ = run_frame([3, 4], torch.tensor([[7], [19]]))
+    prefill_snapshot = prefill["codes"]["audio"].clone()
+    assert prefill["meta"]["codec_frame_valid"].tolist() == [0, 0, 1, 0, 0, 0, 1]
+    output, bounds = run_frame(next_spans, torch.tensor([[11], [23]]))
+    for i, ((start, end), token) in enumerate(zip(bounds, [11, 23], strict=True)):
+        row = _slice_pooler_value(output, req_index=i, start=start, end=end, total_tokens=sum(next_spans))
+        assert row["codes"]["audio"].shape == (next_spans[i], 3)
+        assert row["codes"]["audio"][-1].tolist() == [token, token + 1, token + 2]
+        assert row["meta"]["codec_frame_valid"].tolist() == [0] * (next_spans[i] - 1) + [1]
+        if not async_chunk:
+            assert row["meta"]["ref_code_len"].tolist() == [refs[i].shape[0]] * next_spans[i]
+            assert row["meta"]["codec_streaming"].tolist() == [int(i == 0)] * next_spans[i]
+            torch.testing.assert_close(row["codes"]["ref"], refs[i])
+    assert [info["codes"]["audio"].shape[0] for info in infos] == [3, 4]
+    torch.testing.assert_close(prefill["codes"]["audio"], prefill_snapshot)
