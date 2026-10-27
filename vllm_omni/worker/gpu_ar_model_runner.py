@@ -57,6 +57,7 @@ from vllm_omni.utils.mm_outputs import (
     snapshot_mm_payload,
 )
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.kv_snapshot import PagedKVCopy
 from vllm_omni.worker.lmcache_model_runner_mixin import LMCacheHiddenStateMixin
 from vllm_omni.worker.mamba_prefix_cache import prepare_mamba_prefix_cache
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
@@ -1054,6 +1055,9 @@ class GPUARModelRunner(
         block_size = spec.block_size
         if self._kernel_block_sizes != [block_size] or length < 1:
             return False
+        request_row = self.input_batch.req_id_to_index.get(req_id)
+        if request_row is None:
+            return False
         block_ids = request.block_ids[0][: (length + block_size - 1) // block_size]
         if len(block_ids) * block_size < length or len(layer_names) != keys.shape[0]:
             return False
@@ -1082,11 +1086,14 @@ class GPUARModelRunner(
                 ):
                     return False
             pairs.append(pair)
-        indices = torch.tensor(block_ids, dtype=torch.long, device=keys.device)
-        for index, (key_blocks, value_blocks) in enumerate(pairs):
-            keys[index, :length].copy_(key_blocks.index_select(0, indices).flatten(0, 1)[:length])
-            values[index, :length].copy_(value_blocks.index_select(0, indices).flatten(0, 1)[:length])
-        return True
+        # Source addresses/strides are stable across requests. Only the live
+        # device block table changes; never upload request block IDs here.
+        copier = getattr(self, "_kv_snapshot_copier", None)
+        if copier is None or not copier.matches(pairs):
+            copier = PagedKVCopy(pairs)
+            self._kv_snapshot_copier = copier
+        block_table = self.input_batch.block_table[0].get_device_tensor(self.input_batch.num_reqs)
+        return copier.copy(block_table, request_row, length, keys, values)
 
     def _call_prepare_runner_inputs(
         self,

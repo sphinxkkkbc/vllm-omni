@@ -10,13 +10,14 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_omni.model_executor.models.yue2 import yue2 as y
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+from vllm_omni.worker.kv_snapshot import PagedKVCopy
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.parametrize("length", [4, 6])
 @pytest.mark.parametrize("layout", ["stacked", "packed"])
-def test_paged_snapshot_owns_data_and_excludes_tail(length, layout):
+def test_paged_snapshot_owns_data_and_excludes_tail(mocker, length, layout):
     runner = object.__new__(GPUARModelRunner)
     group = Mock(layer_names=["layer0", "layer1"])
     group.kv_cache_spec = FullAttentionSpec(block_size=4, num_kv_heads=2, head_size=3, dtype=torch.float32)
@@ -24,6 +25,22 @@ def test_paged_snapshot_owns_data_and_excludes_tail(length, layout):
     runner.cache_config = Mock(cache_dtype="auto")
     runner._kernel_block_sizes = [4]
     runner.requests = {"song": Mock(block_ids=([2, 0],))}
+    runner.input_batch = Mock(req_id_to_index={"song": 1}, num_reqs=2)
+    block_table = torch.tensor([[1, 1], [2, 0]], dtype=torch.int32)
+    group_table = Mock()
+    group_table.get_device_tensor.return_value = block_table
+    runner.input_batch.block_table = [group_table]
+    factory = mocker.patch("vllm_omni.worker.gpu_ar_model_runner.PagedKVCopy", wraps=PagedKVCopy)
+
+    def reference_copy(copier, table, row, count, keys, values):
+        ids = table[row].long()
+        for layer, (k, v) in enumerate(copier.pairs):
+            keys[layer, :count].copy_(k[ids].flatten(0, 1)[:count])
+            values[layer, :count].copy_(v[ids].flatten(0, 1)[:count])
+        return True
+
+    # CPU checks runner routing/lifetime; the CUDA test executes the kernel.
+    copy = mocker.patch.object(PagedKVCopy, "copy", autospec=True, side_effect=reference_copy)
     contexts = {}
     expected = []
     for index, name in enumerate(group.layer_names):
@@ -36,6 +53,10 @@ def test_paged_snapshot_owns_data_and_excludes_tail(length, layout):
     keys = torch.full((2, 12, 2, 3), -999.0)
     values = torch.full_like(keys, -999.0)
     assert runner._copy_request_kv("song", group.layer_names, length, keys, values)
+    assert copy.call_args.args[1] is block_table
+    assert copy.call_args.args[2] == 1
+    assert runner._copy_request_kv("song", group.layer_names, length, keys, values)
+    assert factory.call_count == 1  # No new source-pointer upload per request.
     for index, (k, v) in enumerate(expected):
         torch.testing.assert_close(keys[index, :length], k)
         torch.testing.assert_close(values[index, :length], v)
