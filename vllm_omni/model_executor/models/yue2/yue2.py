@@ -37,6 +37,8 @@ from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
+from .cuda_graph_wrapper import PrefillGraphWrapper, PrefillKVLease
+
 # -------------------- token/protocol constants --------------------
 
 
@@ -383,6 +385,7 @@ class ARKVSnapshot:
     keys: torch.Tensor
     values: torch.Tensor
     ready: torch.Event
+    lease: PrefillKVLease | None = None
 
 
 RunnerKVCopy = Callable[[str, Sequence[str], int, torch.Tensor, torch.Tensor], bool]
@@ -596,6 +599,25 @@ class CachedNAR:
         config = model.config
         total = self.ar_length + self.nar_length
         shape = (len(backbone.layers), total, int(config.num_key_value_heads), int(config.head_dim))
+        self._kv_lease: PrefillKVLease | None = None
+        if self.device.type == "cuda" and (ar_kv is None or ar_kv.lease is not None):
+            wrapper = model.prefill_graph_wrapper()
+            if wrapper is not None:
+                lease = wrapper.acquire(total) if ar_kv is None else ar_kv.lease
+                if lease is not None:
+                    self._kv_lease = lease
+                    if ar_kv is not None:
+                        torch.cuda.current_stream(self.device).wait_event(ar_kv.ready)
+                    start = 0 if ar_kv is None else self.ar_length - 1
+                    try:
+                        wrapper.prefill(lease, self.chunk.ar_tokens[start:], start)
+                    except (RuntimeError, ValueError):
+                        event = torch.Event()
+                        event.record()
+                        lease.release(event)
+                        raise
+                    self.keys, self.values = lease.views(total)
+                    return
         start = 0
         if ar_kv is None:
             self.keys = torch.empty(shape, dtype=self.dtype, device=self.device)
@@ -724,6 +746,10 @@ class CachedNAR:
         return result
 
     def close(self):
+        lease = getattr(self, "_kv_lease", None)
+        if lease is not None:
+            lease.release()
+            self._kv_lease = None
         self.keys = self.values = self.graph = None
         self.cos = self.sin = self.pos_emb = None
         self.state_in = self.time_in = self.velocity_out = None
@@ -1746,7 +1772,7 @@ class _SynthesisJob:
         self._released = False
         # Solver engines (captured graphs, K/V buffers), latents and audio:
         # they must outlive the queued kernels that use them.
-        self.keep: list[CachedNAR | torch.Tensor] = []
+        self.keep: list[CachedNAR | ARKVSnapshot | torch.Tensor] = []
         self.t_start: float | None = None
         self.t_done: float | None = None
 
@@ -1841,6 +1867,8 @@ class _SynthesisJob:
         for item in self.keep:
             if isinstance(item, CachedNAR):
                 item.close()
+            elif isinstance(item, ARKVSnapshot) and item.lease is not None:
+                item.lease.release(item.ready)
         self.keep.clear()
         self.stream = None
         self._released = True
@@ -2045,6 +2073,16 @@ class Yue2ForCausalLM(nn.Module):
         """The runner owns block tables; the model owns snapshot storage."""
         self._runner_kv_copy = copy_kv
 
+    def prefill_graph_wrapper(self) -> PrefillGraphWrapper | None:
+        """Keep prefill graphs and their KV slots alive across chunk engines."""
+        if getattr(self, "_warming_up_synthesis", False):
+            return None
+        if not getattr(self, "_prefill_graphs_initialized", False):
+            enabled = bool(getattr(self.config, "yue2_prefill_graph", True))
+            self._prefill_graphs = PrefillGraphWrapper.create(self) if enabled else None
+            self._prefill_graphs_initialized = True
+        return self._prefill_graphs
+
     def ar_project(self, layer, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
         """AR-path Q/K/V from the vLLM backbone's fused projection."""
         attn = layer.self_attn
@@ -2115,10 +2153,12 @@ class Yue2ForCausalLM(nn.Module):
         # warm up in the serving-time state or the first song recompiles.
         self.eval()
         torch.set_default_dtype(torch.float32)
+        self._warming_up_synthesis = True
         try:
             latents = synthesize(self, [EOD, ABC_START, ABC_END, MUSIC_START], list(range(16)), DEFAULT_SEED, steps=1)
             self._decode_latents(latents)
         finally:
+            self._warming_up_synthesis = False
             torch.set_default_dtype(default_dtype)
             self.train(training)
         logger.info("YuE2 synthesis warm-up took %.1f s", time.perf_counter() - t0)
@@ -2607,14 +2647,31 @@ class Yue2ForCausalLM(nn.Module):
             int(self.config.num_key_value_heads),
             int(self.config.head_dim),
         )
-        keys = torch.empty(shape, dtype=weight.dtype, device=weight.device)
-        values = torch.empty_like(keys)
+        wrapper = self.prefill_graph_wrapper()
+        lease = None if wrapper is None else wrapper.acquire(shape[1])
+        if lease is None:
+            keys = torch.empty(shape, dtype=weight.dtype, device=weight.device)
+            values = torch.empty_like(keys)
+        else:
+            keys, values = lease.views(shape[1])
         names = [layer.self_attn.attn.layer_name for layer in self.model.layers]
-        if not copy_kv(state.request_id, names, length, keys, values):
+        try:
+            copied = copy_kv(state.request_id, names, length, keys, values)
+        except (RuntimeError, ValueError):
+            if lease is not None:
+                event = torch.Event()
+                event.record()
+                lease.release(event)
+            raise
+        if not copied:
+            if lease is not None:
+                event = torch.Event()
+                event.record()
+                lease.release(event)
             return None
         ready = torch.Event()
         ready.record()
-        return ARKVSnapshot(keys, values, ready)
+        return ARKVSnapshot(keys, values, ready, lease)
 
     def _queue_synthesis(self, state: _RequestState) -> None:
         codec = [t - CODEC_OFFSET for t in state.history]
@@ -2628,6 +2685,10 @@ class Yue2ForCausalLM(nn.Module):
         if not codec or min(codec) < 0 or max(codec) >= CODEC_SIZE:
             job.error = RuntimeError("semantic history is empty or contains non-codec tokens")
         state.job = job
+        # A job may be cancelled before its generator starts. Retain the
+        # snapshot lease and copy event so that cancellation returns it safely.
+        if snapshots[0] is not None and snapshots[0].lease is not None:
+            job.keep.append(snapshots[0])
         state.hold_steps = 1
         self._synthesis.submit(job)
 
