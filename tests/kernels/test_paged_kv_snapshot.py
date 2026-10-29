@@ -19,7 +19,7 @@ pytestmark = [
 @pytest.mark.parametrize("length", [1, 16, 23, 32])
 @pytest.mark.parametrize("layout", ["stacked", "packed"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_cross_layer_snapshot(length, layout, dtype, monkeypatch):
+def test_kv_snapshot(length, layout, dtype, monkeypatch):
     layers, pages, page_size, heads, dim = 3, 5, 16, 2, 64
     pairs = []
     for _ in range(layers):

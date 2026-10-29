@@ -9,8 +9,9 @@ leased until the solver's GPU work completes, rather than until prefill ends.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from weakref import WeakKeyDictionary
 
 import torch
 from vllm.logger import init_logger
@@ -19,8 +20,9 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 if TYPE_CHECKING:
     from .yue2 import Yue2ForCausalLM
 
+from .kv_slot_pool import PAGE_SIZE, KVSlot, PrefillKVLease, round_token_capacity
+
 logger = init_logger(__name__)
-_PAGE_SIZE = 16
 
 
 if HAS_TRITON:
@@ -64,64 +66,20 @@ class _GraphState:
     graph: torch.cuda.CUDAGraph | None = None
 
 
-@dataclass
-class _KVSlot:
-    keys: torch.Tensor
-    values: torch.Tensor
-    block_table: torch.Tensor
-    graphs: dict[int, _GraphState] = field(default_factory=dict)
-    leased: bool = False
-    retired: torch.Event | None = None
-
-    @property
-    def capacity(self) -> int:
-        return self.keys.shape[1]
-
-
-class PrefillKVLease:
-    """Exclusive ownership of a slot, shared by snapshot and chunk engine."""
-
-    def __init__(self, slot: _KVSlot):
-        self.slot = slot
-        self.released = False
-        slot.leased = True
-
-    def views(self, length: int) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.released or not 1 <= length <= self.slot.capacity:
-            raise ValueError("Invalid prefill KV lease")
-        return self.slot.keys[:, :length], self.slot.values[:, :length]
-
-    def release(self, event: torch.Event | None = None) -> None:
-        """Return a slot, optionally deferring reuse until an event completes."""
-        if not self.released:
-            self.slot.retired = event
-            self.slot.leased = False
-            self.released = True
-
-
-def query_bucket(length: int, maximum: int) -> int:
-    if not 1 <= length <= maximum:
-        raise ValueError("Prefill query length is outside the model context")
-    return min(1 << (length - 1).bit_length(), maximum)
-
-
 class PrefillGraphWrapper:
-    """Own stable KV slots and per-slot Q buckets across requests.
+    """Cache prefill graphs without owning or allocating KV slots.
 
-    Slots are allocated lazily up to max_slots. Smaller free slots may be
-    replaced when a larger chunk arrives; a leased slot is never evicted.
-    Different requests may have different actual lengths within one bucket.
+    Weak slot keys discard graph states when no pool/request retains the slot.
+    Callers keep the lease through all GPU consumers before returning storage.
     """
 
-    def __init__(self, model: Yue2ForCausalLM, fa_version: int, max_slots: int):
+    def __init__(self, model: Yue2ForCausalLM, fa_version: int):
         self.model = model
         self.fa_version = fa_version
         weight = next(model.vae2llm.parameters())
         self.device, self.dtype = weight.device, weight.dtype
         self.maximum = model.max_position_embeddings
-        self.max_slots = max_slots
-        self.slots: list[_KVSlot] = []
-        self._stream: torch.cuda.Stream | None = None
+        self.graphs: WeakKeyDictionary[KVSlot, dict[int, _GraphState]] = WeakKeyDictionary()
 
     @classmethod
     def create(cls, model: Yue2ForCausalLM) -> PrefillGraphWrapper | None:
@@ -134,33 +92,8 @@ class PrefillGraphWrapper:
         if version is None:
             logger.warning("YuE2 prefill graphs unavailable: no supported FlashAttention backend")
             return None
-        slots = max(1, model._sampler_capacity)
-        logger.info("YuE2 B=1 prefill graphs enabled: FA%d, at most %d retained KV slots", version, slots)
-        return cls(model, version, slots)
-
-    def acquire(self, length: int) -> PrefillKVLease | None:
-        capacity = query_bucket(length, self.maximum)
-        capacity = (capacity + _PAGE_SIZE - 1) // _PAGE_SIZE * _PAGE_SIZE
-        free = [slot for slot in self.slots if not slot.leased and (slot.retired is None or slot.retired.query())]
-        suitable = [slot for slot in free if slot.capacity >= capacity]
-        if suitable:
-            return PrefillKVLease(min(suitable, key=lambda slot: slot.capacity))
-        if len(self.slots) >= self.max_slots:
-            if not free:
-                return None
-            # These slots have no GPU users. Drop their graphs with their buffers.
-            obsolete = min(free, key=lambda slot: slot.capacity)
-            self.slots = [slot for slot in self.slots if slot is not obsolete]
-        config = self.model.config
-        shape = (len(self.model.model.layers), capacity, int(config.num_key_value_heads), int(config.head_dim))
-        keys = torch.empty(shape, device=self.device, dtype=self.dtype)
-        slot = _KVSlot(
-            keys,
-            torch.empty_like(keys),
-            torch.arange(capacity // _PAGE_SIZE, dtype=torch.int32, device=self.device)[None],
-        )
-        self.slots.append(slot)
-        return PrefillKVLease(slot)
+        logger.info("YuE2 B=1 prefill graphs enabled: FA%d", version)
+        return cls(model, version)
 
     def _state(self, capacity: int) -> _GraphState:
         heads = int(self.model.config.num_attention_heads)
@@ -174,7 +107,7 @@ class PrefillGraphWrapper:
             output=torch.empty((capacity, heads, dim), dtype=self.dtype, device=self.device),
         )
 
-    def _forward(self, slot: _KVSlot, state: _GraphState) -> None:
+    def _forward(self, slot: KVSlot, state: _GraphState) -> None:
         from vllm.vllm_flash_attn import flash_attn_varlen_func
 
         from .yue2 import _linear
@@ -208,8 +141,8 @@ class PrefillGraphWrapper:
             state.output.zero_()
             h = flash_attn_varlen_func(
                 q,
-                slot.keys[index].view(-1, _PAGE_SIZE, kv_heads, dim),
-                slot.values[index].view(-1, _PAGE_SIZE, kv_heads, dim),
+                slot.keys[index].view(-1, PAGE_SIZE, kv_heads, dim),
+                slot.values[index].view(-1, PAGE_SIZE, kv_heads, dim),
                 max_seqlen_q=capacity,
                 cu_seqlens_q=state.metadata[:2],
                 max_seqlen_k=slot.capacity,
@@ -224,32 +157,19 @@ class PrefillGraphWrapper:
 
     @torch.inference_mode()
     def prefill(self, lease: PrefillKVLease, tokens: list[int], start: int = 0) -> None:
-        caller = torch.cuda.current_stream(self.device)
-        if caller != torch.cuda.default_stream(self.device):
-            self._prefill_on_stream(lease, tokens, start)
-            return
-        if self._stream is None:
-            self._stream = torch.cuda.Stream(device=self.device)
-        self._stream.wait_stream(caller)
-        try:
-            with torch.cuda.stream(self._stream):
-                self._prefill_on_stream(lease, tokens, start)
-        finally:
-            caller.wait_stream(self._stream)
-
-    def _prefill_on_stream(self, lease: PrefillKVLease, tokens: list[int], start: int) -> None:
         slot = lease.slot
-        if lease.released or not tokens or start < 0 or start + len(tokens) > slot.capacity:
-            raise ValueError("Invalid prefill input or released KV slot")
-        capacity = query_bucket(len(tokens), self.maximum)
-        state = slot.graphs.get(capacity)
+        if lease.returned or not tokens or start < 0 or start + len(tokens) > slot.capacity:
+            raise ValueError("Invalid prefill input or returned KV lease")
+        capacity = round_token_capacity(len(tokens), self.maximum)
+        graphs = self.graphs.setdefault(slot, {})
+        state = graphs.get(capacity)
         if state is None:
             # Bound retained graph workspaces. Slot reuse only happens after
             # its prior NAR consumer completes, so an old bucket is safe to drop.
-            if len(slot.graphs) >= 4:
-                del slot.graphs[next(iter(slot.graphs))]
+            if len(graphs) >= 4:
+                del graphs[next(iter(graphs))]
             state = self._state(capacity)
-            slot.graphs[capacity] = state
+            graphs[capacity] = state
         state.host_ids.zero_()
         state.host_ids[: len(tokens)].copy_(torch.tensor(tokens, dtype=torch.long))
         state.host_metadata.copy_(torch.tensor([0, len(tokens), start + len(tokens), start], dtype=torch.int32))

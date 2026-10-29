@@ -80,14 +80,6 @@ class PagedKVCopy:
         self._host_sources = torch.tensor(metadata, dtype=torch.int64, pin_memory=self.device.type == "cuda")
         self.sources = self._host_sources.to(self.device, non_blocking=True)
 
-    def matches(self, pairs: Sequence[tuple[torch.Tensor, torch.Tensor]]) -> bool:
-        """Rebuild metadata if cache initialization replaced any source allocation."""
-        return len(pairs) == len(self.pairs) and all(
-            old.data_ptr() == new.data_ptr() and old.shape == new.shape and old.stride() == new.stride()
-            for old_pair, new_pair in zip(self.pairs, pairs)
-            for old, new in zip(old_pair, new_pair)
-        )
-
     def copy(
         self,
         block_table: torch.Tensor,

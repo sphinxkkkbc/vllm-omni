@@ -1061,6 +1061,7 @@ class GPUARModelRunner(
         block_ids = request.block_ids[0][: (length + block_size - 1) // block_size]
         if len(block_ids) * block_size < length or len(layer_names) != keys.shape[0]:
             return False
+        min_block_id, max_block_id = min(block_ids), max(block_ids)
         context = self.compilation_config.static_forward_context
         pairs = []
         # Validate every layer before writing any destination data.
@@ -1081,15 +1082,15 @@ class GPUARModelRunner(
                     or tensor.shape[1:] != (block_size, *keys.shape[2:])
                     or tensor.dtype != keys.dtype
                     or tensor.device != keys.device
-                    or min(block_ids) < 0
-                    or max(block_ids) >= tensor.shape[0]
+                    or min_block_id < 0
+                    or max_block_id >= tensor.shape[0]
                 ):
                     return False
             pairs.append(pair)
         # Source addresses/strides are stable across requests. Only the live
         # device block table changes; never upload request block IDs here.
         copier = getattr(self, "_kv_snapshot_copier", None)
-        if copier is None or not copier.matches(pairs):
+        if copier is None:
             copier = PagedKVCopy(pairs)
             self._kv_snapshot_copier = copier
         block_table = self.input_batch.block_table[0].get_device_tensor(self.input_batch.num_reqs)

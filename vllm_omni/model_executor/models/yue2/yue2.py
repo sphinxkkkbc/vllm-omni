@@ -37,7 +37,8 @@ from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-from .cuda_graph_wrapper import PrefillGraphWrapper, PrefillKVLease
+from .cuda_graph_wrapper import PrefillGraphWrapper
+from .kv_slot_pool import KVSlotPool, PrefillKVLease
 
 # -------------------- token/protocol constants --------------------
 
@@ -599,11 +600,12 @@ class CachedNAR:
         config = model.config
         total = self.ar_length + self.nar_length
         shape = (len(backbone.layers), total, int(config.num_key_value_heads), int(config.head_dim))
-        self._kv_lease: PrefillKVLease | None = None
+        self._kv_lease: PrefillKVLease | None = None if ar_kv is None else ar_kv.lease
         if self.device.type == "cuda" and (ar_kv is None or ar_kv.lease is not None):
             wrapper = model.prefill_graph_wrapper()
             if wrapper is not None:
-                lease = wrapper.acquire(total) if ar_kv is None else ar_kv.lease
+                pool = model.prefill_kv_pool()
+                lease = (None if pool is None else pool.acquire(total)) if ar_kv is None else ar_kv.lease
                 if lease is not None:
                     self._kv_lease = lease
                     if ar_kv is not None:
@@ -2073,8 +2075,25 @@ class Yue2ForCausalLM(nn.Module):
         """The runner owns block tables; the model owns snapshot storage."""
         self._runner_kv_copy = copy_kv
 
+    def prefill_kv_pool(self) -> KVSlotPool | None:
+        """Snapshot storage is independent of graph creation and capture."""
+        if getattr(self, "_warming_up_synthesis", False) or not getattr(self.config, "yue2_prefill_graph", True):
+            return None
+        if not hasattr(self, "_prefill_kv_pool"):
+            weight = next(self.vae2llm.parameters())
+            self._prefill_kv_pool = KVSlotPool(
+                layers=len(self.model.layers),
+                kv_heads=int(self.config.num_key_value_heads),
+                head_dim=int(self.config.head_dim),
+                maximum=self.max_position_embeddings,
+                max_slots=max(1, self._sampler_capacity),
+                device=weight.device,
+                dtype=weight.dtype,
+            )
+        return self._prefill_kv_pool
+
     def prefill_graph_wrapper(self) -> PrefillGraphWrapper | None:
-        """Keep prefill graphs and their KV slots alive across chunk engines."""
+        """Keep prefill graphs across chunk engines; storage belongs to the KV pool."""
         if getattr(self, "_warming_up_synthesis", False):
             return None
         if not getattr(self, "_prefill_graphs_initialized", False):
@@ -2641,14 +2660,17 @@ class Yue2ForCausalLM(nn.Module):
         weight = next(self.vae2llm.parameters())
         if weight.device.type != "cuda":
             return None
+        # Reserve [prefix + codec | MUSIC_END | NAR frames + 2 boundaries].
+        # Only the first `length` positions are copied here; prefill writes END,
+        # and each ODE evaluation writes the NAR region.
         shape = (
             len(self.model.layers),
             length + 1 + frames + 2,
             int(self.config.num_key_value_heads),
             int(self.config.head_dim),
         )
-        wrapper = self.prefill_graph_wrapper()
-        lease = None if wrapper is None else wrapper.acquire(shape[1])
+        pool = self.prefill_kv_pool()
+        lease = None if pool is None else pool.acquire(shape[1])
         if lease is None:
             keys = torch.empty(shape, dtype=weight.dtype, device=weight.device)
             values = torch.empty_like(keys)
@@ -2676,8 +2698,9 @@ class Yue2ForCausalLM(nn.Module):
     def _queue_synthesis(self, state: _RequestState) -> None:
         codec = [t - CODEC_OFFSET for t in state.history]
         prefix_ids, seed = state.prefix_ids, state.constants.seed
-        # Transfer ownership once when the queued generator starts. Keeping a
-        # snapshot in the job's callable would retain NAR KV through VAE decode.
+        # Pass the snapshot to the generator once, without retaining another
+        # reference in the callable. Pooled KV storage remains pool-owned;
+        # its lease is returned when the chunk's GPU work completes.
         snapshots = [self._snapshot_ar_kv(state)]
         job = _SynthesisJob(
             state.request_id, lambda keep: self._song_iter(prefix_ids, codec, seed, keep, snapshots.pop())

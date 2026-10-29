@@ -11,7 +11,8 @@ from vllm.triton_utils import HAS_TRITON
 
 from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.yue2 import yue2 as y
-from vllm_omni.model_executor.models.yue2.cuda_graph_wrapper import PrefillGraphWrapper, query_bucket
+from vllm_omni.model_executor.models.yue2.cuda_graph_wrapper import PrefillGraphWrapper
+from vllm_omni.model_executor.models.yue2.kv_slot_pool import KVSlotPool, round_token_capacity
 
 pytestmark = [
     pytest.mark.core_model,
@@ -70,45 +71,49 @@ class _Model(nn.Module):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @torch.inference_mode()
 def test_graph_reuses_bucket_for_different_actual_lengths(end_only, dtype, monkeypatch):
-    torch.manual_seed(17)
-    model = _Model(dtype)
-    wrapper = PrefillGraphWrapper.create(model)
-    if wrapper is None:
-        pytest.skip("vLLM FlashAttention unavailable")
-    saved_graph = None
-    saved_slot = None
-    for length in [9, 13]:
-        tokens = list(range(1, length)) + [127]
-        reference = object.__new__(y.CachedNAR)
-        reference.model = model
-        reference.device, reference.dtype, reference.fa3 = torch.device("cuda"), dtype, None
-        reference.ar_length, reference.nar_length = length, 10
-        reference.chunk = y.Chunk(tokens, torch.empty(8, 64))
-        reference._prefill()
-        lease = wrapper.acquire(length + 10)
-        assert lease is not None
-        lease.slot.keys.fill_(float("nan"))
-        lease.slot.values.fill_(float("nan"))
-        start = length - 1 if end_only else 0
-        if end_only:
-            lease.slot.keys[:, :start].copy_(reference.keys[:, :start])
-            lease.slot.values[:, :start].copy_(reference.values[:, :start])
-        bucket = query_bucket(length - start, wrapper.maximum)
-        if saved_graph is not None:
-            assert lease.slot is saved_slot
-            assert lease.slot.graphs[bucket].graph is saved_graph
-            # A hit must replay the old graph without executing Python forward.
-            with monkeypatch.context() as patch:
-                patch.setattr(wrapper, "_forward", lambda *args: pytest.fail("unexpected recapture"))
+    with torch.cuda.stream(torch.cuda.Stream()):
+        torch.manual_seed(17)
+        model = _Model(dtype)
+        wrapper = PrefillGraphWrapper.create(model)
+        if wrapper is None:
+            pytest.skip("vLLM FlashAttention unavailable")
+        pool = KVSlotPool(
+            layers=3, kv_heads=1, head_dim=32, maximum=128, max_slots=1, device=torch.device("cuda"), dtype=dtype
+        )
+        saved_graph = None
+        saved_slot = None
+        for length in [9, 13]:
+            tokens = list(range(1, length)) + [127]
+            reference = object.__new__(y.CachedNAR)
+            reference.model = model
+            reference.device, reference.dtype, reference.fa3 = torch.device("cuda"), dtype, None
+            reference.ar_length, reference.nar_length = length, 10
+            reference.chunk = y.Chunk(tokens, torch.empty(8, 64))
+            reference._prefill()
+            lease = pool.acquire(length + 10)
+            assert lease is not None
+            lease.slot.keys.fill_(float("nan"))
+            lease.slot.values.fill_(float("nan"))
+            start = length - 1 if end_only else 0
+            if end_only:
+                lease.slot.keys[:, :start].copy_(reference.keys[:, :start])
+                lease.slot.values[:, :start].copy_(reference.values[:, :start])
+            bucket = round_token_capacity(length - start, wrapper.maximum)
+            if saved_graph is not None:
+                assert lease.slot is saved_slot
+                assert wrapper.graphs[lease.slot][bucket].graph is saved_graph
+                # A hit must replay the old graph without executing Python forward.
+                with monkeypatch.context() as patch:
+                    patch.setattr(wrapper, "_forward", lambda *args: pytest.fail("unexpected recapture"))
+                    wrapper.prefill(lease, tokens[start:], start)
+            else:
                 wrapper.prefill(lease, tokens[start:], start)
-        else:
-            wrapper.prefill(lease, tokens[start:], start)
-        saved_slot = lease.slot
-        saved_graph = lease.slot.graphs[bucket].graph
-        keys, values = lease.views(length + 10)
-        torch.testing.assert_close(keys[:, :length], reference.keys[:, :length], rtol=1e-2, atol=1e-2)
-        torch.testing.assert_close(values[:, :length], reference.values[:, :length], rtol=1e-2, atol=1e-2)
-        assert torch.isnan(keys[:, length:]).all()  # Padding must never overwrite NAR.
-        assert torch.isnan(values[:, length:]).all()
-        torch.cuda.current_stream().synchronize()
-        lease.release()
+            saved_slot = lease.slot
+            saved_graph = wrapper.graphs[lease.slot][bucket].graph
+            keys, values = lease.views(length + 10)
+            torch.testing.assert_close(keys[:, :length], reference.keys[:, :length], rtol=1e-2, atol=1e-2)
+            torch.testing.assert_close(values[:, :length], reference.values[:, :length], rtol=1e-2, atol=1e-2)
+            assert torch.isnan(keys[:, length:]).all()  # Padding must never overwrite NAR.
+            assert torch.isnan(values[:, length:]).all()
+            torch.cuda.current_stream().synchronize()
+            lease.release()
