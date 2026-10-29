@@ -88,12 +88,11 @@ class PrefillGraphWrapper:
             return None
         from vllm.vllm_flash_attn import flash_attn_interface
 
-        version = next((v for v in (3, 2) if flash_attn_interface.is_fa_version_supported(v)), None)
-        if version is None:
-            logger.warning("YuE2 prefill graphs unavailable: no supported FlashAttention backend")
+        if not flash_attn_interface.is_fa_version_supported(2):
+            logger.warning("YuE2 prefill graphs unavailable: FlashAttention 2 is not supported")
             return None
-        logger.info("YuE2 B=1 prefill graphs enabled: FA%d", version)
-        return cls(model, version)
+        logger.info("YuE2 B=1 prefill graphs enabled: FA2")
+        return cls(model, fa_version=2)
 
     def _state(self, capacity: int) -> _GraphState:
         heads = int(self.model.config.num_attention_heads)

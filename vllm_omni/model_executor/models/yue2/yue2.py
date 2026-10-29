@@ -2077,7 +2077,7 @@ class Yue2ForCausalLM(nn.Module):
 
     def prefill_kv_pool(self) -> KVSlotPool | None:
         """Snapshot storage is independent of graph creation and capture."""
-        if getattr(self, "_warming_up_synthesis", False) or not getattr(self.config, "yue2_prefill_graph", True):
+        if getattr(self, "_warming_up_synthesis", False) or not getattr(self.config, "yue2_prefill_graph", False):
             return None
         if not hasattr(self, "_prefill_kv_pool"):
             weight = next(self.vae2llm.parameters())
@@ -2097,7 +2097,7 @@ class Yue2ForCausalLM(nn.Module):
         if getattr(self, "_warming_up_synthesis", False):
             return None
         if not getattr(self, "_prefill_graphs_initialized", False):
-            enabled = bool(getattr(self.config, "yue2_prefill_graph", True))
+            enabled = bool(getattr(self.config, "yue2_prefill_graph", False))
             self._prefill_graphs = PrefillGraphWrapper.create(self) if enabled else None
             self._prefill_graphs_initialized = True
         return self._prefill_graphs
