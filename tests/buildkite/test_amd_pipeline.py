@@ -26,7 +26,6 @@ AMD_SUITE_COMBINER = Path(__file__).resolve().parents[2] / ".buildkite/amd/scrip
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
 AMD_OMNI_PROCESSOR_RUNNER = Path(".buildkite/amd/scripts/run-omni-processor-test.sh")
-CUDA_MERGE_PIPELINE = Path(".buildkite/cuda/test-merge.yml")
 CUDA_READY_PIPELINE = Path(".buildkite/cuda/test-ready.yml")
 AR_PAGED_ATTENTION_LABEL = "ROCm · AR Diffusion Paged Attention GPU Test"
 DIFFUSION_GROUP = ":card_index_dividers: Diffusion Test"
@@ -510,13 +509,8 @@ def test_personaplex_temporal_stress_has_one_nonblocking_nightly_owner() -> None
     assert "$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/pytest-summary.txt" in all_commands
 
 
-@pytest.mark.parametrize(
-    "pipeline_path",
-    [CUDA_READY_PIPELINE, CUDA_MERGE_PIPELINE],
-    ids=["ready", "merge"],
-)
-def test_cuda_pr_gates_retain_full_model_executor_coverage(pipeline_path: Path) -> None:
-    step = _find_step("Simple · Model Executor Test", pipeline_path)
+def test_cuda_ready_retains_full_model_executor_coverage() -> None:
+    step = _find_step("Simple · Model Executor Test", CUDA_READY_PIPELINE)
     assert "source_file_dependencies" not in step
 
     pytest_command = next(command for command in step["commands"] if "pytest" in command)
@@ -3346,3 +3340,166 @@ def test_device_reduction_ready_pins_collected_gpu_nodes() -> None:
     assert reduction.count("@_also_rocm_mi325") == 5
     assert 'res={"cuda": "L4", "rocm": "MI325"}, num_cards=1' in wan
     assert engine.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 1
+
+
+_WORKER_COPY_MARKER = "core_model and rocm and MI325 and cards_1"
+_WORKER_COPY_FILES = (
+    "tests/worker/test_device_copy.py",
+    "tests/worker_v2/test_intermediate_buffer_cuda_residency.py",
+    "tests/worker_v2/test_omni_ar_model_runner_cuda.py",
+)
+_WORKER_COPY_OWNED_BY_9552 = _WORKER_ONE_CARD_FILES
+_WORKER_COPY_EXCLUDED = (
+    "tests/worker/test_index_staging.py",
+    "tests/worker_v2/test_index_staging.py",
+    "tests/worker_v2/test_shared_stage_cuda.py",
+    "tests/worker_v2/test_staged_writes.py",
+    "tests/worker/test_gpu_ar_model_runner_cuda.py",
+    "tests/worker_v2/test_capture_query_bound_gpu.py",
+    "tests/worker_v2/test_decode_query_bound_gpu.py",
+)
+_WORKER_COPY_NODES = (
+    "tests/worker/test_device_copy.py::test_tensor_copy_cuda_handles_pageable_and_pinned_sources",
+    "tests/worker/test_device_copy.py::test_device_stager_views_survive_until_their_readers_finish",
+    "tests/worker/test_device_copy.py::test_device_stager_empty_input_does_not_consume_a_ring_slot",
+    "tests/worker_v2/test_intermediate_buffer_cuda_residency.py::"
+    "test_gpu_resident_values_stay_on_device_after_update[key0-dtype0]",
+    "tests/worker_v2/test_intermediate_buffer_cuda_residency.py::"
+    "test_gpu_resident_values_stay_on_device_after_update[key1-dtype1]",
+    "tests/worker_v2/test_omni_ar_model_runner_cuda.py::test_chunked_fixed_token_scores_are_copied_from_cuda",
+)
+
+
+def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
+    """READY adds one NonBlocking MI300 job for the remaining copy cases.
+
+    The marker selects both intermediate-buffer residency rows and the three
+    device-copy GPU tests. #9552's worker files stay on the other job. R2-01
+    still collects 1416 model-executor nodes.
+    """
+    step = _find_step("ROCm · One-Card Worker Copy Test", AMD_READY_PIPELINE)
+    command = "\n".join(step["commands"])
+    body = command.split("nodes=(", 1)[1].split(")", 1)[0]
+    quoted = tuple(re.findall(r'"(tests/[^"]+)"', body))
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 25
+    assert step["artifact_paths"] == ["artifacts/rocm-worker-copy/**/*"]
+    assert "timeout --signal=TERM --kill-after=1m 20m" in command
+    assert "timeout 25m" not in command
+    assert _marker_expressions(step) == [_WORKER_COPY_MARKER, _WORKER_COPY_MARKER]
+    assert command.count('--run-level "core_model"') == 2
+    assert quoted == _WORKER_COPY_NODES
+    assert len(_WORKER_COPY_NODES) == 6
+    assert set(quoted).isdisjoint(_WORKER_ONE_CARD_NODES)
+    residency = [node for node in quoted if "test_intermediate_buffer_cuda_residency.py::" in node]
+    assert residency == [
+        "tests/worker_v2/test_intermediate_buffer_cuda_residency.py::"
+        "test_gpu_resident_values_stay_on_device_after_update[key0-dtype0]",
+        "tests/worker_v2/test_intermediate_buffer_cuda_residency.py::"
+        "test_gpu_resident_values_stay_on_device_after_update[key1-dtype1]",
+    ]
+    for path in _WORKER_COPY_FILES:
+        assert sum(node.startswith(path + "::") for node in quoted) >= 1
+        assert command.count(f"\n  {path} \\\n") == 2
+    for path in _WORKER_COPY_OWNED_BY_9552:
+        assert path not in command
+    for path in _WORKER_COPY_EXCLUDED:
+        assert path not in command
+    assert "test_tensor_copy_cpu_preserves_view_and_dtype" not in command
+    assert "test_device_stager_cpu_falls_back_to_a_copy" not in command
+    assert "diff -u /tmp/worker-copy-ready-expected.txt" in command
+    assert "--junitxml=" in command
+
+    device_copy = Path(_WORKER_COPY_FILES[0]).read_text(encoding="utf-8")
+    assert device_copy.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 3
+    assert device_copy.count("@pytest.mark.cpu") == 2
+    residency_source = Path(_WORKER_COPY_FILES[1]).read_text(encoding="utf-8")
+    assert residency_source.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 1
+    runner = Path(_WORKER_COPY_FILES[2]).read_text(encoding="utf-8")
+    assert runner.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 1
+
+    r2_01 = _find_step(
+        "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
+        AMD_READY_PIPELINE,
+    )
+    r2_01_command = "\n".join(r2_01["commands"])
+    assert "assert-pytest-collection.sh 1416" in r2_01_command
+    for path in _WORKER_COPY_FILES:
+        assert path not in r2_01_command
+
+
+_PAUSE_KEEP_READY_MARKER = "core_model and diffusion and rocm and MI325 and cards_2"
+_PAUSE_KEEP_READY_NODE = (
+    "tests/diffusion/distributed/test_pause_keep_two_ranks.py::test_keep_pause_two_ranks_ack_and_rank_failure"
+)
+
+
+def test_pause_keep_two_ranks_ready_pins_the_mi325_node() -> None:
+    """READY fail-closes on the two-rank pause-keep case."""
+    step = _find_step("ROCm · Pause-Keep Two-Rank GPU Test", AMD_READY_PIPELINE)
+    command = "\n".join(step["commands"])
+    source = Path("tests/diffusion/distributed/test_pause_keep_two_ranks.py").read_text(encoding="utf-8")
+
+    assert step["agent_pool"] == "mi300_2"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 40
+    assert "timeout --signal=TERM --kill-after=1m 30m" in command
+    assert "export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=900" in command
+    assert "VLLM_ROCM_USE_AITER=0" not in command
+    assert _marker_expressions(step) == [
+        _PAUSE_KEEP_READY_MARKER,
+        _PAUSE_KEEP_READY_MARKER,
+    ]
+    assert command.count('--run-level "core_model"') == 2
+    assert command.count(_PAUSE_KEEP_READY_NODE) == 1
+    assert "diff -u /tmp/pause-keep-ready-expected.txt" in command
+    assert "cards_3" not in command
+    assert "cards_4" not in command
+    assert "test_diffusion_worker.py" not in command
+    assert 'res={"cuda": "L4", "rocm": "MI325"}, num_cards=2' in source
+
+
+_VERL_GENERATE_READY_MARKER = "core_model and diffusion and rocm and MI325 and cards_1"
+_VERL_GENERATE_READY_NODE = "tests/e2e/features/rlhf_test/test_verl_omni_e2e.py::test_generate"
+
+
+def test_verl_generate_ready_pins_the_mi325_node() -> None:
+    """READY fail-closes on the one-card VeRL-Omni generate case."""
+    step = _find_step("ROCm · VeRL-Omni Generate GPU Test", AMD_READY_PIPELINE)
+    command = "\n".join(step["commands"])
+    source = Path("tests/e2e/features/rlhf_test/test_verl_omni_e2e.py").read_text(encoding="utf-8")
+    server = Path("tests/e2e/features/helpers/verl_omni_server.py").read_text(encoding="utf-8")
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 40
+    assert "timeout --signal=TERM --kill-after=1m 30m" in command
+    assert _marker_expressions(step) == [
+        _VERL_GENERATE_READY_MARKER,
+        _VERL_GENERATE_READY_MARKER,
+    ]
+    assert command.count('--run-level "core_model"') == 2
+    assert command.count(_VERL_GENERATE_READY_NODE) == 1
+    assert "diff -u /tmp/verl-generate-ready-expected.txt" in command
+    assert "export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA" in command
+    assert "VLLM_OMNI_DLO_DP_WAVE_TIMEOUT" not in command
+    assert "test_weight_transfer" not in command
+    assert "ray==" not in command
+    assert "omegaconf==" not in command
+    assert 'res={"cuda": "L4", "rocm": "MI325"}, num_cards=1' in source
+    assert 'tempfile.mkdtemp(prefix="ray-", dir="/tmp")' in source
+    assert "_temp_dir=ray_temp_dir" in source
+    assert "ray.get(refs, timeout=600)" in source
+    assert "server.shutdown.remote()" in source
+    assert source.index("server.shutdown.remote()") < source.index("ray.shutdown()")
+    shutdown = server.split("async def shutdown", 1)[1].split("async def generate", 1)[0]
+    assert "workers = _snapshot_diffusion_workers()" in shutdown
+    assert shutdown.index("workers = _snapshot_diffusion_workers()") < shutdown.index("self.engine.shutdown()")
+    assert "children(recursive=True)" in server
+    assert "psutil.wait_procs" in shutdown
+    assert "multiprocessing.active_children" not in server
