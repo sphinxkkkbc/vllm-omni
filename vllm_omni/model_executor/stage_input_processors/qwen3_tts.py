@@ -439,8 +439,9 @@ def talker2code2wav_async_chunk(
             ref_context = ref_context[-ref_code_context_frames:]
         ref_context_size = int(ref_context.shape[0]) if ref_context.ndim > 1 else 0
         if ref_context_size > 0:
-            # Transport chunk IDs span segments; the emitted-frame watermark
-            # is reset at each segment boundary, just like decoder state.
+            # Transport chunk IDs span segments. The adapter clears this watermark
+            # in OmniChunkTransferAdapter._send_single_request_for_generation
+            # when is_segment_finished is set, so the next segment re-sends reference.
             if request_id not in emitted_frames:
                 ref_context_request_id = request_id
                 ref_frames = list(ref_context.to(device="cpu").unbind(0))

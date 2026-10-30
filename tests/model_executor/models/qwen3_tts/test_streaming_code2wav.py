@@ -47,8 +47,8 @@ class _Graphs:
 @pytest.fixture(autouse=True)
 def mock_graph_pool_handle(monkeypatch):
     monkeypatch.setattr(torch.cuda, "graph_pool_handle", object)
-    monkeypatch.setattr(torch.accelerator, "memory_allocated", lambda _device: 17)
-    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda _device: 23)
+    monkeypatch.setattr(torch.accelerator, "memory_allocated", lambda _device: 17, raising=False)
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda _device: 23, raising=False)
 
 
 @pytest.fixture
@@ -137,8 +137,8 @@ def test_icl_and_xvec_share_suffix_batches(monkeypatch):
 def test_streaming_memory_snapshot_is_retained(backend, monkeypatch):
     from tests.model_executor.models.qwen3_tts.test_qwen3_tts_code2wav import _make_model
 
-    monkeypatch.setattr(torch.accelerator, "memory_allocated", lambda _device: 99)
-    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda _device: 101)
+    monkeypatch.setattr(torch.accelerator, "memory_allocated", lambda _device: 99, raising=False)
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda _device: 101, raising=False)
     model = _make_model()
     model._streaming_codec = backend
     stats = model.get_stage_post_warmup_memory_stats()
@@ -146,9 +146,18 @@ def test_streaming_memory_snapshot_is_retained(backend, monkeypatch):
 
 
 def test_icl_segment_boundary_resends_reference_and_reprimes(backend):
-    from tests.model_executor.stage_input_processors.test_qwen3_tts_async_chunk import _call, _tm
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import Mock
 
-    manager = _tm(initial_chunk_frames=1, left_context=72)
+    from tests.model_executor.stage_input_processors.test_qwen3_tts_async_chunk import _call, _tm
+    from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import OmniChunkTransferAdapter
+
+    manager = object.__new__(OmniChunkTransferAdapter)
+    manager.__dict__.update(vars(_tm(initial_chunk_frames=1, left_context=72)))
+    manager._sender_state_lock = threading.Lock()
+    manager.connector.stage_id = 0
+    manager.connector.put = Mock(return_value=(True, 0, None))
     manager.request_payload["icl"] = torch.full((2, 4), 2, dtype=torch.long)
     for segment in range(2):
         payload = _call(manager, "icl", n_frames=1, finished=True)
@@ -170,9 +179,14 @@ def test_icl_segment_boundary_resends_reference_and_reprimes(backend):
         assert backend.decoder.calls[-2][2] == [0]
         assert backend.decoder.calls[-1][2] == [2]
         backend.release(["icl"])
-        manager.put_req_chunk["icl"] += 1
-        manager.code_prompt_token_ids.pop("icl", None)
-        manager._qwen3_tts_emitted_frames.pop("icl", None)
-        manager.ramp_chunk_count.pop("icl", None)
-        getattr(manager, "_cached_ic", {}).pop("icl", None)
+        manager._send_single_request_for_generation(
+            {
+                "multimodal_output": None,
+                "request": SimpleNamespace(external_req_id="icl", request_id="icl"),
+                "is_finished": False,
+                "is_segment_finished": True,
+                "payload": payload,
+            }
+        )
+        assert "icl" not in manager._qwen3_tts_emitted_frames
     assert manager.put_req_chunk["icl"] == 2
