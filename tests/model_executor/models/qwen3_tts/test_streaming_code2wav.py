@@ -10,6 +10,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _Codec:
+    device = torch.device("cpu")
     RING = 5
     max_frames = 3
     window = 3
@@ -46,6 +47,8 @@ class _Graphs:
 @pytest.fixture(autouse=True)
 def mock_graph_pool_handle(monkeypatch):
     monkeypatch.setattr(torch.cuda, "graph_pool_handle", object)
+    monkeypatch.setattr(torch.accelerator, "memory_allocated", lambda _device: 17)
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda _device: 23)
 
 
 @pytest.fixture
@@ -129,3 +132,47 @@ def test_icl_and_xvec_share_suffix_batches(monkeypatch):
     torch.testing.assert_close(follow[1], torch.tensor([[12.0, 12.0]]))
     assert backend.decoder.calls[-1][0].shape[:2] == (2, 1)
     assert backend.decoder.calls[-1][2] == [1, 3]
+
+
+def test_streaming_memory_snapshot_is_retained(backend, monkeypatch):
+    from tests.model_executor.models.qwen3_tts.test_qwen3_tts_code2wav import _make_model
+
+    monkeypatch.setattr(torch.accelerator, "memory_allocated", lambda _device: 99)
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda _device: 101)
+    model = _make_model()
+    model._streaming_codec = backend
+    stats = model.get_stage_post_warmup_memory_stats()
+    assert (stats.allocated_bytes, stats.reserved_bytes) == (17, 23)
+
+
+def test_icl_segment_boundary_resends_reference_and_reprimes(backend):
+    from tests.model_executor.stage_input_processors.test_qwen3_tts_async_chunk import _call, _tm
+
+    manager = _tm(initial_chunk_frames=1, left_context=72)
+    manager.request_payload["icl"] = torch.full((2, 4), 2, dtype=torch.long)
+    for segment in range(2):
+        payload = _call(manager, "icl", n_frames=1, finished=True)
+        assert payload.meta.ref_context_included
+        assert payload.meta.ref_context_size == 2
+        assert payload.codes.audio.numel() == 4 * 3
+        codes = payload.codes.audio.reshape(1, 4, 3)
+        result = backend.decode(
+            codes,
+            [3],
+            request_ids=["icl"],
+            caches=[{"prefix_frames": 2}],
+            terminal=[True],
+            legacy_decoder=None,
+            chunk_size=300,
+            left_context_size=25,
+        )[0]
+        torch.testing.assert_close(result, torch.tensor([[5.0, 5.0]]))
+        assert backend.decoder.calls[-2][2] == [0]
+        assert backend.decoder.calls[-1][2] == [2]
+        backend.release(["icl"])
+        manager.put_req_chunk["icl"] += 1
+        manager.code_prompt_token_ids.pop("icl", None)
+        manager._qwen3_tts_emitted_frames.pop("icl", None)
+        manager.ramp_chunk_count.pop("icl", None)
+        getattr(manager, "_cached_ic", {}).pop("icl", None)
+    assert manager.put_req_chunk["icl"] == 2

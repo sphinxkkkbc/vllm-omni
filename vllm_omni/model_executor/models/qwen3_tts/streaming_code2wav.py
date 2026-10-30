@@ -51,7 +51,7 @@ class StreamingCode2Wav:
             raise ValueError("decode_modes must contain icl and/or xvec")
         self.decode_modes = decode_modes
         if num_slots <= 0:
-            raise ValueError("decode_streaming_num_slots must be positive")
+            raise ValueError("max_num_seqs must be positive")
         self.decoder = StreamingCodecDecoder(decoder, num_slots)
         self.max_batch_size = max_batch_size or num_slots
         self.free_slots = deque(range(num_slots))
