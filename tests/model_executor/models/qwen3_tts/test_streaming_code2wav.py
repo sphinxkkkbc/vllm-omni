@@ -1,10 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import threading
+from collections import defaultdict
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch
 
+from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import OmniChunkTransferAdapter
 from vllm_omni.model_executor.models.qwen3_tts import streaming_code2wav as module
+from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import Qwen3TTSCode2Wav
+from vllm_omni.model_executor.stage_input_processors.qwen3_tts import talker2code2wav_async_chunk
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -135,32 +143,31 @@ def test_icl_and_xvec_share_suffix_batches(monkeypatch):
 
 
 def test_streaming_memory_snapshot_is_retained(backend, monkeypatch):
-    from tests.model_executor.models.qwen3_tts.test_qwen3_tts_code2wav import _make_model
-
     monkeypatch.setattr(torch.accelerator, "memory_allocated", lambda _device: 99, raising=False)
     monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda _device: 101, raising=False)
-    model = _make_model()
-    model._streaming_codec = backend
-    stats = model.get_stage_post_warmup_memory_stats()
+    model = SimpleNamespace(_streaming_codec=backend)
+    stats = Qwen3TTSCode2Wav.get_stage_post_warmup_memory_stats(model)
     assert (stats.allocated_bytes, stats.reserved_bytes) == (17, 23)
 
 
 def test_icl_segment_boundary_resends_reference_and_reprimes(backend):
-    import threading
-    from types import SimpleNamespace
-    from unittest.mock import Mock
-
-    from tests.model_executor.stage_input_processors.test_qwen3_tts_async_chunk import _call, _tm
-    from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import OmniChunkTransferAdapter
-
     manager = object.__new__(OmniChunkTransferAdapter)
-    manager.__dict__.update(vars(_tm(initial_chunk_frames=1, left_context=72)))
+    manager.code_prompt_token_ids = defaultdict(list)
+    manager.put_req_chunk = defaultdict(int)
+    manager.ramp_chunk_count = defaultdict(int)
+    manager._adaptive_states = {}
+    manager.request_payload = {}
+    manager.connector = SimpleNamespace(
+        config={"extra": {"codec_chunk_frames": 25, "codec_left_context_frames": 72, "initial_codec_chunk_frames": 1}}
+    )
     manager._sender_state_lock = threading.Lock()
     manager.connector.stage_id = 0
     manager.connector.put = Mock(return_value=(True, 0, None))
     manager.request_payload["icl"] = torch.full((2, 4), 2, dtype=torch.long)
-    for segment in range(2):
-        payload = _call(manager, "icl", n_frames=1, finished=True)
+    request = SimpleNamespace(external_req_id="icl", request_id="icl", is_finished=lambda: False)
+    for _ in range(2):
+        manager.code_prompt_token_ids["icl"] = [[1, 2, 3, 4]]
+        payload = talker2code2wav_async_chunk(manager, {"codes": {"audio": torch.empty(0)}}, request, is_finished=True)
         assert payload.meta.ref_context_included
         assert payload.meta.ref_context_size == 2
         assert payload.codes.audio.numel() == 4 * 3
@@ -182,7 +189,7 @@ def test_icl_segment_boundary_resends_reference_and_reprimes(backend):
         manager._send_single_request_for_generation(
             {
                 "multimodal_output": None,
-                "request": SimpleNamespace(external_req_id="icl", request_id="icl"),
+                "request": request,
                 "is_finished": False,
                 "is_segment_finished": True,
                 "payload": payload,
