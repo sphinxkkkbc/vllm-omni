@@ -75,7 +75,7 @@ def _fixture():
     codec = object.__new__(AsyncCodec)
     codec.states = {}
     codec.chunk_size, codec.lookahead = 1, 0
-    codec.generations = {"prefill": 1, "decode": 2}
+    state.audio_routes = {"prefill": 0, "decode": 0}
     codec.buffers, codec.mailbox, codec.retirements = {}, {}, {}
     codec.reads, codec.progress = {}, {}
     codec.released = set()
@@ -119,12 +119,29 @@ def test_final_prefill_creates_state_but_intermediate_prefill_does_not():
     state, batch, conditioning, decoder = _fixture()
     outputs = {"embed": conditioning}
     run_step(state, batch, torch.zeros(3, 8), torch.tensor([[0], [7]]), outputs)
-    assert ("prefill", 1) not in state.codec.states
+    assert "prefill" not in state.codec.states
     batch.num_computed_prefill_tokens_np[0] = 2
     batch.num_computed_tokens_np[0] = 2
     batch.num_computed_tokens_np[1] += 1
     run_step(state, batch, torch.zeros(3, 8), torch.tensor([[12], [8]]), {"audio": []})
-    assert state.codec.states[("prefill", 1)].token[:, :1].tolist() == [[12]]
+    assert state.codec.states["prefill"].token[:, :1].tolist() == [[12]]
+
+
+@pytest.mark.parametrize("sample_before_retire", [False, True])
+def test_retired_route_skips_in_flight_sample_without_recreating_buffer(sample_before_retire):
+    state, batch, conditioning, _ = _fixture()
+    tokens = torch.tensor([[0], [12]])
+    if sample_before_retire:
+        state.post_sample(batch, torch.zeros(3, 8), tokens, {"embed": conditioning})
+        assert "decode" in state.codec.buffers
+    # Same route removal/release order as scheduler.retire_request(), including
+    # cancellation before this request ever produced its first sample.
+    state.audio_routes.pop("decode")
+    state.codec.release("decode")
+    state.codec.consume_retirements()
+    state.post_sample(batch, torch.zeros(3, 8), tokens, {"embed": conditioning})
+    assert "decode" not in state.codec.buffers
+    assert "decode" not in state.codec.mailbox
 
 
 def test_scheduler_length_limit_flushes_last_token():
@@ -132,7 +149,7 @@ def test_scheduler_length_limit_flushes_last_token():
     state.req_states.max_seq_len[1] = 7
     run_step(state, batch, torch.zeros(3, 8), torch.tensor([[0], [12]]), {"embed": conditioning})
     assert decoder.calls[-1]["finalize"] is True
-    request = state.codec.states[("decode", 2)]
+    request = state.codec.states["decode"]
     assert request.token[:, :1].tolist() == [[12]]
 
 
@@ -142,13 +159,13 @@ def test_resumed_prefill_uses_original_prompt_length_for_append_position():
     batch.num_computed_tokens_np[1] = 6
     run_step(state, batch, torch.zeros(3, 8), torch.tensor([[0], [13]]), {"audio": []})
     # Replay prefill includes the two accepted speech tokens, but original
-    # prompt_len remains 6. The new sample belongs at speech-buffer offset 2.
+    # prompt_len remains 6. The new sample belongs at token-buffer offset 2.
     batch.is_prefilling_np[1] = True
     batch.prefill_len_np[1] = 8
     batch.num_computed_prefill_tokens_np[1] = 7
     batch.num_computed_tokens_np[1] = 7
     run_step(state, batch, torch.zeros(3, 8), torch.tensor([[0], [14]]), {"audio": []})
-    assert state.codec.states[("decode", 2)].token[:, :3].tolist() == [[12, 13, 14]]
+    assert state.codec.states["decode"].token[:, :3].tolist() == [[12, 13, 14]]
 
 
 class _TaggedDecoder(_Decoder):
@@ -172,7 +189,7 @@ def test_eos_between_chunk_boundaries_flushes_without_intermediate_decodes():
             assert state.model.code2wav.calls == []
         else:
             assert outputs["audio"][1].tolist() == [100.0] * 12
-        request = state.codec.states[("decode", 2)]
+        request = state.codec.states["decode"]
         assert request.emitted == 0
         assert request.cache is None
 
@@ -201,7 +218,7 @@ def test_coalesced_length_stop_preserves_final_chunk_boundary():
     }
     for position in range(2):
         codec.submit(
-            [SampleEntry("decode", position, position == 1, conditioning, 2)],
+            [SampleEntry("decode", position, position == 1, conditioning)],
             torch.tensor([position + 1]),
             torch.tensor([True]),
         )
@@ -213,7 +230,7 @@ def test_coalesced_length_stop_preserves_final_chunk_boundary():
     assert decoder.calls[0]["token"].tolist() == [[1, 2]]
 
 
-def test_cancel_does_not_wait_for_control_copy_and_reuse_is_isolated():
+def test_cancel_keeps_pending_copy_alive_and_does_not_affect_another_request():
     from vllm_omni.model_executor.models.cosyvoice3.async_codec import SampleEntry
 
     state, _, _, _ = _fixture()
@@ -224,27 +241,25 @@ def test_cancel_does_not_wait_for_control_copy_and_reuse_is_isolated():
         "speech_feat": torch.empty(1, 0, 80),
         "embedding": torch.ones(1, 192),
     }
-    codec.submit([SampleEntry("decode", 0, False, conditioning, 2)], torch.tensor([12]), torch.tensor([True]))
+    codec.submit([SampleEntry("decode", 0, False, conditioning)], torch.tensor([12]), torch.tensor([True]))
     codec.start_reads()
-    old = codec.reads[("decode", 2)]
+    old = codec.reads["decode"]
     done = SimpleNamespace(value=False)
     old.copy_done = SimpleNamespace(query=lambda: done.value)
     codec.cancel("decode")
     codec.release("decode")
     codec.consume_retirements()
     codec.poll_reads()
-    assert ("decode", 2) in codec.reads  # Keep pinned destination alive while its DMA is pending.
-    codec.next_generation = 2
-    generation = codec.register("decode")
-    codec.submit([SampleEntry("decode", 0, True, conditioning, generation)], torch.tensor([23]), torch.tensor([True]))
+    assert "decode" in codec.reads  # Keep pinned destination alive while its DMA is pending.
+    codec.submit([SampleEntry("next", 0, True, conditioning)], torch.tensor([23]), torch.tensor([True]))
     codec.start_reads()
     codec.poll_reads()
     done.value = True
     codec.poll_reads()
-    assert ("decode", 2) not in codec.progress
+    assert "decode" not in codec.progress
     codec.decode_ready()
     codec.publish()
-    assert codec.outputs.get_nowait().generation == generation
+    assert codec.outputs.get_nowait().request_id == "next"
     assert codec.outputs.empty()
 
 
@@ -254,15 +269,15 @@ def test_submit_copies_noncontiguous_source_rows_before_input_reuse():
     state, _, _, _ = _fixture()
     codec = state.codec
     tokens = torch.tensor([11, 22, 33, 44])
-    speech = torch.tensor([True, False, True, True])
-    entries = [SampleEntry("prefill", 0, False, {}, 1), SampleEntry("decode", 0, False, {}, 2)]
-    codec.submit(entries, tokens, speech, rows=[3, 1])
+    token_mask = torch.tensor([True, False, True, True])
+    entries = [SampleEntry("prefill", 0, False, {}), SampleEntry("decode", 0, False, {})]
+    codec.submit(entries, tokens, token_mask, rows=[3, 1])
     tokens.fill_(999)
-    speech.fill_(True)
-    assert codec.buffers[("prefill", 1)].tokens[:, :1].tolist() == [[44]]
-    assert codec.buffers[("decode", 2)].tokens[:, :1].tolist() == [[22]]
-    assert codec.buffers[("prefill", 1)].speech[:1].tolist() == [True]
-    assert codec.buffers[("decode", 2)].speech[:1].tolist() == [False]
+    token_mask.fill_(True)
+    assert codec.buffers["prefill"].tokens[:, :1].tolist() == [[44]]
+    assert codec.buffers["decode"].tokens[:, :1].tolist() == [[22]]
+    assert codec.buffers["prefill"].mask[:1].tolist() == [True]
+    assert codec.buffers["decode"].mask[:1].tolist() == [False]
 
 
 def test_sample_snapshot_preserves_row_mapping_without_cpu_readback(monkeypatch):
@@ -272,7 +287,8 @@ def test_sample_snapshot_preserves_row_mapping_without_cpu_readback(monkeypatch)
     state.req_states = SimpleNamespace(max_seq_len=np.full(5, 32), prompt_len=SimpleNamespace(np=np.full(5, 4)))
     state.intermediate_buffer = SimpleNamespace(gather=lambda batch: [{} for _ in range(5)])
     submitted = []
-    state.codec = SimpleNamespace(generations={"b": 2, "a": 1}, submit=lambda *args: submitted.append(args))
+    state.codec = SimpleNamespace(submit=lambda *args: submitted.append(args))
+    state.audio_routes = {"b": 0, "a": 0}
     batch = SimpleNamespace(
         num_reqs=5,
         req_ids=["prefill", "b", "_warmup_0", "a", "retired"],
@@ -302,13 +318,13 @@ def test_sample_snapshot_preserves_row_mapping_without_cpu_readback(monkeypatch)
     state.post_sample(batch, torch.zeros(5, 8), sampled, outputs)
     batch.req_ids[1] = "reused"
     batch.num_computed_tokens_np[1] = 99
-    entries, tokens, speech, rows = submitted[0]
+    entries, tokens, token_mask, rows = submitted[0]
     assert rows == [1, 3]
     assert [entry.position for entry in entries] == [0, 0]
-    assert [(entry.request_id, entry.generation) for entry in entries] == [("b", 2), ("a", 1)]
+    assert [entry.request_id for entry in entries] == ["b", "a"]
     assert tokens.untyped_storage().data_ptr() == sampled.untyped_storage().data_ptr()
     assert tokens.tolist() == [99, 12, 77, 100, 55]
-    assert speech.tolist() == [True, True, True, False, True]
+    assert token_mask.tolist() == [True, True, True, False, True]
     assert outputs == {}
 
 
@@ -336,7 +352,7 @@ def test_per_request_d2h_owns_pcm_and_publishes_between_submissions(monkeypatch)
         "embedding": torch.ones(1, 192),
     }
     codec.submit(
-        [SampleEntry("prefill", 0, False, conditioning, 1), SampleEntry("decode", 0, True, conditioning, 2)],
+        [SampleEntry("prefill", 0, False, conditioning), SampleEntry("decode", 0, True, conditioning)],
         torch.tensor([7, 8]),
         torch.tensor([True, True]),
     )
@@ -388,7 +404,7 @@ def test_chunk_windows_match_connector_hop_padding_and_lookahead(stop_known_earl
     state, _, _, _ = _fixture()
     codec = state.codec
     codec.chunk_size, codec.lookahead = 4, 3
-    key = ("a", 1)
+    key = "a"
     codec.initialize(key, _chunk_conditioning(), torch.arange(40).reshape(1, -1))
     # A coalesced EOS prefix must take exactly the same windows as incremental
     # token arrivals; it must not collapse the chunk ramp into one large tail.
@@ -414,7 +430,7 @@ def test_prompt_padding_is_removed_before_window_alignment():
     codec.chunk_size, codec.lookahead = 4, 0
     conditioning = _chunk_conditioning(8)
     conditioning["speech_token_len"] = torch.tensor([[3]])
-    key = ("a", 1)
+    key = "a"
     codec.initialize(key, conditioning, torch.arange(5).reshape(1, -1))
     item = codec.prepare(key, 5)
     assert item is not None

@@ -474,6 +474,15 @@ the owned buffers before graph output reuse. It does not advanced-index CUDA
 tensors with Python lists, which would upload indices and synchronize the AR
 stream for each selection.
 
+Codec state is keyed by the unique internal request ID assigned at ingress.
+Client audio routes are installed in `add_request()`, including waiting
+requests. Only AR-completed requests with pending codec tails reserve detached
+codec capacity; queued requests do not reduce the AR admission limit.
+Buffers are created on the first sampled-token submission, with no separate
+codec registration. The runner shares the scheduler's existing audio-route
+table to skip retired requests; the scheduler also discards their queued audio. Cancellation
+markers remain until pending control and audio copies have completed.
+
 The codec worker snapshots mailbox progress and copies previously unread
 validity bits to a request-owned pinned host buffer on a control stream. It
 checks that copy's event before reading the bits on the CPU. Keeping the whole
@@ -536,9 +545,9 @@ drains submitted work before decoder resources disappear. Final client delivery
 still follows engine-loop consumption; this path does not promise that CPU/GIL
 or GPU resource contention disappears.
 
-CPU tests hold a decoder call open while a producer appends many more steps than
-the former FIFO capacity, then verify ordered chunk catch-up and sticky EOS.
-Additional tests cover length stops, cancellation during control D2H, deferred
-termination, stale generations and admission. CUDA stream tests require a CUDA
+CPU tests cover prefill handoff, chunk boundaries, EOS and length stops,
+cancellation during control D2H, deferred termination, late audio after
+retirement and admission. CUDA tests also hold codec work open while the
+producer appends tokens, checking progress and owned token snapshots. CUDA stream tests require a CUDA
 host; CPU tests do not establish stream correctness, audio equivalence or a
 performance gain.

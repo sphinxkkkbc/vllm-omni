@@ -47,7 +47,6 @@ class SampleEntry:
     position: int
     length_finished: bool
     conditioning: dict
-    generation: int
 
 
 @dataclass
@@ -55,8 +54,8 @@ class TokenBuffer:
     """Append-only storage: AR writes suffixes, codec confirms copied validity bits."""
 
     tokens: torch.Tensor
-    speech: torch.Tensor
-    host_speech: torch.Tensor
+    mask: torch.Tensor
+    host_mask: torch.Tensor
     conditioning: dict
     last_position: int = -1  # Producer-owned.
     limit_position: int | None = None
@@ -96,7 +95,6 @@ class ReadyAudio:
     request_id: str
     pcm: torch.Tensor | None
     final: bool
-    generation: int
 
 
 @dataclass
@@ -130,26 +128,23 @@ class AsyncCodec:
             raise ValueError("CosyVoice3 chunk size must be positive and lookahead nonnegative")
         self.chunk_size = chunk_size
         self.lookahead = lookahead
-        self.states: dict[tuple[str, int], StreamingDecodeState] = {}
+        self.states: dict[str, StreamingDecodeState] = {}
         self.device = device
         self.max_model_len = max_model_len
         self.outputs: queue.SimpleQueue[ReadyAudio] = queue.SimpleQueue()
-        # Engine-owned request generations and append-only input buffers.
-        self.generations: dict[str, int] = {}
-        self.next_generation = 0
         # Checked at batch admission; not a strict per-row bound.
         self.pending_audio_threshold = pending_audio_threshold
-        self.buffers: dict[tuple[str, int], TokenBuffer] = {}
+        self.buffers: dict[str, TokenBuffer] = {}
         # Cross-thread mailboxes coalesce updates instead of retaining steps.
-        self.mailbox: dict[tuple[str, int], TokenProgress] = {}
-        self.retirements: dict[tuple[str, int], tuple[bool, bool]] = {}
+        self.mailbox: dict[str, TokenProgress] = {}
+        self.retirements: dict[str, tuple[bool, bool]] = {}
         self.lock = threading.Lock()
         # Codec-owned state; tombstones survive pending control/audio copies.
-        self.cancelled: set[tuple[str, int]] = set()
-        self.ended: set[tuple[str, int]] = set()
-        self.released: set[tuple[str, int]] = set()
-        self.reads: dict[tuple[str, int], ControlRead] = {}
-        self.progress: dict[tuple[str, int], DecodeProgress] = {}
+        self.cancelled: set[str] = set()
+        self.ended: set[str] = set()
+        self.released: set[str] = set()
+        self.reads: dict[str, ControlRead] = {}
+        self.progress: dict[str, DecodeProgress] = {}
         self.pending: deque[PendingAudio] = deque()
         self.error: BaseException | None = None
         self.started = threading.Event()
@@ -169,7 +164,7 @@ class AsyncCodec:
         self,
         entries: Sequence[SampleEntry],
         tokens: torch.Tensor,
-        speech: torch.Tensor,
+        mask: torch.Tensor,
         rows: Sequence[int] | None = None,
     ) -> None:
         self.check_error()
@@ -178,9 +173,7 @@ class AsyncCodec:
         updates = []
         source_rows = range(len(entries)) if rows is None else rows
         for row, entry in zip(source_rows, entries, strict=True):
-            key = (entry.request_id, entry.generation)
-            if self.generations.get(entry.request_id) != entry.generation:
-                continue
+            key = entry.request_id
             buffer = self.buffers.get(key)
             if buffer is None:
                 if entry.position != 0:
@@ -202,7 +195,7 @@ class AsyncCodec:
             # Only new suffix positions are written. Codec reads frozen prefixes
             # directly; neither graph outputs nor an unbounded step queue are retained.
             buffer.tokens[:, position : position + 1].copy_(tokens[row : row + 1].reshape(1, 1))
-            buffer.speech[position : position + 1].copy_(speech[row : row + 1])
+            buffer.mask[position : position + 1].copy_(mask[row : row + 1])
             buffer.last_position = position
             if entry.length_finished and buffer.limit_position is None:
                 buffer.limit_position = position
@@ -216,19 +209,13 @@ class AsyncCodec:
                 self.mailbox[key] = TokenProgress(buffer, end, limit, ready)
         self.tick.set()
 
-    def register(self, request_id: str) -> int:
-        self.next_generation += 1
-        self.generations[request_id] = self.next_generation
-        return self.next_generation
-
     def retire(self, request_id: str, *, cancel: bool, release: bool) -> None:
         self.check_error()
-        key = (request_id, self.generations[request_id])
+        key = request_id
         with self.lock:
             cancelled, released = self.retirements.get(key, (False, False))
             self.retirements[key] = (cancelled or cancel, released or release)
         if release:
-            self.generations.pop(request_id)
             self.buffers.pop(key, None)
         self.tick.set()
 
@@ -266,9 +253,9 @@ class AsyncCodec:
     def publish(self) -> None:
         while self.pending and self.pending[0].copy_done.query():
             audio = self.pending.popleft().output
-            if (audio.request_id, audio.generation) not in self.cancelled:
+            if audio.request_id not in self.cancelled:
                 self.outputs.put(audio)
-        pending = {(x.output.request_id, x.output.generation) for x in self.pending}
+        pending = {x.output.request_id for x in self.pending}
         for key in self.released - pending - self.reads.keys():
             self.cancelled.discard(key)
             self.ended.discard(key)
@@ -287,8 +274,8 @@ class AsyncCodec:
                 buffer = progress.buffer
                 start = buffer.confirmed_end
                 self.control_stream.wait_event(progress.producer_done)
-                buffer.speech.record_stream(self.control_stream)
-                buffer.host_speech[start : progress.end].copy_(buffer.speech[start : progress.end], non_blocking=True)
+                buffer.mask.record_stream(self.control_stream)
+                buffer.host_mask[start : progress.end].copy_(buffer.mask[start : progress.end], non_blocking=True)
                 copied = torch.cuda.Event()
                 copied.record(self.control_stream)
                 self.reads[key] = ControlRead(progress, start, copied)
@@ -303,7 +290,7 @@ class AsyncCodec:
                 continue
             progress = read.progress
             buffer = progress.buffer
-            values = buffer.host_speech[read.start : progress.end].tolist()
+            values = buffer.host_mask[read.start : progress.end].tolist()
             eos = next((read.start + i for i, value in enumerate(values) if not value), None)
             limit = progress.limit_position
             terminal = limit
@@ -350,14 +337,14 @@ class AsyncCodec:
                     host.copy_(wav, non_blocking=True)
                     copied = torch.cuda.Event()
                     copied.record(self.copy_stream)
-                    self.pending.append(PendingAudio(ReadyAudio(key[0], host, final, key[1]), copied, wav))
+                    self.pending.append(PendingAudio(ReadyAudio(key, host, final), copied, wav))
                 # Publish any completed copies between submissions, without
                 # waiting for either HiFT or D2H before queuing the next row.
                 self.publish()
         for key in empty_finals:
             copied = torch.cuda.Event()
             copied.record(self.copy_stream)
-            self.pending.append(PendingAudio(ReadyAudio(key[0], None, True, key[1]), copied, None))
+            self.pending.append(PendingAudio(ReadyAudio(key, None, True), copied, None))
         return bool(items or empty_finals)
 
     @torch.inference_mode()
@@ -393,7 +380,7 @@ class AsyncCodec:
         finally:
             self.started.set()
 
-    def initialize(self, req_id: tuple[str, int], conditioning: Mapping, token_buffer: torch.Tensor) -> None:
+    def initialize(self, req_id: str, conditioning: Mapping, token_buffer: torch.Tensor) -> None:
         """Bind an append-only producer buffer; chunk/cache state stays consumer-owned."""
         from vllm_omni.data_entry_keys import to_struct
 
@@ -418,9 +405,7 @@ class AsyncCodec:
         )
         self.states[req_id] = state
 
-    def prepare(
-        self, req_id: tuple[str, int], length: int, stop_position: int | None = None
-    ) -> StreamingFlowItem | None:
+    def prepare(self, req_id: str, length: int, stop_position: int | None = None) -> StreamingFlowItem | None:
         """Plan one chunk from a confirmed prefix, draining full chunks before its tail.
 
         stop_position is the terminal token's position, not the prefix length:
@@ -459,10 +444,10 @@ class AsyncCodec:
         state.finished = final
         return item
 
-    def apply_result(self, req_id: tuple[str, int], cache: StreamingHiFTState | None) -> None:
+    def apply_result(self, req_id: str, cache: StreamingHiFTState | None) -> None:
         state = self.states[req_id]
         state.cache = None if state.finished else cache
 
-    def finish_requests(self, request_ids: Iterable[tuple[str, int]]) -> None:
+    def finish_requests(self, request_ids: Iterable[str]) -> None:
         for req_id in request_ids:
             self.states.pop(req_id, None)
