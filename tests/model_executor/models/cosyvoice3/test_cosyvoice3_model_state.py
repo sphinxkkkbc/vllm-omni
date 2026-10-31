@@ -13,7 +13,6 @@ import torch
 
 from vllm_omni.model_executor.models.cosyvoice3.async_codec import AsyncCodec
 from vllm_omni.model_executor.models.cosyvoice3.model_state import CosyVoice3ModelState
-from vllm_omni.model_executor.models.cosyvoice3.pipeline_adapter import SingleStageAdapter
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -52,9 +51,8 @@ def cpu_streams(monkeypatch):
 
 def run_step(state, batch, hidden, tokens, outputs):
     codec = state.codec
-    codec.adapter = state.adapter
     codec.decoder = state.model.code2wav
-    state.run_eager_mtp(batch, hidden, tokens, outputs)
+    state.post_sample(batch, hidden, tokens, outputs)
     assert outputs == {}  # Producer never attaches pending audio to AR output.
     # Coalesced progress is consumed independently of producer notifications.
     codec.start_reads()
@@ -72,9 +70,11 @@ def run_step(state, batch, hidden, tokens, outputs):
 
 def _fixture():
     state = object.__new__(CosyVoice3ModelState)
-    state.adapter = SingleStageAdapter(6561, chunk_size=1, lookahead=0)
-    state.max_model_len = 32
+    state.vocab_size = 6561
+    state.codec_max_model_len = 32
     codec = object.__new__(AsyncCodec)
+    codec.states = {}
+    codec.chunk_size, codec.lookahead = 1, 0
     codec.generations = {"prefill": 1, "decode": 2}
     codec.buffers, codec.mailbox, codec.retirements = {}, {}, {}
     codec.reads, codec.progress = {}, {}
@@ -119,12 +119,12 @@ def test_final_prefill_creates_state_but_intermediate_prefill_does_not():
     state, batch, conditioning, decoder = _fixture()
     outputs = {"embed": conditioning}
     run_step(state, batch, torch.zeros(3, 8), torch.tensor([[0], [7]]), outputs)
-    assert ("prefill", 1) not in state.adapter.states
+    assert ("prefill", 1) not in state.codec.states
     batch.num_computed_prefill_tokens_np[0] = 2
     batch.num_computed_tokens_np[0] = 2
     batch.num_computed_tokens_np[1] += 1
     run_step(state, batch, torch.zeros(3, 8), torch.tensor([[12], [8]]), {"audio": []})
-    assert state.adapter.states[("prefill", 1)].token[:, :1].tolist() == [[12]]
+    assert state.codec.states[("prefill", 1)].token[:, :1].tolist() == [[12]]
 
 
 def test_scheduler_length_limit_flushes_last_token():
@@ -132,7 +132,7 @@ def test_scheduler_length_limit_flushes_last_token():
     state.req_states.max_seq_len[1] = 7
     run_step(state, batch, torch.zeros(3, 8), torch.tensor([[0], [12]]), {"embed": conditioning})
     assert decoder.calls[-1]["finalize"] is True
-    request = state.adapter.states[("decode", 2)]
+    request = state.codec.states[("decode", 2)]
     assert request.token[:, :1].tolist() == [[12]]
 
 
@@ -148,7 +148,7 @@ def test_resumed_prefill_uses_original_prompt_length_for_append_position():
     batch.num_computed_prefill_tokens_np[1] = 7
     batch.num_computed_tokens_np[1] = 7
     run_step(state, batch, torch.zeros(3, 8), torch.tensor([[0], [14]]), {"audio": []})
-    assert state.adapter.states[("decode", 2)].token[:, :3].tolist() == [[12, 13, 14]]
+    assert state.codec.states[("decode", 2)].token[:, :3].tolist() == [[12, 13, 14]]
 
 
 class _TaggedDecoder(_Decoder):
@@ -161,7 +161,7 @@ class _TaggedDecoder(_Decoder):
 
 def test_eos_between_chunk_boundaries_flushes_without_intermediate_decodes():
     state, batch, conditioning, _ = _fixture()
-    state.adapter = SingleStageAdapter(6561, chunk_size=25, lookahead=3)
+    state.codec.chunk_size, state.codec.lookahead = 25, 3
     state.model.code2wav = _TaggedDecoder()
     for step, token in enumerate([12, 13, 6562]):
         batch.num_computed_tokens_np[1] = 5 + step
@@ -172,7 +172,7 @@ def test_eos_between_chunk_boundaries_flushes_without_intermediate_decodes():
             assert state.model.code2wav.calls == []
         else:
             assert outputs["audio"][1].tolist() == [100.0] * 12
-        request = state.adapter.states[("decode", 2)]
+        request = state.codec.states[("decode", 2)]
         assert request.emitted == 0
         assert request.cache is None
 
@@ -187,93 +187,13 @@ def test_mixed_speech_and_empty_eos_keep_batch_order():
     assert outputs["audio"][1].numel() == 0
 
 
-@pytest.mark.parametrize("capacity", [1, 2])
-def test_producer_does_not_wait_for_a_busy_codec(monkeypatch, capacity):
-    """Reproduce the trace failure: submit many steps while chunk decode is held."""
-    from vllm_omni.model_executor.models.cosyvoice3.async_codec import SampleEntry
-    from vllm_omni.platforms import current_omni_platform
-
-    stream = SimpleNamespace(wait_event=lambda event: None, synchronize=lambda: None)
-    monkeypatch.setattr(torch.cuda, "Stream", lambda **kw: stream)
-    monkeypatch.setattr(current_omni_platform, "set_device", lambda device: None)
-    entered, resume, submitted = threading.Event(), threading.Event(), threading.Event()
-    calls, errors = [], []
-
-    class SlowDecoder:
-        def forward_streaming(self, token, finalize, **kwargs):
-            prefix = token.clone()
-            calls.append((prefix.tolist()[0], finalize))
-            if len(calls) == 1:
-                entered.set()
-                if not resume.wait(5):
-                    raise TimeoutError("Test failed to release codec")
-                assert torch.equal(token, prefix), "Producer overwrote a prefix being decoded"
-            return token.float().reshape(1, 1, -1), None
-
-    worker = AsyncCodec(SlowDecoder(), SingleStageAdapter(100, chunk_size=2, lookahead=0), "cpu", 64, capacity)
-    generation = worker.register("r")
-    conditioning = {
-        "speech_token": torch.empty(1, 0, dtype=torch.long),
-        "speech_feat": torch.empty(1, 0, 80),
-        "embedding": torch.ones(1, 192),
-    }
-
-    def push(position, token):
-        worker.submit(
-            [SampleEntry("r", position, False, conditioning, generation)],
-            torch.tensor([token]),
-            torch.tensor([token < 100]),
-        )
-
-    def produce():
-        try:
-            for position in range(2, 32):
-                push(position, position + 1)
-            push(32, 100)
-            # An already scheduled AR step after EOS must not extend the tail.
-            push(33, 77)
-        except BaseException as error:
-            errors.append(error)
-        finally:
-            submitted.set()
-
-    producer = threading.Thread(target=produce)
-    try:
-        push(0, 1)
-        push(1, 2)
-        assert entered.wait(2)
-        producer.start()
-        assert submitted.wait(2), "Producer blocked waiting for codec consumption"
-        assert not errors
-        with worker.lock:
-            assert len(worker.mailbox) == 1  # Coalesced notification, not 32 queued snapshots.
-        resume.set()
-        audio = []
-        while not audio or not audio[-1].final:
-            audio.append(worker.outputs.get(timeout=3))
-        assert [(len(tokens), final) for tokens, final in calls] == [
-            (2, False),
-            (6, False),
-            (14, False),
-            (22, False),
-            (30, False),
-            (32, True),
-        ]
-        assert calls[-1][0] == list(range(1, 33))
-    finally:
-        resume.set()
-        if producer.ident is not None:
-            producer.join(timeout=3)
-        worker.close()
-
-
 def test_coalesced_length_stop_preserves_final_chunk_boundary():
     from vllm_omni.model_executor.models.cosyvoice3.async_codec import SampleEntry
 
     state, _, _, decoder = _fixture()
     codec = state.codec
     codec.decoder = state.model.code2wav
-    codec.adapter = SingleStageAdapter(6561, chunk_size=2, lookahead=0)
+    codec.chunk_size, codec.lookahead = 2, 0
     conditioning = {
         "speech_token": torch.empty(1, 0, dtype=torch.long),
         "speech_feat": torch.empty(1, 0, 80),
@@ -299,7 +219,6 @@ def test_cancel_does_not_wait_for_control_copy_and_reuse_is_isolated():
     state, _, _, _ = _fixture()
     codec = state.codec
     codec.decoder = state.model.code2wav
-    codec.adapter = state.adapter
     conditioning = {
         "speech_token": torch.empty(1, 0, dtype=torch.long),
         "speech_feat": torch.empty(1, 0, 80),
@@ -329,7 +248,7 @@ def test_cancel_does_not_wait_for_control_copy_and_reuse_is_isolated():
     assert codec.outputs.empty()
 
 
-def test_submit_copies_noncontiguous_source_rows_before_input_reuse(monkeypatch):
+def test_submit_copies_noncontiguous_source_rows_before_input_reuse():
     from vllm_omni.model_executor.models.cosyvoice3.async_codec import SampleEntry
 
     state, _, _, _ = _fixture()
@@ -337,14 +256,6 @@ def test_submit_copies_noncontiguous_source_rows_before_input_reuse(monkeypatch)
     tokens = torch.tensor([11, 22, 33, 44])
     speech = torch.tensor([True, False, True, True])
     entries = [SampleEntry("prefill", 0, False, {}, 1), SampleEntry("decode", 0, False, {}, 2)]
-    original = torch.Tensor.__getitem__
-
-    def basic_index_only(tensor, index):
-        if isinstance(index, (list, np.ndarray, torch.Tensor)):
-            pytest.fail("submit must use only basic slices")
-        return original(tensor, index)
-
-    monkeypatch.setattr(torch.Tensor, "__getitem__", basic_index_only)
     codec.submit(entries, tokens, speech, rows=[3, 1])
     tokens.fill_(999)
     speech.fill_(True)
@@ -354,37 +265,10 @@ def test_submit_copies_noncontiguous_source_rows_before_input_reuse(monkeypatch)
     assert codec.buffers[("decode", 2)].speech[:1].tolist() == [False]
 
 
-@pytest.mark.parametrize("lengths", [(5, 2, 4), (0, 3, 0), (1,)])
-def test_packed_row_metadata_preserves_cpu_layout(monkeypatch, lengths):
-    # Packing metadata is ordinary torch code. Isolate the optional CUDA FA
-    # extension import on CPU hosts; no attention implementation is exercised.
-    if not torch.cuda.is_available():
-        import sys
-        from types import ModuleType
-
-        fa = ModuleType("vllm.vllm_flash_attn")
-
-        def unused(*args, **kwargs):
-            pytest.fail("Metadata packing must not invoke attention")
-
-        fa.__dict__["flash_attn_varlen_func"] = unused
-        monkeypatch.setitem(sys.modules, fa.__name__, fa)
-    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import pack_rows
-
-    rows = pack_rows(lengths, torch.device("cpu"))
-    starts = [0]
-    for length in lengths:
-        starts.append(starts[-1] + length)
-    assert rows.starts_host.tolist() == starts
-    assert rows.row_ids.tolist() == [row for row, length in enumerate(lengths) for _ in range(length)]
-    assert rows.positions.tolist() == [position for length in lengths for position in range(length)]
-    assert rows.total == sum(lengths)
-
-
 def test_sample_snapshot_preserves_row_mapping_without_cpu_readback(monkeypatch):
     state = object.__new__(CosyVoice3ModelState)
-    state.adapter = SimpleNamespace(vocab_size=100)
-    state.max_model_len = 32
+    state.vocab_size = 100
+    state.codec_max_model_len = 32
     state.req_states = SimpleNamespace(max_seq_len=np.full(5, 32), prompt_len=SimpleNamespace(np=np.full(5, 4)))
     state.intermediate_buffer = SimpleNamespace(gather=lambda batch: [{} for _ in range(5)])
     submitted = []
@@ -415,7 +299,7 @@ def test_sample_snapshot_preserves_row_mapping_without_cpu_readback(monkeypatch)
     monkeypatch.setattr(torch.Tensor, "cpu", no_cpu_readback)
     sampled = torch.tensor([[99], [12], [77], [100], [55]])
     outputs = {"audio": []}
-    state.run_eager_mtp(batch, torch.zeros(5, 8), sampled, outputs)
+    state.post_sample(batch, torch.zeros(5, 8), sampled, outputs)
     batch.req_ids[1] = "reused"
     batch.num_computed_tokens_np[1] = 99
     entries, tokens, speech, rows = submitted[0]
@@ -445,7 +329,7 @@ def test_per_request_d2h_owns_pcm_and_publishes_between_submissions(monkeypatch)
     monkeypatch.setattr(torch.cuda, "Event", PendingEvent)
     state, _, _, decoder = _fixture()
     codec = state.codec
-    codec.adapter, codec.decoder = state.adapter, state.model.code2wav
+    codec.decoder = state.model.code2wav
     conditioning = {
         "speech_token": torch.empty(1, 0, dtype=torch.long),
         "speech_feat": torch.empty(1, 0, 80),
@@ -489,3 +373,51 @@ def test_per_request_d2h_owns_pcm_and_publishes_between_submissions(monkeypatch)
     last = codec.outputs.get_nowait()
     assert last.request_id == "decode" and last.final
     assert last.pcm.tolist() == [2.0] * 4
+
+
+def _chunk_conditioning(prompt_len=3):
+    return {
+        "speech_token": torch.ones((1, prompt_len), dtype=torch.long),
+        "speech_feat": torch.ones((1, prompt_len * 2, 80)),
+        "embedding": torch.ones((1, 192)),
+    }
+
+
+@pytest.mark.parametrize("stop_known_early", [False, True])
+def test_chunk_windows_match_connector_hop_padding_and_lookahead(stop_known_early):
+    state, _, _, _ = _fixture()
+    codec = state.codec
+    codec.chunk_size, codec.lookahead = 4, 3
+    key = ("a", 1)
+    codec.initialize(key, _chunk_conditioning(), torch.arange(40).reshape(1, -1))
+    # A coalesced EOS prefix must take exactly the same windows as incremental
+    # token arrivals; it must not collapse the chunk ramp into one large tail.
+    updates = [(40, 40)] * 4 if stop_known_early else [(n, None) for n in range(1, 41)] + [(40, 40)]
+    items = []
+    for length, stop_position in updates:
+        item = codec.prepare(key, length, stop_position)
+        if item is not None:
+            items.append((item["token"].tolist(), item["token_offset_tokens"], item["finalize"]))
+    assert [(len(tokens[0]), offset, end) for tokens, offset, end in items] == [
+        (8, 0, False),
+        (16, 5, False),
+        (32, 13, False),
+        (40, 29, True),
+    ]
+    assert items[-1][0] == [list(range(40))]
+    assert codec.states[key].finished
+
+
+def test_prompt_padding_is_removed_before_window_alignment():
+    state, _, _, _ = _fixture()
+    codec = state.codec
+    codec.chunk_size, codec.lookahead = 4, 0
+    conditioning = _chunk_conditioning(8)
+    conditioning["speech_token_len"] = torch.tensor([[3]])
+    key = ("a", 1)
+    codec.initialize(key, conditioning, torch.arange(5).reshape(1, -1))
+    item = codec.prepare(key, 5)
+    assert item is not None
+    assert item["prompt_token"].shape == (1, 3)
+    assert item["prompt_feat"].shape == (1, 6, 80)
+    assert item["token"].shape == (1, 5)

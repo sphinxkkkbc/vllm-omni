@@ -2,109 +2,47 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Scheduler routing tests for deferred completion, cancellation and stale audio.
 
-Dependency shims isolate the actual model-local code from CUDA-only vLLM imports.
-Run with --noconftest on hosts without a vLLM installation.
+Use real engine output types; isolate only the base AR scheduler.
 """
 
-import importlib.util
 import queue
-import sys
-import types
-from enum import Enum
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.v1.engine import FinishReason
+from vllm.v1.request import RequestStatus
+
+from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
+from vllm_omni.model_executor.models.cosyvoice3 import async_codec, async_scheduler
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-ROOT = Path(__file__).resolve().parents[4] / "vllm_omni/model_executor/models/cosyvoice3"
-
-
-def _module(monkeypatch, name, **attrs):
-    module = types.ModuleType(name)
-    module.__dict__.update(attrs)
-    monkeypatch.setitem(sys.modules, name, module)
-    return module
 
 
 @pytest.fixture
 def modules(monkeypatch):
-    class Reason(Enum):
-        STOP = 0
-        LENGTH = 1
-        ABORT = 2
-        ERROR = 3
+    def initialize(s):
+        s.running, s.requests = [], {}
+        s.max_num_active_reqs = 2
 
-    class Status(Enum):
-        FINISHED_ABORTED = 0
-        FINISHED_ERROR = 1
+    def schedule(s, throttle_prefills=False):
+        s.observed_limit = s.max_num_active_reqs
+        return SimpleNamespace(scheduled_new_reqs=[], preempted_req_ids=set())
 
-    class Output:
-        def __init__(self, request_id, new_token_ids, finish_reason=None, **kw):
-            self.request_id = request_id
-            self.new_token_ids = new_token_ids
-            self.finish_reason = finish_reason
-            self.multimodal_output = None
-            self.__dict__.update(kw)
-
-    class Outputs:
-        def __init__(self, outputs):
-            self.outputs = outputs
-            self.finished_requests = None
-
-    class Base:
-        def __init__(self):
-            self.running = []
-            self.requests = {}
-            self.max_num_active_reqs = 2
-            self.next_schedule = SimpleNamespace(scheduled_new_reqs=[], preempted_req_ids=set())
-
-        def update_from_output(self, _, result):
-            return result
-
-        def schedule(self, _):
-            self.observed_limit = self.max_num_active_reqs
-            return self.next_schedule
-
-        def has_requests(self):
-            return False
-
-        def has_unfinished_requests(self):
-            return False
-
-        def finish_requests(self, ids, status):
-            return []
-
-    _module(monkeypatch, "vllm.v1.engine", FinishReason=Reason)
-    _module(monkeypatch, "vllm.v1.request", RequestStatus=Status)
-    _module(monkeypatch, "vllm_omni.core.sched.omni_ar_scheduler", OmniARAsyncScheduler=Base)
-    _module(monkeypatch, "vllm_omni.engine", OmniEngineCoreOutput=Output, OmniEngineCoreOutputs=Outputs)
-    _module(monkeypatch, "vllm_omni.platforms", current_omni_platform=SimpleNamespace())
-    pkg = "_cosy_codec_protocol"
-    _module(monkeypatch, pkg, __path__=[str(ROOT)])
-    _module(monkeypatch, pkg + ".pipeline_adapter", SingleStageAdapter=object, CodecRequestKey=tuple[str, int])
-    _module(
-        monkeypatch,
-        pkg + ".cosyvoice3_code2wav",
-        StreamingHiFTState=dict,
-        iter_decode_streaming_batch=lambda *a: iter(()),
-    )
-    loaded = []
-    for name in ("async_codec", "async_scheduler"):
-        full = pkg + "." + name
-        spec = importlib.util.spec_from_file_location(full, ROOT / (name + ".py"))
-        module = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, full, module)
-        spec.loader.exec_module(module)
-        loaded.append(module)
+    monkeypatch.setattr(OmniARAsyncScheduler, "__init__", initialize)
+    monkeypatch.setattr(OmniARAsyncScheduler, "update_from_output", lambda s, batch, result: result)
+    monkeypatch.setattr(OmniARAsyncScheduler, "schedule", schedule)
+    monkeypatch.setattr(OmniARAsyncScheduler, "has_requests", lambda s: False)
+    monkeypatch.setattr(OmniARAsyncScheduler, "has_unfinished_requests", lambda s: False)
+    monkeypatch.setattr(OmniARAsyncScheduler, "finish_requests", lambda s, ids, status: [])
     return SimpleNamespace(
-        codec=loaded[0],
-        scheduler=loaded[1],
-        Reason=Reason,
-        Status=Status,
-        Output=Output,
-        Outputs=Outputs,
+        codec=async_codec,
+        scheduler=async_scheduler,
+        Reason=FinishReason,
+        Status=RequestStatus,
+        Output=OmniEngineCoreOutput,
+        Outputs=OmniEngineCoreOutputs,
     )
 
 
@@ -138,8 +76,8 @@ def _scheduler(m):
 
 
 def _terminal(m, s):
-    out = m.Output("r", [6561], m.Reason.STOP)
-    batch = m.Outputs([out])
+    out = m.Output(request_id="r", new_token_ids=[6561], finish_reason=m.Reason.STOP)
+    batch = m.Outputs(outputs=[out])
     batch.finished_requests = {"r"}
     result = s.update_from_output(None, {7: batch})
     assert not result[7].outputs
@@ -168,8 +106,8 @@ def test_audio_can_finish_before_engine_consumes_eos(modules):
     first = s.update_from_output(None, {})[7].outputs[0]
     assert first.finish_reason is None
     assert not s.codec.released
-    terminal = m.Output("r", [6561], m.Reason.STOP)
-    result = s.update_from_output(None, {7: m.Outputs([terminal])})
+    terminal = m.Output(request_id="r", new_token_ids=[6561], finish_reason=m.Reason.STOP)
+    result = s.update_from_output(None, {7: m.Outputs(outputs=[terminal])})
     assert result[7].outputs[0].finish_reason == m.Reason.STOP
     assert s.codec.released == ["r"]
 
@@ -179,8 +117,8 @@ def test_multiple_ready_chunks_coalesce_without_duplicate_request_outputs(module
     s = _scheduler(m)
     for n in (1.0, 2.0):
         s.codec.outputs.put(m.codec.ReadyAudio("r", torch.tensor([n]), False, 1))
-    tokens = m.Output("r", [12])
-    batch = s.update_from_output(None, {7: m.Outputs([tokens])})[7]
+    tokens = m.Output(request_id="r", new_token_ids=[12])
+    batch = s.update_from_output(None, {7: m.Outputs(outputs=[tokens])})[7]
     assert len(batch.outputs) == 1
     assert batch.outputs[0].new_token_ids == [12]
     assert batch.outputs[0].multimodal_output["audio"].tolist() == [1.0, 2.0]

@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CosyVoice3's MRv2 sampling-to-audio lifecycle.
-
-run_eager_mtp is the existing post-sampling entry point. It can move to
-model_state.post_sample once #9173 introduces that common lifecycle hook.
-"""
+"""CosyVoice3's MRv2 sampling-to-audio lifecycle through post_sample."""
 
 from __future__ import annotations
 
@@ -13,7 +9,6 @@ from collections.abc import Mapping
 import numpy as np
 
 from vllm_omni.model_executor.models.cosyvoice3.async_codec import AsyncCodec, SampleEntry
-from vllm_omni.model_executor.models.cosyvoice3.pipeline_adapter import SingleStageAdapter
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 
 
@@ -22,12 +17,8 @@ class CosyVoice3ModelState(OmniModelState):
         if vllm_config.speculative_config is not None:
             raise ValueError("CosyVoice3 single-stage does not yet support speculative decoding")
         super().__init__(vllm_config, model, encoder_cache, device)
-        self.adapter = SingleStageAdapter(
-            int(model.config.llm["speech_token_size"]),
-            int(getattr(model.config, "codec_chunk_frames", 25)),
-            int(model.config.flow["pre_lookahead_len"]),
-        )
-        self.max_model_len = int(vllm_config.model_config.max_model_len)
+        self.vocab_size = int(model.config.llm["speech_token_size"])
+        self.codec_max_model_len = int(vllm_config.model_config.max_model_len)
         self.codec = None
         self.codec_device = device
         self.codec_pending_audio_threshold = max(2, int(vllm_config.max_concurrent_batches) * 2)
@@ -40,7 +31,12 @@ class CosyVoice3ModelState(OmniModelState):
         self.model._maybe_enable_code2wav_trt()
         self.model.code2wav.keep_stream_cache_on_device = True
         self.codec = AsyncCodec(
-            self.model.code2wav, self.adapter, self.codec_device, self.max_model_len, self.codec_pending_audio_threshold
+            self.model.code2wav,
+            self.codec_device,
+            self.codec_max_model_len,
+            self.codec_pending_audio_threshold,
+            chunk_size=int(getattr(self.model.config, "codec_chunk_frames", 25)),
+            lookahead=int(self.model.config.flow["pre_lookahead_len"]),
         )
         scheduler.codec = self.codec
         scheduler.audio_sample_rate = int(self.model.config.sample_rate)
@@ -54,7 +50,7 @@ class CosyVoice3ModelState(OmniModelState):
         self.req_states = req_states
         return super().prepare_inputs(input_batch, req_states)
 
-    def run_eager_mtp(
+    def post_sample(
         self,
         input_batch,
         text_hidden,
@@ -71,12 +67,12 @@ class CosyVoice3ModelState(OmniModelState):
         )
         kept = ~input_batch.is_prefilling_np[:count] | is_last_prefill
         payloads = self.intermediate_buffer.gather(input_batch)
-        limits = np.minimum(self.req_states.max_seq_len[input_batch.idx_mapping_np[:count]], self.max_model_len)
+        limits = np.minimum(self.req_states.max_seq_len[input_batch.idx_mapping_np[:count]], self.codec_max_model_len)
         end = input_batch.num_computed_tokens_np[:count] + scheduled
         positions = end - self.req_states.prompt_len.np[input_batch.idx_mapping_np[:count]]
         length_finished = end + 1 >= limits
         tokens = sampled_token_ids[:count, 0]
-        speech_mask = (tokens >= 0) & (tokens < self.adapter.vocab_size)
+        speech_mask = (tokens >= 0) & (tokens < self.vocab_size)
         step_embed = multimodal_outputs.get("embed", {})
         entries, rows = [], []
         for row, payload in enumerate(payloads):

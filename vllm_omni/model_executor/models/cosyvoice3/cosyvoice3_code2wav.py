@@ -819,19 +819,6 @@ class CosyVoice3Code2Wav(nn.Module):
         logger.info(f"Loaded hift weights from {hift_path}")
 
 
-def decode_streaming_batch(
-    decoder: CosyVoice3Code2Wav,
-    items: list[StreamingFlowItem],
-    *,
-    n_timesteps: int = 10,
-) -> list[tuple[torch.Tensor, StreamingHiFTState | None]]:
-    """Collect the common decoder iterator in the caller's original request order."""
-    results: list[tuple[torch.Tensor, StreamingHiFTState | None] | None] = [None] * len(items)
-    for index, speech, cache in iter_decode_streaming_batch(decoder, items, n_timesteps=n_timesteps):
-        results[index] = (speech, cache)
-    return cast(list[tuple[torch.Tensor, StreamingHiFTState | None]], results)
-
-
 def iter_decode_streaming_batch(
     decoder: CosyVoice3Code2Wav,
     items: list[StreamingFlowItem],

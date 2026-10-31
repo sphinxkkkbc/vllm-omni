@@ -7,7 +7,6 @@ import torch
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.cosyvoice3.async_codec import AsyncCodec, SampleEntry
-from vllm_omni.model_executor.models.cosyvoice3.pipeline_adapter import SingleStageAdapter
 
 pytestmark = [
     pytest.mark.core_model,
@@ -24,8 +23,7 @@ class Decoder:
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_codec_progresses_and_flushes_eos_without_another_ar_step(monkeypatch):
     monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", "0")
-    adapter = SingleStageAdapter(100, chunk_size=2, lookahead=0)
-    worker = AsyncCodec(Decoder(), adapter, torch.device("cuda", 0), 32, 4)
+    worker = AsyncCodec(Decoder(), torch.device("cuda", 0), 32, 4, chunk_size=2, lookahead=0)
     generation = worker.register("r")
     conditioning = {
         "speech_token": torch.empty(1, 0, dtype=torch.long, device="cuda"),
@@ -66,7 +64,7 @@ def test_ar_can_append_on_another_stream_while_codec_is_busy(monkeypatch):
                     raise TimeoutError("Test did not release decoder")
             return super().forward_streaming(token, finalize, **kwargs)
 
-    worker = AsyncCodec(SlowDecoder(), SingleStageAdapter(100, 2, 0), torch.device("cuda", 0), 64, 1)
+    worker = AsyncCodec(SlowDecoder(), torch.device("cuda", 0), 64, 1, chunk_size=2, lookahead=0)
     generation = worker.register("r")
     conditioning = {
         "speech_token": torch.empty(1, 0, dtype=torch.long, device="cuda"),
@@ -128,7 +126,7 @@ def test_ar_can_append_on_another_stream_while_codec_is_busy(monkeypatch):
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_source_row_selection_does_not_upload_indices_or_synchronize():
     """Check CUDA API events inside producer submission, not profiler teardown."""
-    worker = AsyncCodec(Decoder(), SingleStageAdapter(100, 64, 0), torch.device("cuda", 0), 32, 1)
+    worker = AsyncCodec(Decoder(), torch.device("cuda", 0), 32, 1, chunk_size=64, lookahead=0)
     generations = [worker.register(req_id) for req_id in ("a", "b")]
     conditioning = {
         "speech_token": torch.empty(1, 0, dtype=torch.long, device="cuda"),

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from threading import Lock
 from types import SimpleNamespace
 
 import pytest
@@ -22,11 +23,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.data_entry_keys import to_struct
 from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3, cosyvoice3_talker
-from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
-from vllm_omni.model_executor.models.cosyvoice3.pipeline_adapter import (
-    CrossStageAdapter,
-    _normalize_request_conditioning,
-)
+from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model, _normalize_request_conditioning
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.worker import gpu_ar_model_runner
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
@@ -87,10 +84,6 @@ class _DummyCode2Wav:
             for item in items
         ]
 
-    def iter_streaming_batch(self, items, *, n_timesteps: int = 10):
-        for index, (speech, cache) in enumerate(self.forward_streaming_batch(items, n_timesteps=n_timesteps)):
-            yield index, speech, cache
-
 
 def _make_code2wav_model(
     *,
@@ -115,16 +108,20 @@ def _make_code2wav_model(
     # otherwise run and dereference ``self.model_dir`` (only set in __init__,
     # which this fixture bypasses via object.__new__).
     model._code2wav_trt_done = True
-    model.cross_stage_adapter = CrossStageAdapter(24000, 4)
+    model.source_cache_len = 4
+    model.speech_window = torch.hamming_window(8, periodic=False)
+    model._stream_audio_cache_by_req = {}
+    model._stream_audio_cache_lock = Lock()
+    model._stream_vocoder_cache_by_req = {}
     return model
 
 
 def _make_talker_model() -> CosyVoice3Model:
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
+    model.local_code2wav = False
     model._pending_rejection_rng = None
     model._sampled_token_feedback = None
-    model.local_code2wav = False
     model.model_stage = "cosyvoice3_talker"
     model.config = SimpleNamespace(
         llm={
@@ -504,7 +501,7 @@ def test_forward_reuses_streaming_cache_state_between_chunks():
     cache_state = model.code2wav.forward_streaming_calls[1]["cache_state"]
     assert cache_state is not None
     assert cache_state["speech_offset"] == 4
-    assert "rid-stream" in model.cross_stage_adapter._stream_vocoder_cache_by_req
+    assert "rid-stream" in model._stream_vocoder_cache_by_req
 
 
 def test_forward_clears_streaming_cache_on_terminal_chunk():
@@ -541,7 +538,7 @@ def test_forward_clears_streaming_cache_on_terminal_chunk():
         model_intermediate_buffer=runtime_info,
         seq_token_counts=[3],
     )
-    assert "rid-stream" in model.cross_stage_adapter._stream_vocoder_cache_by_req
+    assert "rid-stream" in model._stream_vocoder_cache_by_req
 
     runtime_info[0]["meta"]["stream_finished"] = torch.tensor(True)
     out = model.forward(
@@ -551,7 +548,7 @@ def test_forward_clears_streaming_cache_on_terminal_chunk():
         seq_token_counts=[3],
     )
     assert out.multimodal_outputs["audio"][0].tolist() == [7.0]
-    assert "rid-stream" not in model.cross_stage_adapter._stream_vocoder_cache_by_req
+    assert "rid-stream" not in model._stream_vocoder_cache_by_req
 
 
 def test_forward_batches_streaming_flow_items(monkeypatch):
@@ -594,10 +591,11 @@ def test_forward_batches_streaming_flow_items(monkeypatch):
     assert len(out.multimodal_outputs["audio"]) == 2
     assert len(model.code2wav.forward_streaming_batch_calls) == 1
     batch_items = model.code2wav.forward_streaming_batch_calls[0]
+    assert [item["index"] for item in batch_items] == [0, 1]
     assert torch.equal(batch_items[0]["token"], torch.tensor([[0, 1, 2]]))
     assert batch_items[1]["token_offset_tokens"] == 1
-    assert "rid-a" in model.cross_stage_adapter._stream_vocoder_cache_by_req
-    assert "rid-b" in model.cross_stage_adapter._stream_vocoder_cache_by_req
+    assert "rid-a" in model._stream_vocoder_cache_by_req
+    assert "rid-b" in model._stream_vocoder_cache_by_req
 
 
 def test_sample_uses_ras_rejection_for_recent_repetition():
@@ -1108,10 +1106,8 @@ def test_embed_input_ids_rejects_cross_request_placeholder_block():
 
 
 def test_full_response_singleton_uses_the_optimized_batch_path(monkeypatch):
-    from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3_code2wav
-
     monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", "1")
-    monkeypatch.setattr(cosyvoice3_code2wav, "cosyvoice3_packed_inference_enabled", lambda: True)
+    monkeypatch.setattr(cosyvoice3, "cosyvoice3_packed_inference_enabled", lambda: True)
     model = _make_code2wav_model()
     model.forward(
         input_ids=torch.tensor([0, 1, 2]),
@@ -1215,12 +1211,13 @@ def test_sampling_mode_preserves_or_merges_control_logits(mode):
 
 
 def test_cancelled_stream_releases_only_its_vocoder_state():
-    adapter = CrossStageAdapter(24000, 4)
-    adapter._stream_vocoder_cache_by_req = {"cancelled": {"mel": torch.ones(2)}, "live": {"mel": torch.zeros(2)}}
-    model = SimpleNamespace(cross_stage_adapter=adapter)
+    model = SimpleNamespace(
+        _stream_audio_cache_lock=Lock(),
+        _stream_vocoder_cache_by_req={"cancelled": {"mel": torch.ones(2)}, "live": {"mel": torch.zeros(2)}},
+    )
     CosyVoice3Model.on_requests_finished(model, {"cancelled", "unknown"})
     CosyVoice3Model.on_requests_finished(model, {"cancelled"})
-    assert set(model.cross_stage_adapter._stream_vocoder_cache_by_req) == {"live"}
+    assert set(model._stream_vocoder_cache_by_req) == {"live"}
 
 
 @pytest.mark.parametrize("mrv2,packed", [(False, False), (False, True), (True, False)])
@@ -1339,3 +1336,139 @@ def test_runner_commits_deferred_rng_once_before_sampling(mocker, route, has_com
             expected_events += ["default"]
     assert result is expected
     assert events == expected_events
+
+
+def test_ras_accepts_upstream_call_and_preserves_bias_context(monkeypatch):
+    from functools import partial
+    from types import MethodType
+
+    import numpy as np
+    from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import _ras_mrv2_sample
+
+    class CheckedContextError(Exception):
+        pass
+
+    bounds = torch.tensor([4], dtype=torch.int32)
+    idx = torch.tensor([0], dtype=torch.int32)
+    logits = torch.zeros(1, 8)
+    batch = SimpleNamespace(
+        expanded_idx_mapping=idx,
+        idx_mapping=idx,
+        idx_mapping_np=np.array([0]),
+        cu_num_logits_np=np.array([0, 1]),
+        expanded_local_pos=idx,
+        positions=torch.tensor([3]),
+        logits_indices=torch.tensor([0]),
+        input_ids=torch.tensor([2]),
+        seq_lens_cpu_upper_bound=bounds,
+    )
+    bias = object.__new__(LogitBiasState)
+
+    def apply_bias(values, ctx):
+        assert values.dtype == torch.float32
+        np.testing.assert_array_equal(ctx.seq_lens_upper_bound_np, bounds.numpy())
+        assert ctx.expanded_idx_mapping is idx
+        assert ctx.input_ids.tolist() == [2]
+        assert ctx.pos.tolist() == [3]
+        raise CheckedContextError
+
+    monkeypatch.setattr(bias, "apply", apply_bias)
+
+    def unexpected_penalty(*args):
+        pytest.fail("RAS must not apply ordinary penalties")
+
+    sampler = SimpleNamespace(
+        compute_nans=False,
+        get_logprobs_dims=lambda rows: None,
+        logits_processors=[SimpleNamespace(apply=unexpected_penalty), bias],
+    )
+    sampler.sample = MethodType(
+        partial(
+            _ras_mrv2_sample,
+            default_top_p=0.8,
+            default_top_k=25,
+            win_size=10,
+            tau_r=0.1,
+            eps=1e-5,
+        ),
+        sampler,
+    )
+    # Execute the actual upstream positional/keyword call; stop before GPU sampling.
+    with pytest.raises(CheckedContextError):
+        Sampler.__call__(sampler, logits, batch)
+    assert torch.equal(logits, torch.zeros_like(logits))
+
+
+def _incremental_decoder(monkeypatch):
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav as module
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
+
+    monkeypatch.setattr(module, "cosyvoice3_packed_streaming_enabled", lambda: True)
+    monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", "1")
+    model = object.__new__(CosyVoice3Code2Wav)
+    torch.nn.Module.__init__(model)
+    model.calls = []
+    model.ratio = 1
+    # Avoid loading weights: exercise actual dispatch, row slicing and yields.
+    monkeypatch.setattr(CosyVoice3Code2Wav, "token_mel_ratio", property(lambda self: self.ratio))
+
+    def flow(items, n_timesteps, *, stream_items):
+        assert stream_items
+        model.calls.append(("flow", [item["tag"] for item in items]))
+        features = torch.stack([torch.full((1, 6), float(item["tag"])) for item in items])
+        return features, [6] * len(items), [1] * len(items)
+
+    def hift(feat, *, cache_state, finalize):
+        tag = int(feat[0, 0, 0])
+        model.calls.append(("hift", tag))
+        return feat, None if finalize else {"tag": tag}
+
+    model.flow_batch_mels = flow
+    model._stream_hift_from_feat = hift
+    return model
+
+
+def _incremental_items(count, finals=()):
+    return [
+        {
+            "tag": index,
+            "token": torch.zeros(1, count - index, dtype=torch.long),
+            "prompt_token": torch.zeros(1, 1, dtype=torch.long),
+            "token_offset_tokens": 0,
+            "finalize": index in finals,
+        }
+        for index in range(count)
+    ]
+
+
+def test_streaming_iterator_pauses_between_hift_and_flow_groups(monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import iter_decode_streaming_batch
+
+    model = _incremental_decoder(monkeypatch)
+    iterator = iter_decode_streaming_batch(model, _incremental_items(3, finals=(0,)))
+    assert model.calls == []
+    first = next(iterator)
+    assert first[0] == 1
+    assert model.calls == [("flow", [1, 2]), ("hift", 1)]
+    second = next(iterator)
+    assert second[0] == 2
+    assert model.calls[-1] == ("hift", 2)
+    assert len(model.calls) == 3  # Neither final Flow nor final HiFT ran ahead.
+    last = next(iterator)
+    assert last[0] == 0
+    assert last[2] is None
+    assert model.calls[-2:] == [("flow", [0]), ("hift", 0)]
+    with pytest.raises(StopIteration):
+        next(iterator)
+
+
+@pytest.mark.parametrize("count", [1, 8, 11])
+def test_list_api_restores_request_order_across_incremental_groups(monkeypatch, count):
+    model = _incremental_decoder(monkeypatch)
+    outputs = model.forward_streaming_batch(_incremental_items(count, finals=(0, 2)))
+    assert [int(speech[0, 0, 0]) for speech, _ in outputs] == list(range(count))
+    assert [cache is None for _, cache in outputs] == [i in (0, 2) for i in range(count)]
+    assert all(len(tags) <= 8 for name, tags in model.calls if name == "flow")

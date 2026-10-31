@@ -11,7 +11,7 @@ from __future__ import annotations
 import queue
 import threading
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -20,10 +20,23 @@ import torch
 from vllm_omni.platforms import current_omni_platform
 
 from .cosyvoice3_code2wav import iter_decode_streaming_batch
-from .pipeline_adapter import CodecRequestKey, SingleStageAdapter
 
 if TYPE_CHECKING:
-    from .cosyvoice3_code2wav import CosyVoice3Code2Wav
+    from .cosyvoice3_code2wav import CosyVoice3Code2Wav, StreamingFlowItem, StreamingHiFTState
+
+
+@dataclass
+class StreamingDecodeState:
+    """Pipeline-owned accumulation; the decoder cache is opaque to this layer."""
+
+    token: torch.Tensor
+    prompt_token: torch.Tensor
+    prompt_feat: torch.Tensor
+    embedding: torch.Tensor
+    emitted: int = 0
+    hop: int = 25
+    cache: StreamingHiFTState | None = None
+    finished: bool = False  # Final window planned; GPU and client completion are tracked separately.
 
 
 @dataclass
@@ -106,13 +119,18 @@ class AsyncCodec:
     def __init__(
         self,
         decoder: CosyVoice3Code2Wav,
-        adapter: SingleStageAdapter,
         device,
         max_model_len: int,
         pending_audio_threshold: int,
+        chunk_size: int = 25,
+        lookahead: int = 3,
     ):
         self.decoder = decoder
-        self.adapter = adapter
+        if chunk_size <= 0 or lookahead < 0:
+            raise ValueError("CosyVoice3 chunk size must be positive and lookahead nonnegative")
+        self.chunk_size = chunk_size
+        self.lookahead = lookahead
+        self.states: dict[tuple[str, int], StreamingDecodeState] = {}
         self.device = device
         self.max_model_len = max_model_len
         self.outputs: queue.SimpleQueue[ReadyAudio] = queue.SimpleQueue()
@@ -121,17 +139,17 @@ class AsyncCodec:
         self.next_generation = 0
         # Checked at batch admission; not a strict per-row bound.
         self.pending_audio_threshold = pending_audio_threshold
-        self.buffers: dict[CodecRequestKey, TokenBuffer] = {}
+        self.buffers: dict[tuple[str, int], TokenBuffer] = {}
         # Cross-thread mailboxes coalesce updates instead of retaining steps.
-        self.mailbox: dict[CodecRequestKey, TokenProgress] = {}
-        self.retirements: dict[CodecRequestKey, tuple[bool, bool]] = {}
+        self.mailbox: dict[tuple[str, int], TokenProgress] = {}
+        self.retirements: dict[tuple[str, int], tuple[bool, bool]] = {}
         self.lock = threading.Lock()
         # Codec-owned state; tombstones survive pending control/audio copies.
-        self.cancelled: set[CodecRequestKey] = set()
-        self.ended: set[CodecRequestKey] = set()
-        self.released: set[CodecRequestKey] = set()
-        self.reads: dict[CodecRequestKey, ControlRead] = {}
-        self.progress: dict[CodecRequestKey, DecodeProgress] = {}
+        self.cancelled: set[tuple[str, int]] = set()
+        self.ended: set[tuple[str, int]] = set()
+        self.released: set[tuple[str, int]] = set()
+        self.reads: dict[tuple[str, int], ControlRead] = {}
+        self.progress: dict[tuple[str, int], DecodeProgress] = {}
         self.pending: deque[PendingAudio] = deque()
         self.error: BaseException | None = None
         self.started = threading.Event()
@@ -241,7 +259,7 @@ class AsyncCodec:
             if released:
                 self.released.add(key)
             self.progress.pop(key, None)
-            self.adapter.finish_requests({key})
+            self.finish_requests({key})
         # ControlRead keeps source flags and pinned destination alive until its
         # event completes, even if the request was cancelled in the meantime.
 
@@ -306,13 +324,13 @@ class AsyncCodec:
                 continue
             buffer = progress.buffer
             buffer.tokens.record_stream(self.stream)
-            self.adapter.initialize(key, buffer.conditioning, buffer.tokens)
-            state = self.adapter.states[key]
+            self.initialize(key, buffer.conditioning, buffer.tokens)
+            state = self.states[key]
             if state.finished:
                 continue
             for tensor in (state.prompt_token, state.prompt_feat, state.embedding):
                 tensor.record_stream(self.stream)
-            item = self.adapter.prepare(key, progress.length, progress.stop_position)
+            item = self.prepare(key, progress.length, progress.stop_position)
             if item is not None:
                 items.append(item)
                 bindings.append((key, item["finalize"]))
@@ -321,7 +339,7 @@ class AsyncCodec:
         if items:
             for index, wav, cache in iter_decode_streaming_batch(self.decoder, items):
                 key, final = bindings[index]
-                self.adapter.apply_result(key, cache)
+                self.apply_result(key, cache)
                 # Snapshot before the next request can reuse graph output storage.
                 wav = wav.reshape(-1).float().clone()
                 decoded = torch.cuda.Event()
@@ -367,10 +385,84 @@ class AsyncCodec:
                 self.stream.synchronize()
                 self.copy_stream.synchronize()
                 self.control_stream.synchronize()
-                self.adapter.finish_requests(set(self.adapter.states))
+                self.finish_requests(set(self.states))
                 self.buffers.clear()
                 self.progress.clear()
         except BaseException as error:
             self.error = error
         finally:
             self.started.set()
+
+    def initialize(self, req_id: tuple[str, int], conditioning: Mapping, token_buffer: torch.Tensor) -> None:
+        """Bind an append-only producer buffer; chunk/cache state stays consumer-owned."""
+        from vllm_omni.data_entry_keys import to_struct
+
+        from .cosyvoice3 import _normalize_request_conditioning
+        from .utils import unpad_prompt_conditioning
+
+        if req_id in self.states:
+            return
+        payload = to_struct(_normalize_request_conditioning({"embed": dict(conditioning)}))
+        embed = payload.embed
+        if embed is None or any(getattr(embed, key) is None for key in ("speech_token", "speech_feat", "embedding")):
+            raise ValueError(f"CosyVoice3 single-stage request {req_id} has no prompt conditioning")
+        prompt_token, prompt_feat = unpad_prompt_conditioning(
+            embed.speech_token, embed.speech_feat, embed.speech_token_len
+        )
+        state = StreamingDecodeState(
+            token=token_buffer,
+            prompt_token=prompt_token[:1],
+            prompt_feat=prompt_feat[:1],
+            embedding=embed.embedding[:1],
+            hop=self.chunk_size,
+        )
+        self.states[req_id] = state
+
+    def prepare(
+        self, req_id: tuple[str, int], length: int, stop_position: int | None = None
+    ) -> StreamingFlowItem | None:
+        """Plan one chunk from a confirmed prefix, draining full chunks before its tail.
+
+        stop_position is the terminal token's position, not the prefix length:
+        length excludes EOS but includes the last speech token at a length stop.
+
+        None means no decoder work: insufficient tokens, an already finished
+        plan, or an empty terminal prefix. Only the last case newly sets
+        state.finished; the executor sends its terminal notification without
+        invoking the decoder. A returned item's finalize flag owns tail policy.
+        """
+        state = self.states[req_id]
+        if state.finished:
+            return None
+        pad = (-state.prompt_token.shape[1]) % self.chunk_size if state.emitted == 0 else 0
+        hop = state.hop + pad
+        threshold = state.emitted + hop + self.lookahead
+        final = stop_position is not None and stop_position < threshold
+        if not final and length < threshold:
+            return None
+        if length == 0:
+            state.finished = final
+            return None
+        prefix = length if final else threshold
+        item: StreamingFlowItem = {
+            "token": state.token[:, :prefix],
+            "prompt_token": state.prompt_token,
+            "prompt_feat": state.prompt_feat,
+            "embedding": state.embedding,
+            "cache_state": state.cache,
+            "token_offset_tokens": state.emitted,
+            "finalize": final,
+        }
+        if not final:
+            state.emitted += hop
+            state.hop = min(4 * self.chunk_size, 2 * state.hop)
+        state.finished = final
+        return item
+
+    def apply_result(self, req_id: tuple[str, int], cache: StreamingHiFTState | None) -> None:
+        state = self.states[req_id]
+        state.cache = None if state.finished else cache
+
+    def finish_requests(self, request_ids: Iterable[tuple[str, int]]) -> None:
+        for req_id in request_ids:
+            self.states.pop(req_id, None)

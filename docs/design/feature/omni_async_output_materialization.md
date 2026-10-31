@@ -480,11 +480,13 @@ checks that copy's event before reading the bits on the CPU. Keeping the whole
 validity prefix preserves EOS even when many progress notifications coalesce.
 Length-limit termination also preserves its original token position. Cancellation
 and release use a separate coalesced control mailbox, without waiting for space
-in a token queue. Decoder state stays owned by the codec thread. `SingleStageAdapter` plans
-chunk windows over validated token prefixes; only the AR producer writes tokens.
-The worker passes the confirmed prefix length and optional stop position to the
-adapter. Readiness, prefix boundaries, chunk-ramp advancement and tail selection
-are decided together by the adapter, including when EOS progress has coalesced.
+in a token queue. Decoder state stays owned by the codec thread. The worker plans chunk windows
+over validated token prefixes using the confirmed length and optional stop
+position; only the AR producer writes tokens. Readiness, prefix boundaries,
+chunk-ramp advancement and tail selection are decided together by the worker,
+including when EOS progress has coalesced. The existing two-stage forward path
+keeps its request routing and cache cleanup in the model; the single-stage
+codec runs alongside it without a shared pipeline adapter.
 
 The worker catches up through the existing chunk ramp and lookahead before
 finalizing the tail, rather than merging a backlog into one large final decode.
